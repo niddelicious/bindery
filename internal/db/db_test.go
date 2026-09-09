@@ -875,6 +875,10 @@ func TestPickClientForMediaType(t *testing.T) {
 	// contains audio" heuristic.
 	dualClient := models.DownloadClient{ID: 4, Name: "SAB-dual", Category: "books", CategoryAudiobook: "audiobooks", Type: "sabnzbd"}
 
+	transBoth := models.DownloadClient{ID: 10, Name: "Transmission-both", Category: "/downloads", MediaType: "both", Type: "transmission"}
+	transBooks := models.DownloadClient{ID: 11, Name: "Transmission-books", Category: "/downloads/books", MediaType: "ebook", Type: "transmission"}
+	transAudio := models.DownloadClient{ID: 12, Name: "Transmission-audio", Category: "/downloads/audiobooks", MediaType: "audiobook", Type: "transmission"}
+
 	tests := []struct {
 		name      string
 		clients   []models.DownloadClient
@@ -889,6 +893,17 @@ func TestPickClientForMediaType(t *testing.T) {
 		{"ebook falls back to first when all audio", []models.DownloadClient{audioClient}, "ebook", 1},
 		{"audiobook prefers explicit CategoryAudiobook over legacy heuristic", []models.DownloadClient{audioClient, dualClient}, "audiobook", 4},
 		{"ebook on dual-config client returns it via fallback path", []models.DownloadClient{dualClient}, "ebook", 4},
+		{"transmission books handles ebook", []models.DownloadClient{transBooks}, "ebook", 11},
+		{"transmission books rejects audiobook", []models.DownloadClient{transBooks}, "audiobook", 0},
+		{"transmission audio rejects ebook", []models.DownloadClient{transAudio}, "ebook", 0},
+		{"transmission audio handles audiobook", []models.DownloadClient{transAudio}, "audiobook", 12},
+		{"transmission both handles ebook", []models.DownloadClient{transBoth}, "ebook", 10},
+		{"transmission both handles audiobook", []models.DownloadClient{transBoth}, "audiobook", 10},
+		{"transmission split routes ebook to books", []models.DownloadClient{transBooks, transAudio}, "ebook", 11},
+		{"transmission split routes audiobook to audio", []models.DownloadClient{transBooks, transAudio}, "audiobook", 12},
+		{"transmission both and audio routes audiobook to audio", []models.DownloadClient{transBoth, transAudio}, "audiobook", 12},
+		{"transmission books and both routes ebook to books", []models.DownloadClient{transBooks, transBoth}, "ebook", 11},
+		{"transmission books and both routes audiobook to both", []models.DownloadClient{transBooks, transBoth}, "audiobook", 10},
 	}
 
 	for _, tt := range tests {
@@ -908,6 +923,36 @@ func TestPickClientForMediaType(t *testing.T) {
 				t.Errorf("expected client ID %d, got %d (%s)", tt.wantID, got.ID, got.Name)
 			}
 		})
+	}
+}
+
+func TestIsClientEligible(t *testing.T) {
+	cases := []struct {
+		client    models.DownloadClient
+		mediaType string
+		want      bool
+	}{
+		{models.DownloadClient{Type: "transmission", Category: "/downloads", MediaType: "both"}, models.MediaTypeEbook, true},
+		{models.DownloadClient{Type: "transmission", Category: "/downloads", MediaType: "both"}, models.MediaTypeAudiobook, true},
+		{models.DownloadClient{Type: "transmission", Category: "/downloads", MediaType: ""}, models.MediaTypeEbook, true},
+		{models.DownloadClient{Type: "transmission", Category: "/downloads", MediaType: ""}, models.MediaTypeAudiobook, true},
+		{models.DownloadClient{Type: "transmission", Category: "/downloads/books", MediaType: "ebook"}, models.MediaTypeEbook, true},
+		{models.DownloadClient{Type: "transmission", Category: "/downloads/books", MediaType: "ebook"}, models.MediaTypeAudiobook, false},
+		{models.DownloadClient{Type: "transmission", Category: "/downloads/audio", MediaType: "audiobook"}, models.MediaTypeEbook, false},
+		{models.DownloadClient{Type: "transmission", Category: "/downloads/audio", MediaType: "audiobook"}, models.MediaTypeAudiobook, true},
+		{models.DownloadClient{Type: "sabnzbd", Category: "books", CategoryAudiobook: "audiobooks"}, models.MediaTypeEbook, true},
+		{models.DownloadClient{Type: "sabnzbd", Category: "books", CategoryAudiobook: "audiobooks"}, models.MediaTypeAudiobook, true},
+		{models.DownloadClient{Type: "sabnzbd", Category: "books"}, models.MediaTypeEbook, true},
+		{models.DownloadClient{Type: "sabnzbd", Category: "books"}, models.MediaTypeAudiobook, true},
+		{models.DownloadClient{Type: "sabnzbd", Category: "audiobooks"}, models.MediaTypeEbook, false},
+		{models.DownloadClient{Type: "sabnzbd", Category: "audiobooks"}, models.MediaTypeAudiobook, true},
+	}
+
+	for _, tc := range cases {
+		got := IsClientEligible(&tc.client, tc.mediaType)
+		if got != tc.want {
+			t.Errorf("IsClientEligible(%+v, %q) = %v, want %v", tc.client, tc.mediaType, got, tc.want)
+		}
 	}
 }
 

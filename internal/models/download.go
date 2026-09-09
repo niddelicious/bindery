@@ -16,13 +16,16 @@ type DownloadClient struct {
 	// audiobook download. When empty, audiobooks fall back to Category, which
 	// preserves pre-#700 behaviour for clients that have not opted in to the
 	// per-media-type split.
-	CategoryAudiobook string                `json:"categoryAudiobook"`
-	PathRemap         string                `json:"pathRemap"`
-	Priority          int                   `json:"priority"`
-	Enabled           bool                  `json:"enabled"`
-	CreatedAt         time.Time             `json:"createdAt"`
-	UpdatedAt         time.Time             `json:"updatedAt"`
-	Health            *DownloadClientHealth `json:"health,omitempty"`
+	CategoryAudiobook string `json:"categoryAudiobook"`
+	// MediaType filters what media types this download client is eligible
+	// for: "ebook", "audiobook", or "both" (default when empty or "both").
+	MediaType string                `json:"mediaType"`
+	PathRemap string                `json:"pathRemap"`
+	Priority  int                   `json:"priority"`
+	Enabled   bool                  `json:"enabled"`
+	CreatedAt time.Time             `json:"createdAt"`
+	UpdatedAt time.Time             `json:"updatedAt"`
+	Health    *DownloadClientHealth `json:"health,omitempty"`
 
 	// Username and Password are used by download clients that authenticate with
 	// credentials rather than an API key (e.g. qBittorrent, Transmission).

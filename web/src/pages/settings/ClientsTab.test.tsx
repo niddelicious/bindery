@@ -178,6 +178,33 @@ describe('download client edit form credentials', () => {
     expect(payload.id).toBe(7)
     expect(payload).not.toHaveProperty('apiKey')
   })
+
+  it('renders Transmission with Download Directory and Use this client for checkboxes', async () => {
+    renderTab([makeClient({ type: 'transmission', name: 'My Transmission', category: '/downloads/books', mediaType: 'both', apiKeyConfigured: false, passwordConfigured: true })])
+    openEditForm()
+
+    expect(screen.getByText('Download Directory')).toBeInTheDocument()
+    expect(screen.getByPlaceholderText('/downloads (leave blank for default)')).toHaveValue('/downloads/books')
+    expect(screen.getByText('settings.clients.useForLabel')).toBeInTheDocument()
+    expect(screen.queryByText('settings.clients.audiobookCategoryLabel')).not.toBeInTheDocument()
+
+    const booksCheckbox = screen.getByRole('checkbox', { name: 'settings.clients.useForBooks' }) as HTMLInputElement
+    const audioCheckbox = screen.getByRole('checkbox', { name: 'settings.clients.useForAudiobooks' }) as HTMLInputElement
+    expect(booksCheckbox.checked).toBe(true)
+    expect(audioCheckbox.checked).toBe(true)
+
+    // Uncheck Books -> only Audiobooks is checked -> mediaType='audiobook'
+    fireEvent.click(booksCheckbox)
+    expect(booksCheckbox.checked).toBe(false)
+    expect(audioCheckbox.checked).toBe(true)
+
+    save()
+
+    await waitFor(() => expect(api.updateDownloadClient).toHaveBeenCalled())
+    const [, payload] = vi.mocked(api.updateDownloadClient).mock.calls[0]
+    expect(payload.category).toBe('/downloads/books')
+    expect(payload.mediaType).toBe('audiobook')
+  })
 })
 
 describe('download client add form', () => {

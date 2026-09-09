@@ -21,6 +21,7 @@ export interface DownloadClient {
   // Optional; when empty (the default for pre-#700 rows) audiobook grabs
   // fall back to `category`.
   categoryAudiobook?: string
+  mediaType?: string
   pathRemap?: string
   enabled: boolean
   health?: DownloadClientHealth

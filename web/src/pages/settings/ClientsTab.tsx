@@ -167,12 +167,24 @@ function EditClientForm({ client, onClose, onSaved }: { client: DownloadClient; 
   const [urlBase, setUrlBase] = useState(client.urlBase || '')
   const [category, setCategory] = useState(client.category)
   const [categoryAudiobook, setCategoryAudiobook] = useState(client.categoryAudiobook || '')
+  const [mediaTypeBooks, setMediaTypeBooks] = useState(client.mediaType !== 'audiobook')
+  const [mediaTypeAudiobooks, setMediaTypeAudiobooks] = useState(client.mediaType !== 'ebook')
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
   const [pathRemap, setPathRemap] = useState(client.pathRemap || '')
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<{ ok: boolean; msg: string; warn?: string } | null>(null)
   const labelCls = 'block text-xs text-slate-600 dark:text-zinc-400 mb-1'
+
+  const handleMediaTypeBooksChange = (checked: boolean) => {
+    if (!checked && !mediaTypeAudiobooks) return
+    setMediaTypeBooks(checked)
+  }
+
+  const handleMediaTypeAudiobooksChange = (checked: boolean) => {
+    if (!checked && !mediaTypeBooks) return
+    setMediaTypeAudiobooks(checked)
+  }
 
   const handleTypeChange = (newType: string) => {
     setType(newType)
@@ -218,6 +230,11 @@ function EditClientForm({ client, onClose, onSaved }: { client: DownloadClient; 
       pathRemap: pathRemap.trim(),
       useSsl: useSSL,
       urlBase: urlBase.trim(),
+    }
+    if (type === 'transmission') {
+      data.mediaType = mediaTypeBooks && mediaTypeAudiobooks ? 'both' : mediaTypeBooks ? 'ebook' : 'audiobook'
+    } else if (client.mediaType) {
+      data.mediaType = ''
     }
     if (isPasswordClient(type)) {
       data.clearApiKey = true
@@ -346,6 +363,31 @@ function EditClientForm({ client, onClose, onSaved }: { client: DownloadClient; 
           <p className="text-xs text-slate-500 dark:text-zinc-500 mt-1">{t('settings.clients.audiobookCategoryHelp')}</p>
         </div>
       )}
+      {type === 'transmission' && (
+        <div>
+          <label className={labelCls}>{t('settings.clients.useForLabel')}</label>
+          <div className="flex items-center gap-4 mt-1">
+            <label className="flex items-center gap-1.5 text-xs text-slate-700 dark:text-zinc-300 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={mediaTypeBooks}
+                onChange={e => handleMediaTypeBooksChange(e.target.checked)}
+                className="rounded border-slate-300 dark:border-zinc-700"
+              />
+              {t('settings.clients.useForBooks')}
+            </label>
+            <label className="flex items-center gap-1.5 text-xs text-slate-700 dark:text-zinc-300 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={mediaTypeAudiobooks}
+                onChange={e => handleMediaTypeAudiobooksChange(e.target.checked)}
+                className="rounded border-slate-300 dark:border-zinc-700"
+              />
+              {t('settings.clients.useForAudiobooks')}
+            </label>
+          </div>
+        </div>
+      )}
       <PathRemapField
         id={`edit-client-path-remap-${client.id}`}
         label="Download client path remap"
@@ -388,6 +430,8 @@ function AddClientForm({ onClose, onAdded }: { onClose: () => void; onAdded: (c:
   const [urlBase, setUrlBase] = useState('')
   const [category, setCategory] = useState('books')
   const [categoryAudiobook, setCategoryAudiobook] = useState('')
+  const [mediaTypeBooks, setMediaTypeBooks] = useState(true)
+  const [mediaTypeAudiobooks, setMediaTypeAudiobooks] = useState(true)
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
   const [pathRemap, setPathRemap] = useState('')
@@ -403,6 +447,16 @@ function AddClientForm({ onClose, onAdded }: { onClose: () => void; onAdded: (c:
   // SCGI is rTorrent's own listener: no TLS, no auth. Say so where the choice
   // is made rather than dropping the fields silently on save.
   const scgiIgnored = rtorrentScgiIgnoredFields(type, urlBase, useSSL, username, credential)
+
+  const handleMediaTypeBooksChange = (checked: boolean) => {
+    if (!checked && !mediaTypeAudiobooks) return
+    setMediaTypeBooks(checked)
+  }
+
+  const handleMediaTypeAudiobooksChange = (checked: boolean) => {
+    if (!checked && !mediaTypeBooks) return
+    setMediaTypeAudiobooks(checked)
+  }
 
   const handleTypeChange = (newType: 'sabnzbd' | 'nzbget' | 'qbittorrent' | 'transmission' | 'deluge' | 'rtorrent') => {
     setType(newType)
@@ -437,9 +491,24 @@ function AddClientForm({ onClose, onAdded }: { onClose: () => void; onAdded: (c:
     setPort('8080')
   }
 
-  const buildData = () => isPasswordClient(type)
-    ? { name, host, port: parseInt(port), username: hasUsername(type) ? username : '', password: credential, apiKey: '', category, categoryAudiobook: categoryAudiobook.trim(), pathRemap: pathRemap.trim(), type, enabled: true, useSsl: useSSL, urlBase: urlBase.trim() }
-    : { name, host, port: parseInt(port), apiKey: credential, username: '', password: '', category, categoryAudiobook: categoryAudiobook.trim(), pathRemap: pathRemap.trim(), type, enabled: true, useSsl: useSSL, urlBase: urlBase.trim() }
+  const buildData = () => {
+    const base = {
+      name,
+      host,
+      port: parseInt(port),
+      category,
+      categoryAudiobook: categoryAudiobook.trim(),
+      pathRemap: pathRemap.trim(),
+      type,
+      enabled: true,
+      useSsl: useSSL,
+      urlBase: urlBase.trim(),
+      ...(type === 'transmission' ? { mediaType: mediaTypeBooks && mediaTypeAudiobooks ? 'both' : mediaTypeBooks ? 'ebook' : 'audiobook' } : {}),
+    }
+    return isPasswordClient(type)
+      ? { ...base, username: hasUsername(type) ? username : '', password: credential, apiKey: '' }
+      : { ...base, apiKey: credential, username: '', password: '' }
+  }
 
   const submit = async () => {
     const data = buildData()
@@ -544,6 +613,31 @@ function AddClientForm({ onClose, onAdded }: { onClose: () => void; onAdded: (c:
           <label className={labelCls}>{t('settings.clients.audiobookCategoryLabel')}</label>
           <input value={categoryAudiobook} onChange={e => setCategoryAudiobook(e.target.value)} placeholder={t('settings.clients.audiobookCategoryPlaceholder')} className={inputCls} />
           <p className="text-xs text-slate-500 dark:text-zinc-500 mt-1">{t('settings.clients.audiobookCategoryHelp')}</p>
+        </div>
+      )}
+      {type === 'transmission' && (
+        <div>
+          <label className={labelCls}>{t('settings.clients.useForLabel')}</label>
+          <div className="flex items-center gap-4 mt-1">
+            <label className="flex items-center gap-1.5 text-xs text-slate-700 dark:text-zinc-300 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={mediaTypeBooks}
+                onChange={e => handleMediaTypeBooksChange(e.target.checked)}
+                className="rounded border-slate-300 dark:border-zinc-700"
+              />
+              {t('settings.clients.useForBooks')}
+            </label>
+            <label className="flex items-center gap-1.5 text-xs text-slate-700 dark:text-zinc-300 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={mediaTypeAudiobooks}
+                onChange={e => handleMediaTypeAudiobooksChange(e.target.checked)}
+                className="rounded border-slate-300 dark:border-zinc-700"
+              />
+              {t('settings.clients.useForAudiobooks')}
+            </label>
+          </div>
         </div>
       )}
       <PathRemapField

@@ -679,7 +679,10 @@
       "passwordEditLabel": "Password (leave blank to keep current)",
       "apiKeyEditLabel": "API Key (leave blank to keep current)",
       "credentialKeepHint": "Bindery no longer sends a saved password or API key back to the browser. Leave this blank to keep the one already stored.",
-      "credentialUnsetHint": "No credential is stored for this client yet."
+      "credentialUnsetHint": "No credential is stored for this client yet.",
+      "useForLabel": "Use this client for:",
+      "useForBooks": "Books",
+      "useForAudiobooks": "Audiobooks"
     },
     "notifications": {
       "heading": "Webhook Notifications",

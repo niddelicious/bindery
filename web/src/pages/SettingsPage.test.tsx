@@ -1823,6 +1823,7 @@ describe('SettingsPage', () => {
         enabled: true,
         useSsl: false,
         urlBase: '',
+        ...(type === 'transmission' ? { mediaType: 'both' } : {}),
       })
     })
   })
