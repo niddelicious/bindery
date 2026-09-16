@@ -167,6 +167,8 @@ function EditClientForm({ client, onClose, onSaved }: { client: DownloadClient; 
   const [urlBase, setUrlBase] = useState(client.urlBase || '')
   const [category, setCategory] = useState(client.category)
   const [categoryAudiobook, setCategoryAudiobook] = useState(client.categoryAudiobook || '')
+  const [enabledForBooks, setEnabledForBooks] = useState(client.enabledForBooks ?? true)
+  const [enabledForAudiobooks, setEnabledForAudiobooks] = useState(client.enabledForAudiobooks ?? true)
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
   const [pathRemap, setPathRemap] = useState(client.pathRemap || '')
@@ -218,6 +220,8 @@ function EditClientForm({ client, onClose, onSaved }: { client: DownloadClient; 
       pathRemap: pathRemap.trim(),
       useSsl: useSSL,
       urlBase: urlBase.trim(),
+      enabledForBooks,
+      enabledForAudiobooks,
     }
     if (isPasswordClient(type)) {
       data.clearApiKey = true
@@ -346,6 +350,19 @@ function EditClientForm({ client, onClose, onSaved }: { client: DownloadClient; 
           <p className="text-xs text-slate-500 dark:text-zinc-500 mt-1">{t('settings.clients.audiobookCategoryHelp')}</p>
         </div>
       )}
+      <div>
+        <label className={labelCls}>{t('settings.clients.eligibilityLabel')}</label>
+        <div className="flex gap-4">
+          <div className="flex items-center gap-2">
+            <input type="checkbox" id={`edit-eligible-books-${client.id}`} checked={enabledForBooks} onChange={e => setEnabledForBooks(e.target.checked)} className="rounded border-slate-300 dark:border-zinc-700" />
+            <label htmlFor={`edit-eligible-books-${client.id}`} className="text-sm">{t('settings.clients.enabledForBooks')}</label>
+          </div>
+          <div className="flex items-center gap-2">
+            <input type="checkbox" id={`edit-eligible-audiobooks-${client.id}`} checked={enabledForAudiobooks} onChange={e => setEnabledForAudiobooks(e.target.checked)} className="rounded border-slate-300 dark:border-zinc-700" />
+            <label htmlFor={`edit-eligible-audiobooks-${client.id}`} className="text-sm">{t('settings.clients.enabledForAudiobooks')}</label>
+          </div>
+        </div>
+      </div>
       <PathRemapField
         id={`edit-client-path-remap-${client.id}`}
         label="Download client path remap"
@@ -388,6 +405,8 @@ function AddClientForm({ onClose, onAdded }: { onClose: () => void; onAdded: (c:
   const [urlBase, setUrlBase] = useState('')
   const [category, setCategory] = useState('books')
   const [categoryAudiobook, setCategoryAudiobook] = useState('')
+  const [enabledForBooks, setEnabledForBooks] = useState(true)
+  const [enabledForAudiobooks, setEnabledForAudiobooks] = useState(true)
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
   const [pathRemap, setPathRemap] = useState('')
@@ -438,8 +457,8 @@ function AddClientForm({ onClose, onAdded }: { onClose: () => void; onAdded: (c:
   }
 
   const buildData = () => isPasswordClient(type)
-    ? { name, host, port: parseInt(port), username: hasUsername(type) ? username : '', password: credential, apiKey: '', category, categoryAudiobook: categoryAudiobook.trim(), pathRemap: pathRemap.trim(), type, enabled: true, useSsl: useSSL, urlBase: urlBase.trim() }
-    : { name, host, port: parseInt(port), apiKey: credential, username: '', password: '', category, categoryAudiobook: categoryAudiobook.trim(), pathRemap: pathRemap.trim(), type, enabled: true, useSsl: useSSL, urlBase: urlBase.trim() }
+    ? { name, host, port: parseInt(port), username: hasUsername(type) ? username : '', password: credential, apiKey: '', category, categoryAudiobook: categoryAudiobook.trim(), pathRemap: pathRemap.trim(), type, enabled: true, useSsl: useSSL, urlBase: urlBase.trim(), enabledForBooks, enabledForAudiobooks }
+    : { name, host, port: parseInt(port), apiKey: credential, username: '', password: '', category, categoryAudiobook: categoryAudiobook.trim(), pathRemap: pathRemap.trim(), type, enabled: true, useSsl: useSSL, urlBase: urlBase.trim(), enabledForBooks, enabledForAudiobooks }
 
   const submit = async () => {
     const data = buildData()
@@ -546,6 +565,19 @@ function AddClientForm({ onClose, onAdded }: { onClose: () => void; onAdded: (c:
           <p className="text-xs text-slate-500 dark:text-zinc-500 mt-1">{t('settings.clients.audiobookCategoryHelp')}</p>
         </div>
       )}
+      <div>
+        <label className={labelCls}>{t('settings.clients.eligibilityLabel')}</label>
+        <div className="flex gap-4">
+          <div className="flex items-center gap-2">
+            <input type="checkbox" id="add-eligible-books" checked={enabledForBooks} onChange={e => setEnabledForBooks(e.target.checked)} className="rounded border-slate-300 dark:border-zinc-700" />
+            <label htmlFor="add-eligible-books" className="text-sm">{t('settings.clients.enabledForBooks')}</label>
+          </div>
+          <div className="flex items-center gap-2">
+            <input type="checkbox" id="add-eligible-audiobooks" checked={enabledForAudiobooks} onChange={e => setEnabledForAudiobooks(e.target.checked)} className="rounded border-slate-300 dark:border-zinc-700" />
+            <label htmlFor="add-eligible-audiobooks" className="text-sm">{t('settings.clients.enabledForAudiobooks')}</label>
+          </div>
+        </div>
+      </div>
       <PathRemapField
         id="add-client-path-remap"
         label="Download client path remap"

@@ -53,6 +53,7 @@ export default function SearchPage() {
         size: r.size,
         indexerId: r.indexerId,
         protocol: r.protocol,
+        mediaType: r.mediaType,
       })
       setGrabbed(prev => new Set(prev).add(r.guid))
     } catch (e) {

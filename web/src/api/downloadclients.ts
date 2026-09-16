@@ -23,6 +23,12 @@ export interface DownloadClient {
   categoryAudiobook?: string
   pathRemap?: string
   enabled: boolean
+  // Eligibility gates (independent of category/pathRemap): a client not
+  // eligible for a media type is skipped when a grab of that type is routed.
+  // Both default true, so an existing client keeps handling everything until
+  // a user opts it out of one.
+  enabledForBooks: boolean
+  enabledForAudiobooks: boolean
   health?: DownloadClientHealth
 }
 

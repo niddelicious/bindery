@@ -139,3 +139,28 @@ describe('SearchPage no-download-client nudge', () => {
     expect(screen.queryByText(noClientBody)).not.toBeInTheDocument()
   })
 })
+
+// A free-text search result carries its own detected mediaType (the search
+// page groups results as "Ebook"/"Audiobook" from exactly this field), so the
+// grab payload must forward it — otherwise the backend can't route the grab
+// to a client eligible for that media type (#2401 regression).
+describe('SearchPage grab forwards mediaType', () => {
+  it('includes the search result mediaType in the grab payload', async () => {
+    vi.mocked(api.searchIndexers).mockResolvedValue([
+      makeResult({ guid: 'audio-guid', title: 'Some Book M4B', mediaType: 'audiobook' }),
+    ])
+    vi.mocked(api.grab).mockResolvedValue(makeDownload({ guid: 'audio-guid' }))
+    renderSearchPage()
+    fireEvent.change(screen.getByPlaceholderText(en.search.placeholder), {
+      target: { value: 'some book' },
+    })
+    fireEvent.submit(screen.getByPlaceholderText(en.search.placeholder).closest('form')!)
+    const grabButton = await screen.findByRole('button', { name: en.search.grab })
+
+    fireEvent.click(grabButton)
+
+    await waitFor(() => expect(api.grab).toHaveBeenCalledWith(
+      expect.objectContaining({ guid: 'audio-guid', mediaType: 'audiobook' }),
+    ))
+  })
+})

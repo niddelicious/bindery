@@ -146,6 +146,8 @@ function makeClient(overrides: Partial<DownloadClient> = {}): DownloadClient {
     category: 'books',
     pathRemap: '',
     enabled: true,
+    enabledForBooks: true,
+    enabledForAudiobooks: true,
     ...overrides,
   }
 }
@@ -1744,6 +1746,8 @@ describe('SettingsPage', () => {
         enabled: true,
         useSsl: true,
         urlBase: '/sab',
+        enabledForBooks: true,
+        enabledForAudiobooks: true,
       })
     })
     expect(await screen.findByText('SAB Books')).toBeInTheDocument()
@@ -1823,6 +1827,8 @@ describe('SettingsPage', () => {
         enabled: true,
         useSsl: false,
         urlBase: '',
+        enabledForBooks: true,
+        enabledForAudiobooks: true,
       })
     })
   })
@@ -1864,6 +1870,8 @@ describe('SettingsPage', () => {
         pathRemap: '/media:/books',
         useSsl: true,
         urlBase: '/qbittorrent',
+        enabledForBooks: true,
+        enabledForAudiobooks: true,
       })
     })
     expect(await screen.findByText('qBit Books')).toBeInTheDocument()
@@ -1888,6 +1896,27 @@ describe('SettingsPage', () => {
       expect(api.addDownloadClient).toHaveBeenCalledWith(expect.objectContaining({
         category: 'ebooks',
         categoryAudiobook: 'audiobooks',
+      }))
+    })
+  })
+
+  it('defaults media-type eligibility to both, and persists opting a client out of one', async () => {
+    renderSettings()
+    await openClientsTab()
+
+    fireEvent.click(screen.getByRole('button', { name: 'settings.clients.addButton' }))
+    fireEvent.change(screen.getByPlaceholderText('Host'), { target: { value: 'sabnzbd' } })
+    fireEvent.change(screen.getByPlaceholderText('API Key'), { target: { value: 'k' } })
+    expect(screen.getByRole('checkbox', { name: 'settings.clients.enabledForBooks' })).toBeChecked()
+    expect(screen.getByRole('checkbox', { name: 'settings.clients.enabledForAudiobooks' })).toBeChecked()
+
+    fireEvent.click(screen.getByRole('checkbox', { name: 'settings.clients.enabledForAudiobooks' }))
+    fireEvent.click(screen.getByRole('button', { name: 'common.save' }))
+
+    await waitFor(() => {
+      expect(api.addDownloadClient).toHaveBeenCalledWith(expect.objectContaining({
+        enabledForBooks: true,
+        enabledForAudiobooks: false,
       }))
     })
   })
