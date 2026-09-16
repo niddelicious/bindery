@@ -120,14 +120,9 @@ func SendDownload(ctx context.Context, client *models.DownloadClient, sourceURL,
 	switch client.Type {
 	case "transmission":
 		trans := TransmissionFor(client)
-		// Transmission's download-dir must be an absolute path. The Category
-		// field is repurposed as an optional path override for Transmission; if
-		// the user left it as a bare label (e.g. "books") we pass "" so
-		// Transmission falls back to its own configured default directory.
-		transDL := client.Category
-		if !strings.HasPrefix(transDL, "/") {
-			transDL = ""
-		}
+		// Transmission's download directory is independent of the client's
+		// media-type eligibility and category fields.
+		transDL := torrentSavePath(client, opts)
 		torrentID, err := trans.AddTorrent(ctx, sourceURL, transDL, opts.SeedRatio)
 		if err != nil {
 			return nil, err
@@ -308,7 +303,7 @@ func GetStalledIDs(ctx context.Context, client *models.DownloadClient) (map[stri
 		return out, true, nil
 	case "transmission":
 		trans := TransmissionFor(client)
-		torrents, err := trans.GetTorrents(ctx, client.Category)
+		torrents, err := trans.GetTorrents(ctx, "")
 		if err != nil {
 			return nil, true, err
 		}
@@ -419,7 +414,7 @@ func getNZBGetLiveStatuses(ctx context.Context, client *models.DownloadClient) (
 func getTorrentLiveStatuses(ctx context.Context, client *models.DownloadClient) (map[string]LiveStatus, error) {
 	if client.Type == "transmission" {
 		trans := TransmissionFor(client)
-		torrents, err := trans.GetTorrents(ctx, client.Category)
+		torrents, err := trans.GetTorrents(ctx, "")
 		if err != nil {
 			return nil, err
 		}

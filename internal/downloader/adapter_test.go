@@ -131,20 +131,20 @@ func TestGetLiveStatusesTransmission(t *testing.T) {
 		t.Fatalf("unexpected size/status: %+v", status)
 	}
 
-	// Category acts as a download-directory filter on shared Transmission instances.
+	// Transmission polling is independent of the client's media-type category.
 	clientFiltered := &models.DownloadClient{Type: "transmission", Host: host, Port: port, Category: "/books"}
 	filteredByID, _, err := GetLiveStatuses(context.Background(), clientFiltered)
 	if err != nil {
 		t.Fatalf("GetLiveStatuses with category: %v", err)
 	}
-	if len(filteredByID) != 1 {
-		t.Fatalf("expected 1 status when category=/books, got %d", len(filteredByID))
+	if len(filteredByID) != 2 {
+		t.Fatalf("expected 2 statuses regardless of category, got %d", len(filteredByID))
 	}
 	if _, ok := filteredByID["7"]; !ok {
-		t.Fatalf("expected torrent id 7 in filtered result")
+		t.Fatalf("expected torrent id 7 in result")
 	}
-	if _, ok := filteredByID["99"]; ok {
-		t.Fatalf("torrent 99 (/other) should have been filtered out")
+	if _, ok := filteredByID["99"]; !ok {
+		t.Fatalf("expected torrent id 99 in result")
 	}
 }
 
@@ -544,11 +544,9 @@ func TestSendDownload_Transmission_ZeroID(t *testing.T) {
 	}
 }
 
-// TestSendDownload_Transmission_RelativeCategoryNotSentAsDownloadDir verifies
-// that a non-absolute Category value (the common default "books") is not
-// forwarded to Transmission as download-dir, which would cause
-// "download directory path is not absolute".
-func TestSendDownload_Transmission_RelativeCategoryNotSentAsDownloadDir(t *testing.T) {
+// TestSendDownload_Transmission_CategoryDoesNotSetDownloadDir verifies that
+// media-type/category configuration does not control Transmission's directory.
+func TestSendDownload_Transmission_CategoryDoesNotSetDownloadDir(t *testing.T) {
 	var gotBody map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&gotBody)
@@ -561,7 +559,6 @@ func TestSendDownload_Transmission_RelativeCategoryNotSentAsDownloadDir(t *testi
 	}))
 	defer srv.Close()
 	host, port := serverHostPort(t, srv.URL)
-	// "books" is a relative label — must NOT be sent as download-dir
 	client := &models.DownloadClient{Type: "transmission", Host: host, Port: port, Category: "books"}
 	if _, err := SendDownload(context.Background(), client, "magnet:?xt=urn:btih:abc", ""); err != nil {
 		t.Fatalf("SendDownload: %v", err)
@@ -572,9 +569,9 @@ func TestSendDownload_Transmission_RelativeCategoryNotSentAsDownloadDir(t *testi
 	}
 }
 
-// TestSendDownload_Transmission_AbsoluteCategorySentAsDownloadDir verifies
-// that when Category is an absolute path it IS forwarded as download-dir.
-func TestSendDownload_Transmission_AbsoluteCategorySentAsDownloadDir(t *testing.T) {
+// TestSendDownload_Transmission_UsesConfiguredDownloadDir verifies that the
+// global Bindery download directory is forwarded to Transmission.
+func TestSendDownload_Transmission_UsesConfiguredDownloadDir(t *testing.T) {
 	var gotBody map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&gotBody)
@@ -587,8 +584,8 @@ func TestSendDownload_Transmission_AbsoluteCategorySentAsDownloadDir(t *testing.
 	}))
 	defer srv.Close()
 	host, port := serverHostPort(t, srv.URL)
-	client := &models.DownloadClient{Type: "transmission", Host: host, Port: port, Category: "/custom/books"}
-	if _, err := SendDownload(context.Background(), client, "magnet:?xt=urn:btih:abc", ""); err != nil {
+	client := &models.DownloadClient{Type: "transmission", Host: host, Port: port, Category: "books"}
+	if _, err := SendDownload(context.Background(), client, "magnet:?xt=urn:btih:abc", "", SendOptions{DownloadDir: "/custom/books"}); err != nil {
 		t.Fatalf("SendDownload: %v", err)
 	}
 	args, _ := gotBody["arguments"].(map[string]any)

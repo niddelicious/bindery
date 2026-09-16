@@ -1026,6 +1026,8 @@ func (h *QueueHandler) grab(ctx context.Context, req grabRequest) (*models.Downl
 		slog.Warn("failed to update download status", "download_id", dl.ID, "status", models.StateDownloading, "error", err)
 	}
 	dl.Status = models.StateDownloading
+	slog.Info("download grabbed", "title", req.Title, "media_type", req.MediaType,
+		"protocol", req.Protocol, "client", client.Name, "client_media_type", client.MediaType)
 
 	h.recordHistory(ctx, models.HistoryEventGrabbed, req.Title, bookID, map[string]any{
 		"guid": req.GUID,
