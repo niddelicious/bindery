@@ -32,7 +32,7 @@ import { importListsApi } from './importlists'
 import { recommendationsApi } from './recommendations'
 
 // Shared core: public constant, error class, helpers, and CSRF init.
-export { ApiError, BINDERY_BASE, isNoDownloadClientError, initCSRF } from './core'
+export { ApiError, BINDERY_BASE, isNoDownloadClientError, isNoEligibleClientError, initCSRF } from './core'
 
 // Re-export every domain module's types so
 // `import { Book, Author, ImportList, … } from '../api/client'` still resolves.

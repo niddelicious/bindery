@@ -949,9 +949,9 @@ func TestRankClientsForMediaType(t *testing.T) {
 	high := models.DownloadClient{ID: 2, Name: "high-priority", Category: "books"}
 	audio := models.DownloadClient{ID: 3, Name: "audio", Category: "audiobooks"}
 
-	// RankClientsForMediaType preserves incoming order for clients it has no
-	// preference between — priority ordering is the caller's job (the DB
-	// layer already returns candidates ORDER BY priority).
+	// All three share the same (zero) Priority, so with nothing to break the
+	// tie on Priority the legacy category heuristic decides order — this is
+	// the pre-Priority-field behavior, preserved for anyone who never set it.
 	ranked := RankClientsForMediaType([]models.DownloadClient{high, low, audio}, models.MediaTypeEbook)
 	wantOrder := []int64{2, 1, 3}
 	for i, id := range wantOrder {
@@ -960,11 +960,23 @@ func TestRankClientsForMediaType(t *testing.T) {
 		}
 	}
 
-	// An audiobook grab ranks the audio-category client first even though it
-	// was last in priority order.
+	// Same tie-on-Priority case: the audio-category client ranks first for an
+	// audiobook grab even though it was listed last.
 	ranked = RankClientsForMediaType([]models.DownloadClient{high, low, audio}, models.MediaTypeAudiobook)
 	if ranked[0].ID != audio.ID {
 		t.Fatalf("expected audio client ranked first for audiobook, got %d", ranked[0].ID)
+	}
+
+	// #2412 regression: a client with an explicit CategoryAudiobook must not
+	// jump ahead of a client with a numerically lower (higher-precedence)
+	// Priority that has no category hint at all. Priority is the primary,
+	// user-controlled signal; the category heuristic only breaks a tie
+	// between clients that share the same Priority.
+	audiobooksPriority := models.DownloadClient{ID: 10, Name: "Audiobooks", Priority: 30}
+	bothCategoryAudiobook := models.DownloadClient{ID: 11, Name: "Both", Priority: 50, CategoryAudiobook: "audiobooks"}
+	ranked = RankClientsForMediaType([]models.DownloadClient{audiobooksPriority, bothCategoryAudiobook}, models.MediaTypeAudiobook)
+	if ranked[0].ID != audiobooksPriority.ID {
+		t.Fatalf("expected the higher-priority client (30) ranked first regardless of the category hint, got client %d first", ranked[0].ID)
 	}
 }
 

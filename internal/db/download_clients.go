@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -345,44 +346,48 @@ func PickClientForMediaType(clients []models.DownloadClient, mediaType string) *
 	return &ranked[0]
 }
 
-// RankClientsForMediaType orders clients by how well suited they are to the
-// given media type: an explicit CategoryAudiobook match first, then the
-// legacy "audio in category" heuristic, then the rest in their incoming
-// (priority) order. Unlike PickClientForMediaType it returns every client, so
-// a caller can retry the next-best one if sending to the first choice fails.
+// RankClientsForMediaType orders clients by Priority first (lower is tried
+// first — the user-controlled ordering signal), and only falls back to the
+// category heuristic to break a tie between clients that share the same
+// Priority: an explicit CategoryAudiobook match, then the legacy "audio in
+// category" heuristic, then everything else. Unlike PickClientForMediaType it
+// returns every client, so a caller can retry the next-best one if sending to
+// the first choice fails.
+//
+// Priority must win outright over the category hint — #2412 was a client
+// with CategoryAudiobook set jumping ahead of a higher-priority (lower
+// Priority number) client that had no category hint at all, because the
+// category heuristic used to partition the whole list before priority was
+// ever consulted.
 func RankClientsForMediaType(clients []models.DownloadClient, mediaType string) []models.DownloadClient {
-	if len(clients) <= 1 {
-		return clients
-	}
-	ranked := make([]models.DownloadClient, 0, len(clients))
-	used := make([]bool, len(clients))
-	take := func(match func(models.DownloadClient) bool) {
-		for i := range clients {
-			if !used[i] && match(clients[i]) {
-				ranked = append(ranked, clients[i])
-				used[i] = true
-			}
+	ranked := append([]models.DownloadClient(nil), clients...)
+	sort.SliceStable(ranked, func(i, j int) bool {
+		if ranked[i].Priority != ranked[j].Priority {
+			return ranked[i].Priority < ranked[j].Priority
 		}
-	}
-	// First pass: prefer a client whose explicit fields match.
-	take(func(c models.DownloadClient) bool {
-		return mediaType == models.MediaTypeAudiobook && strings.TrimSpace(c.CategoryAudiobook) != ""
+		return categoryPreferenceScore(ranked[i], mediaType) < categoryPreferenceScore(ranked[j], mediaType)
 	})
-	// Second pass: legacy heuristic for clients without CategoryAudiobook set.
-	take(func(c models.DownloadClient) bool {
-		cat := strings.ToLower(c.Category)
-		if mediaType == models.MediaTypeAudiobook {
-			return strings.Contains(cat, "audio")
-		}
-		return !strings.Contains(cat, "audio")
-	})
-	// Remaining clients, in their incoming (priority) order.
-	for i := range clients {
-		if !used[i] {
-			ranked = append(ranked, clients[i])
-		}
-	}
 	return ranked
+}
+
+// categoryPreferenceScore ranks a client's category hint for the given media
+// type; lower is more preferred. Only used to break a Priority tie — see
+// RankClientsForMediaType.
+func categoryPreferenceScore(c models.DownloadClient, mediaType string) int {
+	if mediaType == models.MediaTypeAudiobook && strings.TrimSpace(c.CategoryAudiobook) != "" {
+		return 0
+	}
+	audioCategory := strings.Contains(strings.ToLower(c.Category), "audio")
+	if mediaType == models.MediaTypeAudiobook {
+		if audioCategory {
+			return 1
+		}
+		return 2
+	}
+	if !audioCategory {
+		return 1
+	}
+	return 2
 }
 
 // FilterEligibleForMediaType keeps only clients that opted in to handling the

@@ -902,7 +902,7 @@ func noEligibleMediaTypeError(mediaType string) error {
 	if mediaType == models.MediaTypeAudiobook {
 		label = "audiobooks"
 	}
-	return fmt.Errorf("no enabled download client is eligible for %s — enable at least one client for %s in Settings → Download Clients", label, label)
+	return fmt.Errorf("no enabled download client is eligible for %s — enable a download client for %s in Settings", label, label)
 }
 
 // noProtocolClientError builds an actionable "no enabled download client" error.

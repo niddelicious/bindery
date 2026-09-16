@@ -146,6 +146,7 @@ function makeClient(overrides: Partial<DownloadClient> = {}): DownloadClient {
     category: 'books',
     pathRemap: '',
     enabled: true,
+    priority: 0,
     enabledForBooks: true,
     enabledForAudiobooks: true,
     ...overrides,
@@ -1748,6 +1749,7 @@ describe('SettingsPage', () => {
         urlBase: '/sab',
         enabledForBooks: true,
         enabledForAudiobooks: true,
+        priority: 0,
       })
     })
     expect(await screen.findByText('SAB Books')).toBeInTheDocument()
@@ -1829,6 +1831,7 @@ describe('SettingsPage', () => {
         urlBase: '',
         enabledForBooks: true,
         enabledForAudiobooks: true,
+        priority: 0,
       })
     })
   })
@@ -1872,6 +1875,7 @@ describe('SettingsPage', () => {
         urlBase: '/qbittorrent',
         enabledForBooks: true,
         enabledForAudiobooks: true,
+        priority: 0,
       })
     })
     expect(await screen.findByText('qBit Books')).toBeInTheDocument()
@@ -1919,6 +1923,18 @@ describe('SettingsPage', () => {
         enabledForAudiobooks: false,
       }))
     })
+  })
+
+  it('displays and sorts download clients by priority', async () => {
+    const low = makeClient({ id: 51, name: 'Low priority', priority: 5 })
+    const high = makeClient({ id: 52, name: 'High priority', priority: 1 })
+
+    renderSettings({ clients: [low, high] })
+    await openClientsTab()
+
+    const names = screen.getAllByRole('heading', { level: 4 }).map(h => h.textContent)
+    expect(names).toEqual(['High priority', 'Low priority'])
+    expect(screen.getByText(/High priority/).closest('div')?.parentElement?.textContent).toContain('settings.clients.priorityLabel: 1')
   })
 
   it('shows qBittorrent path health errors under the client', async () => {

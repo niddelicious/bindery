@@ -32,6 +32,12 @@ export default function ClientsTab({ clients, setClients }: Props) {
   const [clientTestResult, setClientTestResult] = useState<Record<number, { ok: boolean; msg: string; warn?: string }>>({})
   const [confirmDeleteClient, setConfirmDeleteClient] = useState<number | null>(null)
 
+  // The API already returns clients ORDER BY priority, but that order goes
+  // stale the moment a client is added, edited, or reordered without a full
+  // refetch (setClients just appends/replaces in place) — sort on every
+  // render so the list always reflects the order grabs are actually tried in.
+  const sortedClients = [...clients].sort((a, b) => a.priority - b.priority)
+
   return (
     <div>
       <div className="flex justify-between items-center mb-4">
@@ -44,7 +50,7 @@ export default function ClientsTab({ clients, setClients }: Props) {
         <p className="text-slate-600 dark:text-zinc-500 text-sm">{t('settings.clients.empty')}</p>
       ) : (
         <div className="space-y-2">
-          {clients.map(c => (
+          {sortedClients.map(c => (
             <div key={c.id}>
               <div className="flex items-center justify-between p-4 border border-slate-200 dark:border-zinc-800 rounded-lg bg-slate-100 dark:bg-zinc-900">
                 <div className="flex items-center gap-3 min-w-0">
@@ -58,7 +64,7 @@ export default function ClientsTab({ clients, setClients }: Props) {
                   />
                   <div className="min-w-0">
                     <h4 className={`font-medium text-sm ${!c.enabled ? 'text-slate-600 dark:text-zinc-500' : ''}`}>{c.name}</h4>
-                    <p className="text-xs text-slate-600 dark:text-zinc-500">{c.host}:{c.port} ({c.category})</p>
+                    <p className="text-xs text-slate-600 dark:text-zinc-500">{c.host}:{c.port} ({c.category}) · {t('settings.clients.priorityLabel')}: {c.priority}</p>
                   </div>
                 </div>
                 <div className="flex items-center gap-3 flex-shrink-0">
@@ -169,6 +175,7 @@ function EditClientForm({ client, onClose, onSaved }: { client: DownloadClient; 
   const [categoryAudiobook, setCategoryAudiobook] = useState(client.categoryAudiobook || '')
   const [enabledForBooks, setEnabledForBooks] = useState(client.enabledForBooks ?? true)
   const [enabledForAudiobooks, setEnabledForAudiobooks] = useState(client.enabledForAudiobooks ?? true)
+  const [priority, setPriority] = useState(String(client.priority ?? 0))
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
   const [pathRemap, setPathRemap] = useState(client.pathRemap || '')
@@ -222,6 +229,7 @@ function EditClientForm({ client, onClose, onSaved }: { client: DownloadClient; 
       urlBase: urlBase.trim(),
       enabledForBooks,
       enabledForAudiobooks,
+      priority: parseInt(priority) || 0,
     }
     if (isPasswordClient(type)) {
       data.clearApiKey = true
@@ -363,6 +371,11 @@ function EditClientForm({ client, onClose, onSaved }: { client: DownloadClient; 
           </div>
         </div>
       </div>
+      <div>
+        <label className={labelCls}>{t('settings.clients.priorityLabel')}</label>
+        <input type="number" value={priority} onChange={e => setPriority(e.target.value)} className={`${inputCls} max-w-[8rem]`} />
+        <p className="text-xs text-slate-500 dark:text-zinc-500 mt-1">{t('settings.clients.priorityHelp')}</p>
+      </div>
       <PathRemapField
         id={`edit-client-path-remap-${client.id}`}
         label="Download client path remap"
@@ -407,6 +420,7 @@ function AddClientForm({ onClose, onAdded }: { onClose: () => void; onAdded: (c:
   const [categoryAudiobook, setCategoryAudiobook] = useState('')
   const [enabledForBooks, setEnabledForBooks] = useState(true)
   const [enabledForAudiobooks, setEnabledForAudiobooks] = useState(true)
+  const [priority, setPriority] = useState('0')
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
   const [pathRemap, setPathRemap] = useState('')
@@ -457,8 +471,8 @@ function AddClientForm({ onClose, onAdded }: { onClose: () => void; onAdded: (c:
   }
 
   const buildData = () => isPasswordClient(type)
-    ? { name, host, port: parseInt(port), username: hasUsername(type) ? username : '', password: credential, apiKey: '', category, categoryAudiobook: categoryAudiobook.trim(), pathRemap: pathRemap.trim(), type, enabled: true, useSsl: useSSL, urlBase: urlBase.trim(), enabledForBooks, enabledForAudiobooks }
-    : { name, host, port: parseInt(port), apiKey: credential, username: '', password: '', category, categoryAudiobook: categoryAudiobook.trim(), pathRemap: pathRemap.trim(), type, enabled: true, useSsl: useSSL, urlBase: urlBase.trim(), enabledForBooks, enabledForAudiobooks }
+    ? { name, host, port: parseInt(port), username: hasUsername(type) ? username : '', password: credential, apiKey: '', category, categoryAudiobook: categoryAudiobook.trim(), pathRemap: pathRemap.trim(), type, enabled: true, useSsl: useSSL, urlBase: urlBase.trim(), enabledForBooks, enabledForAudiobooks, priority: parseInt(priority) || 0 }
+    : { name, host, port: parseInt(port), apiKey: credential, username: '', password: '', category, categoryAudiobook: categoryAudiobook.trim(), pathRemap: pathRemap.trim(), type, enabled: true, useSsl: useSSL, urlBase: urlBase.trim(), enabledForBooks, enabledForAudiobooks, priority: parseInt(priority) || 0 }
 
   const submit = async () => {
     const data = buildData()
@@ -577,6 +591,11 @@ function AddClientForm({ onClose, onAdded }: { onClose: () => void; onAdded: (c:
             <label htmlFor="add-eligible-audiobooks" className="text-sm">{t('settings.clients.enabledForAudiobooks')}</label>
           </div>
         </div>
+      </div>
+      <div>
+        <label className={labelCls}>{t('settings.clients.priorityLabel')}</label>
+        <input type="number" value={priority} onChange={e => setPriority(e.target.value)} className={`${inputCls} max-w-[8rem]`} />
+        <p className="text-xs text-slate-500 dark:text-zinc-500 mt-1">{t('settings.clients.priorityHelp')}</p>
       </div>
       <PathRemapField
         id="add-client-path-remap"
