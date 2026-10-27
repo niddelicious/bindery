@@ -1985,8 +1985,8 @@ func TestQueueGrab_SendFailureDoesNotTryAnotherClient(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if !strings.Contains(resp["error"], "eligible download client first") {
-		t.Errorf("expected error to name the selected client, got: %q", resp["error"])
+	if resp["error"] != sendFailedMessage {
+		t.Errorf("expected a generic send-failure message, got: %q", resp["error"])
 	}
 }
 

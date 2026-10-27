@@ -480,7 +480,7 @@ function EditClientForm({ client, onClose, onSaved }: { client: DownloadClient; 
       <div>
         <label className={labelCls}>{t('settings.clients.priorityLabel')}</label>
         <input type="number" value={priority} onChange={e => setPriority(e.target.value)} className={`${inputCls} max-w-[8rem]`} />
-        <p className="text-xs text-slate-500 dark:text-zinc-500 mt-1">{t('settings.clients.priorityHelp')}</p>
+        <p className="text-xs text-fg-muted mt-1">{t('settings.clients.priorityHelp')}</p>
       </div>
       <PathRemapField
         id={`edit-client-path-remap-${client.id}`}
@@ -735,7 +735,7 @@ function AddClientForm({ onClose, onAdded }: { onClose: () => void; onAdded: (c:
       <div>
         <label className={labelCls}>{t('settings.clients.priorityLabel')}</label>
         <input type="number" value={priority} onChange={e => setPriority(e.target.value)} className={`${inputCls} max-w-[8rem]`} />
-        <p className="text-xs text-slate-500 dark:text-zinc-500 mt-1">{t('settings.clients.priorityHelp')}</p>
+        <p className="text-xs text-fg-muted mt-1">{t('settings.clients.priorityHelp')}</p>
       </div>
       <PathRemapField
         id="add-client-path-remap"

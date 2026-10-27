@@ -1326,6 +1326,7 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 		specs = append(specs, decision.FreeleechOnlySpec{IndexerIDs: freeleechOnly})
 	}
 	dm := decision.New(specs...)
+	enabledProtocols := map[string]bool{"usenet": true, "torrent": true}
 	eligibleProtocols := map[string]bool{"usenet": true, "torrent": true}
 	if s.clients != nil {
 		enabledClients, err := s.clients.ListEnabled(ctx)
@@ -1334,11 +1335,21 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 			outcome = "download client lookup failed"
 			return
 		}
+		enabledProtocols = make(map[string]bool)
 		eligibleProtocols = make(map[string]bool)
 		for _, client := range enabledClients {
+			protocol := downloader.ProtocolForClient(client.Type)
+			enabledProtocols[protocol] = true
 			if len(db.FilterEligibleForMediaType([]models.DownloadClient{client}, mediaType)) > 0 {
-				eligibleProtocols[downloader.ProtocolForClient(client.Type)] = true
+				eligibleProtocols[protocol] = true
 			}
+		}
+	}
+	resultProtocolEnabled := false
+	for _, result := range results {
+		if enabledProtocols[result.Protocol] {
+			resultProtocolEnabled = true
+			break
 		}
 	}
 	resultCountBeforeClientFilter := len(results)
@@ -1350,8 +1361,13 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 	}
 	results = filteredResults
 	if len(results) == 0 && resultCountBeforeClientFilter > 0 {
-		slog.Warn("SearchAndGrabBook: no enabled download client eligible for media type", "book", book.Title, "mediaType", mediaType)
-		outcome = "no eligible download client for media type"
+		if resultProtocolEnabled {
+			slog.Warn("SearchAndGrabBook: no enabled download client eligible for media type", "book", book.Title, "mediaType", mediaType)
+			outcome = "no eligible download client for media type"
+		} else {
+			slog.Warn("SearchAndGrabBook: no enabled download client for protocol", "book", book.Title)
+			outcome = "no download client for protocol"
+		}
 		return
 	}
 	releases := make([]decision.Release, len(results))
@@ -1443,15 +1459,22 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 	// An indexer pinned to a download client (#3080) sends every grab to that
 	// client or, above, was skipped. There is deliberately no fallback to the
 	// default pick for its releases.
-	client := bestClient
-	if client == nil {
-		candidates, err := s.clients.GetEnabledByProtocol(ctx, best.Protocol)
+	var candidates []models.DownloadClient
+	if bestClient != nil {
+		candidates = []models.DownloadClient{*bestClient}
+	} else {
+		var err error
+		candidates, err = s.clients.GetEnabledByProtocol(ctx, best.Protocol)
 		if err != nil {
 			slog.Error("SearchAndGrabBook: failed to list download clients", "protocol", best.Protocol, "error", err)
 			outcome = "download client lookup failed"
 			return
 		}
-		client = db.PickClientForMediaType(candidates, mediaType)
+	}
+	if len(candidates) == 0 {
+		slog.Warn("SearchAndGrabBook: no enabled download client for protocol", "book", book.Title, "protocol", best.Protocol)
+		outcome = "no download client for protocol"
+		return
 	}
 	// No cross-protocol fallback: a usenet release must not be pushed to a
 	// torrent client (qBittorrent would accept the .nzb URL, fail to parse it
@@ -1463,6 +1486,7 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 		return
 	}
 	ranked := db.RankClientsForMediaType(eligible, mediaType)
+	client := &ranked[0]
 
 	slog.Info("auto-grabbing book",
 		"book", book.Title,
@@ -1540,7 +1564,6 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 		return
 	}
 
-	client := &ranked[0]
 	sendRes, err := downloader.SendDownload(ctx, client, best.NZBURL, best.Title, downloader.SendOptions{
 		MediaType:            mediaType,
 		DownloadDir:          s.downloadDir,

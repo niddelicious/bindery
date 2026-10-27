@@ -119,6 +119,14 @@ func pinnedMessage(ctx context.Context, perr *db.PinnedClientError) string {
 	return perr.Message(isAdminCtx(ctx))
 }
 
+func isNoEligibleMediaTypeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, "no enabled ") && strings.Contains(message, " download client is eligible for")
+}
+
 // writeGrabError answers an error from grab or resendRelease. A missing client
 // is a setup problem the user can fix (400, with a code the web app keys on);
 // a refused or unreachable client is a generic 502, since the text comes from
@@ -135,7 +143,7 @@ func writeGrabError(w http.ResponseWriter, r *http.Request, err error) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": pinnedMessage(r.Context(), perr), "code": codeIndexerClientUnavailable})
 	case errors.Is(err, errNoDownloadClient):
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error(), "code": codeNoDownloadClient})
-	case strings.Contains(err.Error(), "no enabled download client is eligible for"):
+	case isNoEligibleMediaTypeError(err):
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 	case errors.Is(err, errSendFailed):
 		slog.Warn("grab: download client did not take the release", "method", r.Method, "path", r.URL.Path, "error", err)
@@ -164,7 +172,7 @@ func queueItemMessage(ctx context.Context, err error) string {
 		return pinnedMessage(ctx, perr)
 	case errors.Is(err, errNoDownloadClient), errors.Is(err, errAlreadyGrabbed),
 		errors.Is(err, errRetryNotResendable), errors.Is(err, errGrabBookNotFound),
-		strings.Contains(err.Error(), "no enabled download client is eligible for"):
+		isNoEligibleMediaTypeError(err):
 		return err.Error()
 	case errors.Is(err, errSendFailed):
 		slog.Warn("bulk queue item: download client did not take the release", "error", err)

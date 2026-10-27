@@ -26,10 +26,10 @@ type DownloadClient struct {
 	// so a client handles everything until a user opts it out of one type.
 	EnabledForBooks      bool                  `json:"enabledForBooks"`
 	EnabledForAudiobooks bool                  `json:"enabledForAudiobooks"`
-	RemoveOnImport    bool                  `json:"removeOnImport"`
-	CreatedAt         time.Time             `json:"createdAt"`
-	UpdatedAt         time.Time             `json:"updatedAt"`
-	Health            *DownloadClientHealth `json:"health,omitempty"`
+	RemoveOnImport       bool                  `json:"removeOnImport"`
+	CreatedAt            time.Time             `json:"createdAt"`
+	UpdatedAt            time.Time             `json:"updatedAt"`
+	Health               *DownloadClientHealth `json:"health,omitempty"`
 
 	// Username and Password are used by download clients that authenticate with
 	// credentials rather than an API key (e.g. qBittorrent, Transmission).
