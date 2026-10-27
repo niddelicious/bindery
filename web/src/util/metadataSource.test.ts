@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import {
   hardcoverSeriesUrl,
+  metadataRetrievedDate,
   metadataSourceLink,
   providerDisplayName,
   providerFromBookForeignId,
@@ -54,6 +55,26 @@ describe('metadataSourceLink', () => {
     })
   })
 
+  it('links NB book records but not authority-file authors', () => {
+    expect(metadataSourceLink('nb:a0000000000000000000000000000001', 'book')).toEqual({
+      url: 'https://www.nb.no/items/a0000000000000000000000000000001',
+      label: 'Nasjonalbiblioteket',
+    })
+    expect(metadataSourceLink('nb:author:10000001', 'author')).toBeNull()
+    expect(metadataSourceLink('nb:../x', 'book')).toBeNull()
+  })
+
+  it('links BnF book records to their catalogue ARK but not authority-file authors', () => {
+    expect(metadataSourceLink('bnf:cb48780493c', 'book')).toEqual({
+      url: 'https://catalogue.bnf.fr/ark:/12148/cb48780493c',
+      label: 'BnF',
+    })
+    expect(metadataSourceLink('bnf:author:11885918', 'author')).toBeNull()
+    expect(metadataSourceLink('bnf:author:11885918', 'book')).toBeNull()
+    expect(metadataSourceLink('bnf:../x', 'book')).toBeNull()
+    expect(metadataSourceLink('bnf:cb48780493c', 'author')).toBeNull()
+  })
+
   it('returns null for local or malformed provider ids', () => {
     expect(metadataSourceLink('abs:abc', 'book')).toBeNull()
     expect(metadataSourceLink('calibre:7', 'book')).toBeNull()
@@ -70,12 +91,28 @@ describe('metadataSourceLink', () => {
   })
 })
 
+describe('metadataRetrievedDate', () => {
+  it('prefers the last metadata fetch, then the date the row was added', () => {
+    expect(metadataRetrievedDate({ lastMetadataRefreshAt: '2026-10-09T18:30:00Z', createdAt: '2026-10-02T09:00:00Z' })).toBe('2026-10-09')
+    expect(metadataRetrievedDate({ lastMetadataRefreshAt: null, createdAt: '2026-10-02T09:00:00Z' })).toBe('2026-10-02')
+  })
+
+  it('returns null when there is no usable date', () => {
+    expect(metadataRetrievedDate(undefined)).toBeNull()
+    expect(metadataRetrievedDate({})).toBeNull()
+    expect(metadataRetrievedDate({ createdAt: 'not a date' })).toBeNull()
+    expect(metadataRetrievedDate({ createdAt: '0001-01-01T00:00:00Z' })).toBeNull()
+  })
+})
+
 describe('providerDisplayName', () => {
   it('names the providers a book can come from', () => {
     expect(providerDisplayName('openlibrary')).toBe('OpenLibrary')
     expect(providerDisplayName('hardcover')).toBe('Hardcover')
     expect(providerDisplayName('googlebooks')).toBe('Google Books')
     expect(providerDisplayName('dnb')).toBe('DNB')
+    expect(providerDisplayName('nb')).toBe('Nasjonalbiblioteket')
+    expect(providerDisplayName('bnf')).toBe('BnF')
     expect(providerDisplayName('calibre')).toBe('Calibre')
     expect(providerDisplayName('audiobookshelf')).toBe('Audiobookshelf')
   })
@@ -101,6 +138,8 @@ describe('providerFromBookForeignId', () => {
     expect(providerFromBookForeignId('hc:123')).toBe('hardcover')
     expect(providerFromBookForeignId('HC:123')).toBe('hardcover')
     expect(providerFromBookForeignId('dnb:123')).toBe('dnb')
+    expect(providerFromBookForeignId('nb:a0000000000000000000000000000001')).toBe('nb')
+    expect(providerFromBookForeignId('bnf:cb48780493c')).toBe('bnf')
     expect(providerFromBookForeignId('calibre:7')).toBe('calibre')
     expect(providerFromBookForeignId('abs:lib:item')).toBe('audiobookshelf')
   })

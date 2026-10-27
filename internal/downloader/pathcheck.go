@@ -25,8 +25,8 @@ const (
 	PathNotVisible = "warning"
 	// PathUnknown means the client type does not expose a completed-downloads
 	// path Bindery can introspect (SABnzbd, Transmission, Deluge), so the Test
-	// stays connection-only with no regression. rTorrent does expose one
-	// (directory.default) and is checked.
+	// stays connection-only with no regression. rTorrent is checked at the
+	// folder Bindery sends it (#2664).
 	PathUnknown = "unknown"
 )
 
@@ -41,6 +41,10 @@ type PathVisibility struct {
 	// Path is the resolved, path-remapped local path that was stat'd. Empty for
 	// PathUnknown.
 	Path string `json:"path,omitempty"`
+	// RemotePath is the completed folder exactly as the client reports it,
+	// before any remap, cleaned in the client's own namespace. It is the left
+	// hand side a path remap needs (#2031). Empty for PathUnknown.
+	RemotePath string `json:"remotePath,omitempty"`
 }
 
 // CheckCompletedPathVisibility resolves the client's completed-downloads path,
@@ -81,11 +85,83 @@ func CheckCompletedPathVisibility(ctx context.Context, client *models.DownloadCl
 // client serves audiobooks separately, rather than pointing only at the ebook
 // one (#1984, the half left over from #1993).
 func completedPathVisibility(ctx context.Context, client *models.DownloadClient, downloadDir, audiobookDownloadDir, globalRemap string) PathVisibility {
+	if client.Type == "qbittorrent" || client.Type == "rtorrent" {
+		return grabPathVisibility(ctx, client, downloadDir, audiobookDownloadDir, globalRemap)
+	}
 	info, err := CompletedPath(ctx, client)
 	if err != nil || strings.TrimSpace(info.Path) == "" {
 		return PathVisibility{Status: PathUnknown}
 	}
 	return statRemappedPath(client, info.Path, clientExpectedHint(client, downloadDir, audiobookDownloadDir), globalRemap)
+}
+
+// grabPathVisibility checks the folder a grab actually lands in, resolved by
+// GrabSavePath exactly as the diagnose action resolves it, rather than the
+// client's default folder (#2664).
+//
+// The default was the wrong folder for two setups. rTorrent is sent
+// d.directory.set on every grab, built from BINDERY_DOWNLOAD_DIR, so its
+// directory.default says nothing about where Bindery's downloads go: a
+// seedbox keeping ~/rtorrent/download as its default, with grabs sent to a
+// remapped /data that imports fine, was told its completed folder was not
+// visible. And qBittorrent saves a category with an empty save path to the
+// default save path plus the category name, not to the default itself.
+//
+// Each media type whose grab folder differs is checked, ebook first, and the
+// first folder Bindery cannot read is the answer. A media type the client
+// cannot answer for is skipped; none answering is PathUnknown, as before.
+func grabPathVisibility(ctx context.Context, client *models.DownloadClient, downloadDir, audiobookDownloadDir, globalRemap string) PathVisibility {
+	// GrabSavePath answers rTorrent from the folder Bindery sends without
+	// needing the client, so ask the client first: one that does not answer
+	// is PathUnknown, as it always was, rather than judged on Bindery's own
+	// folder alone.
+	if _, err := CompletedPath(ctx, client); err != nil {
+		return PathVisibility{Status: PathUnknown}
+	}
+	hint := clientExpectedHint(client, downloadDir, audiobookDownloadDir)
+	result := PathVisibility{Status: PathUnknown}
+	seen := map[string]bool{}
+	for _, mediaType := range []string{models.MediaTypeEbook, models.MediaTypeAudiobook} {
+		info, err := GrabSavePath(ctx, client, mediaType, downloadDir, audiobookDownloadDir, globalRemap)
+		if err != nil || strings.TrimSpace(info.Path) == "" || seen[info.Path] {
+			continue
+		}
+		seen[info.Path] = true
+		vis := statRemappedPath(client, info.Path, hint, globalRemap)
+		if vis.Status == PathNotVisible && info.CreatedOnGrab {
+			vis = createdOnGrabVisibility(vis)
+		}
+		if vis.Status == PathNotVisible {
+			return vis
+		}
+		if result.Status == PathUnknown {
+			result = vis
+		}
+	}
+	return result
+}
+
+// createdOnGrabVisibility judges a folder the client makes on the first grab
+// (ClientPathInfo.CreatedOnGrab) that does not exist yet. Its parent being
+// readable is as good as it gets before that first grab, so that is reported
+// as visible, naming the folder the client will create. A missing parent
+// keeps the original warning.
+func createdOnGrabVisibility(missing PathVisibility) PathVisibility {
+	localPath := missing.Path
+	if localPath == "" {
+		return missing
+	}
+	parent := filepath.Dir(localPath)
+	info, err := os.Stat(parent)
+	if err != nil || !info.IsDir() {
+		return missing
+	}
+	return PathVisibility{
+		Status:     PathVisible,
+		Path:       localPath,
+		RemotePath: missing.RemotePath,
+		Message:    fmt.Sprintf("Bindery can read %q, where the client creates the folder %q on its first download.", parent, localPath),
+	}
 }
 
 // clientExpectedHint describes the local directories Bindery is configured to
@@ -138,6 +214,27 @@ func RemapClientPath(client *models.DownloadClient, rawPath string, global *path
 	return rawPath, RemapRuleNone
 }
 
+// ClientSidePath is RemapClientPath run the other way: it renders a path on
+// Bindery's filesystem in the download client's own namespace, for a path
+// Bindery sends to the client. The precedence is the same, so whatever is
+// sent reads back to where it started: the client's own PathRemap first, and
+// only if none of its rules covers the path the global
+// BINDERY_DOWNLOAD_PATH_REMAP (#2665).
+//
+// "Covers" means a rule matched, not that the path changed. A client that
+// mounts Bindery's download folder at the same path, next to a global remap
+// written for other clients, opts out of the global remap with an identity
+// rule such as "/downloads:/downloads"; that rule matches and maps the folder
+// to itself, so the global remap is not consulted.
+func ClientSidePath(client *models.DownloadClient, localPath string, global *pathmap.Remapper) string {
+	if client != nil && strings.TrimSpace(client.PathRemap) != "" {
+		if clientPath, matched := pathmap.Parse(client.PathRemap).ApplyInverseMatched(localPath); matched {
+			return clientPath
+		}
+	}
+	return global.ApplyInverse(localPath)
+}
+
 // remapClientPath is RemapClientPath for callers holding the global remap as
 // its raw setting string and needing only the path.
 func remapClientPath(client *models.DownloadClient, rawPath, globalRemap string) string {
@@ -154,20 +251,23 @@ func statRemappedPath(client *models.DownloadClient, clientPath, expectedHint, g
 	if localPath == "." || localPath == "" {
 		return PathVisibility{Status: PathUnknown}
 	}
+	remotePath := pathmap.CleanClientPath(clientPath)
 	if info, err := os.Stat(localPath); err == nil {
 		if !info.IsDir() {
 			// A file where a directory is expected is unusual but readable; still
 			// report visible since Bindery can reach it.
 			return PathVisibility{
-				Status:  PathVisible,
-				Path:    localPath,
-				Message: fmt.Sprintf("Bindery can read the client's completed-downloads path at %q.", localPath),
+				Status:     PathVisible,
+				Path:       localPath,
+				RemotePath: remotePath,
+				Message:    fmt.Sprintf("Bindery can read the client's completed-downloads path at %q.", localPath),
 			}
 		}
 		return PathVisibility{
-			Status:  PathVisible,
-			Path:    localPath,
-			Message: fmt.Sprintf("Bindery can read the client's completed-downloads folder at %q.", localPath),
+			Status:     PathVisible,
+			Path:       localPath,
+			RemotePath: remotePath,
+			Message:    fmt.Sprintf("Bindery can read the client's completed-downloads folder at %q.", localPath),
 		}
 	}
 
@@ -184,10 +284,10 @@ func statRemappedPath(client *models.DownloadClient, clientPath, expectedHint, g
 	}
 	msg := fmt.Sprintf("Connected, but Bindery can't read the client's completed-downloads folder at %q — %s.", localPath, hint)
 	if local := strings.TrimSpace(clientPath); local != "" && filepath.Clean(local) != localPath {
-		msg = fmt.Sprintf("Connected, but Bindery can't read the client's completed-downloads folder. The client writes to %q, which maps to %q inside Bindery, but that path does not exist — %s.", filepath.Clean(local), localPath, hint)
+		msg = fmt.Sprintf("Connected, but Bindery can't read the client's completed-downloads folder. The client writes to %q, which maps to %q inside Bindery, but that path does not exist — %s.", pathmap.CleanClientPath(local), localPath, hint)
 	}
 	if expected := strings.TrimSpace(expectedHint); expected != "" {
 		msg += fmt.Sprintf(" Bindery is configured to read from %s.", expected)
 	}
-	return PathVisibility{Status: PathNotVisible, Message: msg, Path: localPath}
+	return PathVisibility{Status: PathNotVisible, Message: msg, Path: localPath, RemotePath: remotePath}
 }

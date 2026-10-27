@@ -5,6 +5,8 @@ import { resolveBookQuery } from '../api/booklookup'
 import { metadataSourceLink, providerDisplayName, providerFromBookForeignId } from '../util/metadataSource'
 import { btn, btnSize } from './buttons'
 import MetadataLinksMenu from './MetadataLinksMenu'
+import { useModal } from './useModal'
+import CoverImage from './CoverImage'
 
 interface AuthorMismatch {
   currentAuthor: string
@@ -45,6 +47,10 @@ export default function RebindModal({ book, onClose, onSuccess }: Props) {
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [mismatch, setMismatch] = useState<AuthorMismatch | null>(null)
+
+  // A native modal <dialog> already traps focus and turns Escape into a
+  // cancel event; useModal adds the back button (#3052).
+  useModal({ onClose, canClose: !submitting, native: true, labelledBy: 'book-rebind-title' })
 
   useEffect(() => {
     const element = dialog.current!
@@ -113,9 +119,12 @@ export default function RebindModal({ book, onClose, onSuccess }: Props) {
       onSuccess(updated)
     } catch (err: unknown) {
       if (err instanceof ApiError && err.status === 409) {
-        const body = err.body as { force_required?: boolean; current_author?: string; upstream_author?: string; error?: string } | null
+        const body = err.body as { force_required?: boolean; reason?: string; current_author?: string; upstream_author?: string; error?: string } | null
         if (body?.force_required) {
           setMismatch({ currentAuthor: body.current_author ?? '', upstreamAuthor: body.upstream_author ?? '' })
+        } else if (body?.reason === 'changed') {
+          // The book was edited while the new record was fetched (#2926).
+          setError(t('bookRebind.changed'))
         } else {
           setError(t('bookRebind.conflict'))
         }
@@ -130,15 +139,16 @@ export default function RebindModal({ book, onClose, onSuccess }: Props) {
   return (
     <dialog
       ref={dialog}
+      aria-modal="true"
       aria-labelledby="book-rebind-title"
       aria-describedby="book-rebind-description"
-      className="m-auto max-h-[90dvh] w-[calc(100%-2rem)] max-w-2xl overflow-y-auto rounded-lg border border-slate-300 bg-white p-0 text-slate-900 shadow-xl backdrop:bg-black/60 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
+      className="m-auto modal-max-h w-[calc(100%-2rem)] max-w-2xl overflow-y-auto rounded-lg border border-slate-300 bg-white p-0 text-slate-900 shadow-xl backdrop:bg-black/60 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
       onCancel={event => { event.preventDefault(); if (!submitting) onClose() }}
       onClick={event => { if (event.target === event.currentTarget && !submitting) onClose() }}
     >
       <div className="p-5 sm:p-6">
         <h2 id="book-rebind-title" className="text-lg font-semibold">{t('bookRebind.title')}</h2>
-        <p id="book-rebind-description" className="mt-1 text-sm text-slate-600 dark:text-zinc-400">
+        <p id="book-rebind-description" className="mt-1 text-sm text-fg-muted">
           {t('bookRebind.description', { title: book.title })}
         </p>
 
@@ -168,6 +178,7 @@ export default function RebindModal({ book, onClose, onSuccess }: Props) {
                   <label htmlFor="rebind-query" className="mb-1 block text-sm font-medium">{t('bookRebind.query')}</label>
                   <div className="flex flex-col gap-2 sm:flex-row">
                     <input
+                      enterKeyHint="search"
                       ref={queryInput}
                       id="rebind-query"
                       value={query}
@@ -179,9 +190,9 @@ export default function RebindModal({ book, onClose, onSuccess }: Props) {
                       {t(searching ? 'bookRebind.searching' : 'bookRebind.searchButton')}
                     </button>
                   </div>
-                  <p className="mt-2 text-xs text-slate-600 dark:text-zinc-400">{t('bookRebind.searchHint')}</p>
+                  <p className="mt-2 text-xs text-fg-muted">{t('bookRebind.searchHint')}</p>
                 </form>
-                <div role="status" className="mt-4 text-sm text-slate-600 dark:text-zinc-400">
+                <div role="status" className="mt-4 text-sm text-fg-muted">
                   {searching ? t('bookRebind.searching') : searched ? t(results.length ? 'bookRebind.resultCount' : 'bookRebind.noResults', { count: results.length }) : null}
                 </div>
                 {results.length > 0 && (
@@ -194,16 +205,16 @@ export default function RebindModal({ book, onClose, onSuccess }: Props) {
                       return (
                         <div key={candidate.foreignBookId} className="rounded p-3 hover:bg-slate-100 dark:hover:bg-zinc-800">
                           <label className="flex cursor-pointer items-start gap-3 rounded focus-within:outline-2 focus-within:outline-emerald-600">
-                            <input type="radio" name="rebind-result" className="mt-1 accent-emerald-600" disabled={isEdition || isOtherLibraryBook} checked={selected === candidate} onChange={() => { setSelected(candidate); setError(null) }} />
-                            {candidate.imageUrl && <img src={candidate.imageUrl} alt="" loading="lazy" className="h-16 w-11 shrink-0 rounded object-cover" />}
+                            <input type="radio" name="rebind-result" className="mt-1" disabled={isEdition || isOtherLibraryBook} checked={selected === candidate} onChange={() => { setSelected(candidate); setError(null) }} />
+                            <CoverImage src={candidate.imageUrl} alt="" loading="lazy" decoding="async" className="h-16 w-11 shrink-0 rounded object-cover" />
                             <span className="min-w-0 flex-1 text-sm">
                               <span className="block break-words font-medium">{candidate.title}</span>
-                              <span className="block text-slate-600 dark:text-zinc-400">{candidate.author?.authorName || t('bookRebind.unknownAuthor')}</span>
-                              <span className="block break-words text-xs text-slate-600 dark:text-zinc-400">
+                              <span className="block text-fg-muted">{candidate.author?.authorName || t('bookRebind.unknownAuthor')}</span>
+                              <span className="block break-words text-xs text-fg-muted">
                                 {providerDisplayName(providerFromBookForeignId(candidate.foreignBookId))} · {candidate.foreignBookId}
                                 {candidate.releaseDate ? ` · ${candidate.releaseDate.slice(0, 4)}` : ''}
                               </span>
-                              {isEdition && <span className="mt-1 block text-xs text-slate-600 dark:text-zinc-400">{t('bookRebind.editionHint')}</span>}
+                              {isEdition && <span className="mt-1 block text-xs text-fg-muted">{t('bookRebind.editionHint')}</span>}
                             </span>
                           </label>
                           {!!candidate.libraryBookId && (
@@ -233,7 +244,7 @@ export default function RebindModal({ book, onClose, onSuccess }: Props) {
                 <div>
                   <label htmlFor="rebind-id" className="mb-1 block text-sm font-medium">{t('bookRebind.identifier')}</label>
                   <input id="rebind-id" value={foreignId} onChange={event => { setForeignId(event.target.value); setError(null) }} disabled={submitting} placeholder={provider === 'openlibrary' ? 'OL12345W' : 'hc:12345'} className={inputClass} />
-                  <p className="mt-2 text-xs text-slate-600 dark:text-zinc-400">{t(`bookRebind.${provider}Hint`)}</p>
+                  <p className="mt-2 text-xs text-fg-muted">{t(`bookRebind.${provider}Hint`)}</p>
                 </div>
               </form>
             )}

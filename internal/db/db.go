@@ -3,21 +3,25 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"embed"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/vavallee/bindery/internal/indexer"
 	"github.com/vavallee/bindery/internal/isbnutil"
+	"github.com/vavallee/bindery/internal/models"
 	"github.com/vavallee/bindery/internal/textutil"
 
 	_ "modernc.org/sqlite"
@@ -66,8 +70,71 @@ func Open(dbPath string) (*sql.DB, error) {
 	return db, nil
 }
 
-// OpenMemory creates an in-memory database for testing.
+// OpenMemory creates an in-memory database for testing. Each call returns an
+// independent database holding the fully migrated schema.
+//
+// Running all migrations through modernc's transpiled SQLite costs ~2.5s per
+// call under -race, which is paid by hundreds of tests. So the first call
+// migrates a template once per process and every call after deserializes a
+// copy of it, which is byte-for-byte the state migrate would have produced.
 func OpenMemory() (*sql.DB, error) {
+	tmplOnce.Do(func() { tmpl, tmplErr = memoryTemplate() })
+	if tmplErr != nil {
+		return nil, tmplErr
+	}
+	db, err := openMemoryConn()
+	if err != nil {
+		return nil, err
+	}
+	if err := withRawConn(db, func(c memConn) error { return c.Deserialize(tmpl) }); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("load memory template: %w", err)
+	}
+	// Some DSN pragmas (synchronous, cache_size) belong to the schema, not the
+	// connection, so Deserialize resets them to SQLite's defaults. Set them again.
+	for _, p := range connectionPragmas() {
+		if _, err := db.Exec("PRAGMA " + p); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("reapply PRAGMA %s: %w", p, err)
+		}
+	}
+	return db, nil
+}
+
+var (
+	tmplOnce sync.Once
+	tmpl     []byte
+	tmplErr  error
+)
+
+// memConn is the part of modernc.org/sqlite's driver connection OpenMemory
+// uses to copy the template.
+type memConn interface {
+	Serialize() ([]byte, error)
+	Deserialize([]byte) error
+}
+
+func memoryTemplate() ([]byte, error) {
+	db, err := openMemoryConn()
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	if err := migrate(db); err != nil {
+		return nil, fmt.Errorf("run migrations: %w", err)
+	}
+	var buf []byte
+	err = withRawConn(db, func(c memConn) (err error) {
+		buf, err = c.Serialize()
+		return err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("serialize memory template: %w", err)
+	}
+	return buf, nil
+}
+
+func openMemoryConn() (*sql.DB, error) {
 	db, err := sql.Open("sqlite", ":memory:"+connectionPragmaDSN)
 	if err != nil {
 		return nil, fmt.Errorf("open memory database: %w", err)
@@ -83,13 +150,22 @@ func OpenMemory() (*sql.DB, error) {
 		db.Close()
 		return nil, err
 	}
-
-	if err := migrate(db); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("run migrations: %w", err)
-	}
-
 	return db, nil
+}
+
+func withRawConn(db *sql.DB, fn func(memConn) error) error {
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	return conn.Raw(func(dc any) error {
+		c, ok := dc.(memConn)
+		if !ok {
+			return fmt.Errorf("sqlite driver conn %T cannot serialize", dc)
+		}
+		return fn(c)
+	})
 }
 
 // preflight validates that the directory containing dbPath exists, is a
@@ -204,6 +280,13 @@ const connectionPragmaDSN = "?_pragma=foreign_keys(1)" +
 	"&_pragma=synchronous(1)" +
 	"&_pragma=temp_store(2)" +
 	"&_pragma=cache_size(-16000)"
+
+// connectionPragmas returns the pragmas connectionPragmaDSN sets, in the
+// driver's name(value) form.
+func connectionPragmas() []string {
+	q, _ := url.ParseQuery(strings.TrimPrefix(connectionPragmaDSN, "?"))
+	return q["_pragma"]
+}
 
 func setPragmas(db *sql.DB) error {
 	pragmas := []string{
@@ -389,6 +472,23 @@ func migrate(database *sql.DB) error {
 		return fmt.Errorf("backfill asin case: %w", err)
 	}
 
+	// Google Books, the Audiobookshelf import and the book edit API used to
+	// store a language exactly as it arrived ("en", "english") while the other
+	// write paths stored the ISO 639-2/B code ("eng"), so one author could hold
+	// both spellings. Those paths now go through models.NormalizeLanguageCode;
+	// this brings the rows they already wrote up to it (#3086).
+	if err := runBackfillOnce(database, backfillRevKeyLanguageCode, models.NormalizeLanguageCodeRev, backfillLanguageCodes); err != nil {
+		return fmt.Errorf("backfill language codes: %w", err)
+	}
+
+	// SetFilePath bound a library file to a book by the book's declared media
+	// type, and "both" fell back to ebook, so an .m4b or .mp3 found for such a
+	// book was stored as an ebook file (#3474). The writers now label by
+	// extension; this repairs the rows they already wrote.
+	if err := runBackfillOnce(database, backfillRevKeyBookFileFmt, bookFileFormatRev, backfillBookFileFormats); err != nil {
+		return fmt.Errorf("backfill book file formats: %w", err)
+	}
+
 	return nil
 }
 
@@ -433,7 +533,30 @@ const (
 	backfillRevKeyBookSortKeys = "backfill.book_sort_key_rev"
 	backfillRevKeySearchKeys   = "backfill.search_key_rev"
 	backfillRevKeyASINCase     = "backfill.asin_case_rev"
+	backfillRevKeyLanguageCode = "backfill.language_code_rev"
+	backfillRevKeyBookFileFmt  = "backfill.book_file_format_rev"
 )
+
+// bookFileFormatRev is the revision of the audio-extension rule behind
+// backfillBookFileFormats. Bump it if the set of audio extensions grows.
+const bookFileFormatRev = 1
+
+// BackfillRevisionKeys lists the settings keys that hold the normalizer
+// revision each startup backfill last ran at. The settings registry in
+// internal/api describes each one as Bindery's own bookkeeping, and a test there
+// fails when a key in this list has no descriptor, so a new backfill cannot
+// turn up on the Advanced tab as an unrecognised key.
+func BackfillRevisionKeys() []string {
+	return []string{
+		backfillRevKeyDedup,
+		backfillRevKeySortKeys,
+		backfillRevKeyBookSortKeys,
+		backfillRevKeySearchKeys,
+		backfillRevKeyASINCase,
+		backfillRevKeyLanguageCode,
+		backfillRevKeyBookFileFmt,
+	}
+}
 
 // backfillRevisionCurrent reports whether the stored marker for key already
 // equals want, i.e. whether the backfill that owns it can be skipped (#2346).
@@ -1083,9 +1206,10 @@ func backfillBookSortKeys(database *sql.DB) error {
 // backfillSearchKeys populates the three columns migration 083 adds for the
 // library search box: books.search_key, authors.search_key and
 // author_aliases.search_key, each folded from the text the box used to match
-// with `LIKE ? COLLATE NOCASE` (#1660).
+// with `LIKE ? COLLATE NOCASE` (#1660). Migration 114 adds series.search_key,
+// which the Books search also matches (#3462).
 //
-// All three are folded by the SAME function the query folder uses. That is the
+// All of them are folded by the SAME function the query folder uses. That is the
 // whole point of the column: the failure this replaces was not that LIKE is
 // slow, it was that the row and the query were reduced through different
 // alphabets — SQLite's ASCII-only case fold on one side and nothing at all on
@@ -1101,6 +1225,7 @@ func backfillSearchKeys(database *sql.DB) error {
 		{"books", "title"},
 		{"authors", "name"},
 		{"author_aliases", "name"},
+		{"series", "title"},
 	} {
 		n, err := backfillFoldedSearchColumn(database, target.table, target.source)
 		if err != nil {
@@ -1207,6 +1332,98 @@ func backfillASINColumn(database *sql.DB, table string) (int, error) {
 	return len(updates), nil
 }
 
+// backfillLanguageCodes re-normalizes every stored language through
+// models.NormalizeLanguageCode, in books.language and editions.language.
+//
+// Comparisons already normalize both sides (models.IsLanguageAllowed), so a
+// stale spelling never changed what the language filter let through. It shows
+// wherever the stored value is used as it is: the API response, the OPDS
+// feed's dc:language, and anything that groups by language, where "en" and
+// "eng" on one author read as two languages (#3086).
+//
+// A value NormalizeLanguageCode does not recognise comes back lowercased and
+// otherwise unchanged, so a language somebody typed by hand is never lost.
+//
+// Unconditional and idempotent like the other backfills; migrate() gates it on
+// backfill.language_code_rev against models.NormalizeLanguageCodeRev.
+func backfillLanguageCodes(database *sql.DB) error {
+	total := 0
+	for _, table := range []string{"books", "editions"} {
+		n, err := backfillLanguageColumn(database, table)
+		if err != nil {
+			return err
+		}
+		total += n
+	}
+	if total > 0 {
+		slog.Info("backfilled language codes", "rows", total)
+	}
+	return nil
+}
+
+// backfillLanguageColumn rewrites <table>.language for every row whose stored
+// value differs from models.NormalizeLanguageCode of itself, and reports how
+// many rows it touched. Table names are compile-time constants from this file,
+// never user input, so interpolating them is safe; only the values are bound.
+func backfillLanguageColumn(database *sql.DB, table string) (int, error) {
+	type pending struct {
+		id       int64
+		language string
+	}
+	// Read phase in its own scope so the cursor closes before the write tx
+	// opens — holding a read cursor across Begin() risks "database is locked".
+	updates, err := func() ([]pending, error) {
+		rows, err := database.Query(fmt.Sprintf(
+			"SELECT id, COALESCE(language, '') FROM %s WHERE COALESCE(language, '') != ''", table))
+		if err != nil {
+			return nil, fmt.Errorf("read %s for language backfill: %w", table, err)
+		}
+		defer rows.Close()
+		var out []pending
+		for rows.Next() {
+			var id int64
+			var stored string
+			if err := rows.Scan(&id, &stored); err != nil {
+				return nil, fmt.Errorf("scan %s row for language backfill: %w", table, err)
+			}
+			if want := models.NormalizeLanguageCode(stored); want != stored {
+				out = append(out, pending{id: id, language: want})
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("iterate %s for language backfill: %w", table, err)
+		}
+		return out, nil
+	}()
+	if err != nil {
+		return 0, err
+	}
+	if len(updates) == 0 {
+		return 0, nil
+	}
+
+	tx, err := database.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("begin %s language backfill tx: %w", table, err)
+	}
+	stmt, err := tx.Prepare(fmt.Sprintf("UPDATE %s SET language = ? WHERE id = ?", table))
+	if err != nil {
+		_ = tx.Rollback()
+		return 0, fmt.Errorf("prepare %s language backfill: %w", table, err)
+	}
+	defer stmt.Close()
+	for _, u := range updates {
+		if _, err := stmt.Exec(u.language, u.id); err != nil {
+			_ = tx.Rollback()
+			return 0, fmt.Errorf("update language for %s %d: %w", table, u.id, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit %s language backfill: %w", table, err)
+	}
+	return len(updates), nil
+}
+
 // backfillFoldedSearchColumn rewrites <table>.search_key from <table>.<source>
 // for every row where the two disagree, and reports how many rows it touched.
 func backfillFoldedSearchColumn(database *sql.DB, table, source string) (int, error) {
@@ -1295,4 +1512,69 @@ func stampBackfillRevisions(database *sql.DB) {
 	markBackfillRevision(database, backfillRevKeyBookSortKeys, bookSortKeyRev)
 	markBackfillRevision(database, backfillRevKeySearchKeys, textutil.FoldForSearchRev)
 	markBackfillRevision(database, backfillRevKeyASINCase, isbnutil.NormalizeASINRev)
+	markBackfillRevision(database, backfillRevKeyLanguageCode, models.NormalizeLanguageCodeRev)
+	markBackfillRevision(database, backfillRevKeyBookFileFmt, bookFileFormatRev)
+}
+
+// backfillBookFileFormats relabels book_files rows that hold an audio file but
+// say 'ebook' (#3474), then refreshes the status of each book it touched so the
+// stored paths and status follow the corrected inventory. It is unconditional
+// and idempotent; migrate() gates it on backfill.book_file_format_rev.
+//
+// Cost: the refresh does one os.Stat per tracked file of each touched book (see
+// derivedFormatPath). Only books with a mislabelled row are touched, normally a
+// handful, and the marker makes this a one time pass, so it runs inline rather
+// than in the background: a goroutine would compete with startup for the single
+// SQLite connection.
+func backfillBookFileFormats(database *sql.DB) error {
+	var conds []string
+	var args []any
+	for _, ext := range models.AudioExtensions() {
+		conds = append(conds, "LOWER(path) LIKE ?")
+		args = append(args, "%"+ext)
+	}
+	where := "format = 'ebook' AND (" + strings.Join(conds, " OR ") + ")"
+
+	ids, err := func() ([]int64, error) {
+		rows, err := database.Query("SELECT DISTINCT book_id FROM book_files WHERE "+where, args...)
+		if err != nil {
+			return nil, fmt.Errorf("read book_files for format backfill: %w", err)
+		}
+		defer rows.Close()
+		var out []int64
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				return nil, fmt.Errorf("scan book_files format backfill: %w", err)
+			}
+			out = append(out, id)
+		}
+		return out, rows.Err()
+	}()
+	if err != nil {
+		return err
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	res, err := database.Exec("UPDATE book_files SET format = 'audiobook' WHERE "+where, args...)
+	if err != nil {
+		return fmt.Errorf("relabel audio book_files: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	books := NewBookRepo(database)
+	for _, id := range ids {
+		before, _ := books.GetByID(context.Background(), id)
+		if err := books.refreshBookStatus(context.Background(), id); err != nil {
+			slog.Warn("book file format backfill: refresh book status", "bookID", id, "error", err)
+			continue
+		}
+		after, _ := books.GetByID(context.Background(), id)
+		if before != nil && after != nil && before.Status != after.Status {
+			slog.Info("book file format backfill changed a book's status",
+				"book_id", id, "title", after.Title, "from", before.Status, "to", after.Status)
+		}
+	}
+	slog.Info("relabelled audio files recorded as ebook files", "files", n, "books", len(ids))
+	return nil
 }

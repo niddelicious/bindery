@@ -2,7 +2,7 @@ replicaCount: 1
 
 image:
   repository: ghcr.io/vavallee/bindery
-  tag: "1.38.0"
+  tag: "1.46.0"
   pullPolicy: IfNotPresent
 
 service:
@@ -58,6 +58,10 @@ env:
   BINDERY_DB_PATH: /config/bindery.db
   BINDERY_DATA_DIR: /config
   BINDERY_LOG_LEVEL: info
+  # Days to keep a finished (imported or failed) download row before it is
+  # trimmed; 0 keeps every row. History and the blocklist are never trimmed.
+  # See docs/DEPLOYMENT.md for what trimming changes about duplicate grabs.
+  BINDERY_DOWNLOAD_RETENTION_DAYS: "90"
   # IMPORTANT: these defaults are placeholders, NOT a working layout — they are
   # two different paths and neither is backed by a mounted volume out of the
   # box. A dir that isn't inside a mounted volume writes to ephemeral container
@@ -81,10 +85,19 @@ env:
   # IP or CIDR of the reverse proxy in front of Bindery. When set, X-Forwarded-For
   # is trusted only from that address. Required for local-only auth mode to be safe.
   # BINDERY_TRUSTED_PROXY: "192.168.1.1"
+  # local-only and disabled auth modes skip the login only for host names a
+  # public site cannot have (IPs, localhost, single label names, .local, .lan,
+  # .home.arpa, .internal, .localdomain). If you open Bindery by an ingress
+  # host such as books.example.com, or a namespaced service name such as
+  # bindery.media.svc, in one of those modes, list it here. "*" turns the
+  # DNS rebinding check off; never wildcard a shared domain like duckdns.org.
+  # BINDERY_ALLOWED_HOSTS: "books.example.com"
   # Allow the UI to be embedded in an <iframe> by a trusted dashboard (Organizr,
   # etc.). Empty (default) blocks all framing. Set to a CSP frame-ancestors
   # source list: 'self' for same-origin, or a specific origin. See #1367.
   # BINDERY_FRAME_ANCESTORS: "https://organizr.example.com"
+  # Mode for the directories the importer creates: 0700, 0750 (default) or 0755.
+  # BINDERY_DIR_MODE: "0755"
 
 resources:
   requests:

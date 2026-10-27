@@ -2,6 +2,7 @@ package recommender
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/vavallee/bindery/internal/db"
@@ -343,5 +344,47 @@ func TestParsePosition_ProfilePackage(t *testing.T) {
 	}
 	if parsePosition("1.5") != 1.5 {
 		t.Error("1.5 should parse")
+	}
+}
+
+// A library's main genre counts for it (#3172). With the distinct genres as
+// the IDF numerator, a genre on more books than there are genres weighed
+// negatively: here crime, on 30 of 40 books across 5 genres, came out about
+// -1.34 and was missing from the top genres the genre searches use.
+func TestBuildProfile_MainGenreWeighsPositively(t *testing.T) {
+	f := newProfileFixtures(t)
+	a := seedAuthor(t, f, "Kari Nordmann", "OL1A", false)
+	n := 0
+	for genre, count := range map[string]int{"Crime": 30, "Thriller": 5, "Romance": 3, "History": 1, "Poetry": 1} {
+		for range count {
+			n++
+			seedBook(t, f, a.ID, fmt.Sprintf("OL%dW", n), fmt.Sprintf("Bok %d", n), []string{genre})
+		}
+	}
+
+	p, err := BuildProfile(context.Background(), f.userID, f.books, f.authors, f.series, f.recs, f.settings)
+	if err != nil {
+		t.Fatalf("BuildProfile: %v", err)
+	}
+	for genre, w := range p.GenreWeights {
+		if w < 0 {
+			t.Errorf("weight of %q = %.3f, want no negative weights", genre, w)
+		}
+	}
+	if w := p.GenreWeights["crime"]; w <= 0 {
+		t.Errorf("weight of the main genre = %.3f, want positive", w)
+	}
+	if !topNGenres(p, 3)["crime"] {
+		t.Errorf("top 3 genres = %v, want the main genre among them (weights %v)", topNGenres(p, 3), p.GenreWeights)
+	}
+	// TF-IDF over the books: tf * ln(books / books with the genre) peaks for
+	// a genre on about a third of the books, so thriller (5 of 40) edges out
+	// crime (30 of 40), and both sit above romance (3 of 40). Checking the
+	// order, not only the signs, catches a formula that merely avoids
+	// negatives, such as abs(ln(genres / books with the genre)), which puts
+	// crime first and thriller at 0 (#3173 review).
+	w := p.GenreWeights
+	if !(w["thriller"] > w["crime"] && w["crime"] > w["romance"] && w["romance"] > w["history"]) {
+		t.Errorf("weights %v, want thriller > crime > romance > history", w)
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/vavallee/bindery/internal/auth"
 	"github.com/vavallee/bindery/internal/db"
+	"github.com/vavallee/bindery/internal/indexer/newznab"
 	"github.com/vavallee/bindery/internal/models"
 )
 
@@ -79,6 +80,7 @@ func (h *HistoryHandler) List(w http.ResponseWriter, r *http.Request) {
 	items := make([]historyItem, len(events))
 	bookIDs := make([]int64, 0, len(events))
 	for i, e := range events {
+		e.Data = redactEventData(e.Data)
 		items[i] = historyItem{HistoryEvent: e}
 		if e.BookID != nil {
 			bookIDs = append(bookIDs, *e.BookID)
@@ -138,7 +140,11 @@ func (h *HistoryHandler) Blocklist(w http.ResponseWriter, r *http.Request) {
 	}
 
 	event, err := h.history.GetByID(r.Context(), id)
-	if err != nil || event == nil {
+	if err != nil {
+		writeServerError(w, r, err)
+		return
+	}
+	if event == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "history event not found"})
 		return
 	}
@@ -166,23 +172,24 @@ func (h *HistoryHandler) Blocklist(w http.ResponseWriter, r *http.Request) {
 	}
 	guid, _ := data["guid"].(string)
 
-	// Fall back to sourceTitle as a unique key if no guid stored
+	// BlocklistedSpec matches a release by GUID only, so an entry keyed on
+	// anything else (such as the title) could never match and would only tell
+	// the user a release is blocked when it is not (#3249). Refuse instead.
 	if guid == "" {
-		guid = event.SourceTitle
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "this history event has no release GUID, so there is nothing to blocklist"})
+		return
 	}
 
 	// Idempotent: blocklisting the same release twice must not create a
 	// duplicate row. Create has no unique constraint to lean on.
-	if guid != "" {
-		blocked, err := h.blocklist.IsBlocked(r.Context(), guid)
-		if err != nil {
-			writeServerError(w, r, err)
-			return
-		}
-		if blocked {
-			writeJSON(w, http.StatusOK, map[string]string{"status": "already blocklisted"})
-			return
-		}
+	blocked, err := h.blocklist.IsBlocked(r.Context(), guid)
+	if err != nil {
+		writeServerError(w, r, err)
+		return
+	}
+	if blocked {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "already blocklisted"})
+		return
 	}
 
 	entry := &models.BlocklistEntry{
@@ -206,5 +213,9 @@ func (h *HistoryHandler) Blocklist(w http.ResponseWriter, r *http.Request) {
 		writeServerError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, entry)
+	// The entry keeps the raw GUID, which search results are matched against;
+	// the caller, who may be any user, sees it without credentials.
+	shown := *entry
+	shown.GUID = newznab.RedactDownloadURL(shown.GUID)
+	writeJSON(w, http.StatusCreated, shown)
 }

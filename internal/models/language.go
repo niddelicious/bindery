@@ -33,12 +33,14 @@ func ParseAllowedLanguages(csv string) []string {
 	return out
 }
 
-// The three tables below are the only ISO 639 tables in the codebase, and
-// NormalizeLanguageCode is the only thing that reads them. There used to be
-// four such tables (here, in the indexer's release filter, and twice over in
-// the Audible ingestion paths) and they disagreed with each other, so the same
-// language filtered differently depending on which code path happened to be
-// consulted. Add a language here and every caller learns it at once.
+// The alias tables below are the only ISO 639 tables in the codebase, and
+// NormalizeLanguageCode is the only thing that reads them (languageNames,
+// further down, is a display table keyed by the codes they produce). There
+// used to be four competing copies (here, in the indexer's release filter,
+// and twice over in the Audible ingestion paths) and they disagreed with each
+// other, so the same language filtered differently depending on which code
+// path happened to be consulted. Add a language here and every caller learns
+// it at once.
 
 // iso639TwoLetterToB maps ISO 639-1 two-letter codes to the ISO 639-2/B
 // three-letter vocabulary Bindery stores in Book.Language and metadata-profile
@@ -47,10 +49,50 @@ func ParseAllowedLanguages(csv string) []string {
 var iso639TwoLetterToB = map[string]string{
 	"en": "eng", "fr": "fre", "de": "ger", "nl": "dut", "es": "spa",
 	"it": "ita", "pt": "por", "ja": "jpn", "zh": "chi", "ru": "rus",
-	"sv": "swe", "no": "nor", "da": "dan", "pl": "pol", "cs": "cze",
+	"sv": "swe", "no": "nor", "nb": "nor", "nn": "nor", "da": "dan", "pl": "pol", "cs": "cze",
 	"tr": "tur", "hi": "hin", "ko": "kor", "ar": "ara", "fi": "fin",
 	"el": "gre", "hu": "hun", "ro": "rum", "ca": "cat", "la": "lat",
+	// The rest of ISO 639-1, so a file tagged "uk", "he" or "sk" is read as
+	// the language it names rather than as no language at all (#2998).
+	"aa": "aar", "ab": "abk", "ae": "ave", "af": "afr", "ak": "aka",
+	"am": "amh", "an": "arg", "as": "asm", "av": "ava", "ay": "aym",
+	"az": "aze", "ba": "bak", "be": "bel", "bg": "bul", "bi": "bis",
+	"bm": "bam", "bn": "ben", "bo": "tib", "br": "bre", "bs": "bos",
+	"ce": "che", "ch": "cha", "co": "cos", "cr": "cre", "cu": "chu",
+	"cv": "chv", "cy": "wel", "dv": "div", "dz": "dzo", "ee": "ewe",
+	"eo": "epo", "et": "est", "eu": "baq", "fa": "per", "ff": "ful",
+	"fj": "fij", "fo": "fao", "fy": "fry", "ga": "gle", "gd": "gla",
+	"gl": "glg", "gn": "grn", "gu": "guj", "gv": "glv", "ha": "hau",
+	"he": "heb", "ho": "hmo", "hr": "hrv", "ht": "hat", "hy": "arm",
+	"hz": "her", "ia": "ina", "id": "ind", "ie": "ile", "ig": "ibo",
+	"ii": "iii", "ik": "ipk", "io": "ido", "is": "ice", "iu": "iku",
+	"jv": "jav", "ka": "geo", "kg": "kon", "ki": "kik", "kj": "kua",
+	"kk": "kaz", "kl": "kal", "km": "khm", "kn": "kan", "kr": "kau",
+	"ks": "kas", "ku": "kur", "kv": "kom", "kw": "cor", "ky": "kir",
+	"lb": "ltz", "lg": "lug", "li": "lim", "ln": "lin", "lo": "lao",
+	"lt": "lit", "lu": "lub", "lv": "lav", "mg": "mlg", "mh": "mah",
+	"mi": "mao", "mk": "mac", "ml": "mal", "mn": "mon", "mr": "mar",
+	"ms": "may", "mt": "mlt", "my": "bur", "na": "nau", "nd": "nde",
+	"ne": "nep", "ng": "ndo", "nr": "nbl", "nv": "nav", "ny": "nya",
+	"oc": "oci", "oj": "oji", "om": "orm", "or": "ori", "os": "oss",
+	"pa": "pan", "pi": "pli", "ps": "pus", "qu": "que", "rm": "roh",
+	"rn": "run", "rw": "kin", "sa": "san", "sc": "srd", "sd": "snd",
+	"se": "sme", "sg": "sag", "si": "sin", "sk": "slo", "sl": "slv",
+	"sm": "smo", "sn": "sna", "so": "som", "sq": "alb", "sr": "srp",
+	"ss": "ssw", "st": "sot", "su": "sun", "sw": "swa", "ta": "tam",
+	"te": "tel", "tg": "tgk", "th": "tha", "ti": "tir", "tk": "tuk",
+	"tl": "tgl", "tn": "tsn", "to": "ton", "ts": "tso", "tt": "tat",
+	"tw": "twi", "ty": "tah", "ug": "uig", "uk": "ukr", "ur": "urd",
+	"uz": "uzb", "ve": "ven", "vi": "vie", "vo": "vol", "wa": "wln",
+	"wo": "wol", "xh": "xho", "yi": "yid", "yo": "yor", "za": "zha",
+	"zu": "zul",
 }
+
+// iso639LegacyTwoLetter maps the ISO 639-1 codes withdrawn in 1989 onto the
+// codes that replaced them. Older EPUB tools and Java locales still write
+// them, and passed through raw they read as no language at all and relabelled
+// a book to "iw".
+var iso639LegacyTwoLetter = map[string]string{"iw": "he", "in": "id", "ji": "yi"}
 
 // iso639TermToB maps the ISO 639-2/T (terminology) code onto the 639-2/B
 // (bibliographic) code for the twenty languages where the two standards
@@ -64,6 +106,13 @@ var iso639TermToB = map[string]string{
 	"fra": "fre", "isl": "ice", "kat": "geo", "mkd": "mac", "mri": "mao",
 	"msa": "may", "nld": "dut", "ron": "rum", "slk": "slo", "zho": "chi",
 }
+
+// iso639NorwegianToB folds the two Norwegian written standards onto the
+// macrolanguage code. Bokmål and Nynorsk have their own ISO 639-2 codes, and
+// Norwegian catalogues (EPUB dc:language, the National Library) use them, but
+// a metadata profile offers only "Norwegian" and stores "nor". Without this a
+// profile allowing Norwegian rejected every book tagged "nob" or "nno".
+var iso639NorwegianToB = map[string]string{"nob": "nor", "nno": "nor"}
 
 // iso639NameToB maps a language written out as a word onto its 639-2/B code.
 // Audible reports languages this way ("english", "german"), and release names
@@ -102,6 +151,80 @@ var iso639NameToB = map[string]string{
 	"latin": "lat",
 }
 
+// iso639ChineseToB folds the ISO 639-3 codes for the two Chinese languages
+// books are written in onto the macrolanguage code a profile stores, the way
+// iso639NorwegianToB does for Norwegian. EPUBs tag themselves "cmn" or "yue"
+// as well as "zh".
+var iso639ChineseToB = map[string]string{"cmn": "chi", "yue": "chi"}
+
+// languagePrimarySubtag splits the language off a tag that carries a region,
+// script or variant subtag ("en-US" gives "en"), and reports whether code is
+// such a tag at all.
+//
+// A separator alone does not make one. A hyphenated name the tables do not
+// know ("Serbo-Croatian", "Old-High-German") is a whole value, and since
+// NormalizeLanguageCode now decides what is stored, cutting it at the hyphen
+// would keep "serbo" or "old" and lose the rest for good (#3086). So the part
+// before the separator has to be a code the tables recognise, whatever follows
+// it ("zh-Hant-TW", "ca-valencia"). A code they do not recognise is only split
+// from a plain region ("fil-PH", "es-419"), the one shape a name cannot be
+// mistaken for.
+func languagePrimarySubtag(code string) (string, bool) {
+	i := strings.IndexAny(code, "-_")
+	if i != 2 && i != 3 {
+		return "", false
+	}
+	primary, rest := code[:i], code[i+1:]
+	if isKnownLanguageCode(primary) || isRegionSubtag(rest) {
+		return primary, true
+	}
+	return "", false
+}
+
+// isRegionSubtag reports whether s has the shape of a BCP 47 region: two
+// letters ("us") or three digits ("419").
+func isRegionSubtag(s string) bool {
+	switch len(s) {
+	case 2:
+		return isASCIILetter(s[0]) && isASCIILetter(s[1])
+	case 3:
+		return isASCIIDigit(s[0]) && isASCIIDigit(s[1]) && isASCIIDigit(s[2])
+	}
+	return false
+}
+
+func isASCIILetter(c byte) bool { return c >= 'a' && c <= 'z' }
+func isASCIIDigit(c byte) bool  { return c >= '0' && c <= '9' }
+
+// isKnownLanguageCode reports whether code is a two- or three-letter code any
+// of the tables above resolve.
+func isKnownLanguageCode(code string) bool {
+	for _, table := range []map[string]string{
+		iso639TwoLetterToB, iso639LegacyTwoLetter, iso639TermToB,
+		iso639NorwegianToB, iso639ChineseToB, languageNames,
+	} {
+		if _, ok := table[code]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// IsKnownLanguage reports whether raw (a code in any spelling, or a language
+// name) resolves to a language in Bindery's ISO 639 tables. Unlike
+// NormalizeLanguageCode, which passes an unrecognised three letter string
+// through unchanged, this is false for it. Used where the source is sloppy,
+// such as audio tags, so junk like "xxx" or "abc" abstains rather than votes.
+func IsKnownLanguage(raw string) bool {
+	return isKnownLanguageCode(NormalizeLanguageCode(raw))
+}
+
+// NormalizeLanguageCodeRev is the revision of NormalizeLanguageCode's output.
+// Bump it whenever a change here would give an already-stored language a
+// different value; the startup backfill gated on this marker then
+// re-normalizes existing rows. See runBackfillOnce in internal/db.
+const NormalizeLanguageCodeRev = 1
+
 // NormalizeLanguageCode canonicalizes a language code from any source (an
 // EPUB's dc:language, provider metadata, a hand-edited metadata profile) into
 // the lowercased ISO 639-2/B form the language filter compares against. It
@@ -121,10 +244,16 @@ func NormalizeLanguageCode(code string) string {
 		return b
 	}
 	// Drop a region/script subtag: "en-US", "pt_BR", "zh-Hans".
-	if i := strings.IndexAny(code, "-_"); i > 0 {
-		code = code[:i]
+	if primary, ok := languagePrimarySubtag(code); ok {
+		code = primary
+	}
+	if b, ok := iso639ChineseToB[code]; ok {
+		return b
 	}
 	if len(code) == 2 {
+		if current, ok := iso639LegacyTwoLetter[code]; ok {
+			code = current
+		}
 		if b, ok := iso639TwoLetterToB[code]; ok {
 			return b
 		}
@@ -133,7 +262,96 @@ func NormalizeLanguageCode(code string) string {
 	if b, ok := iso639TermToB[code]; ok {
 		return b
 	}
+	if b, ok := iso639NorwegianToB[code]; ok {
+		return b
+	}
 	return code
+}
+
+// releaseRegionToB maps the country codes scene release groups put in a
+// release name's language slot where the country code is not the language's
+// own ISO 639-1 code: "-WEB-SE-" is a Swedish release, but ISO 639-1 "se" is
+// Northern Sami, and "dk" is no language code at all (#3271). Kept apart from
+// the ISO tables because it is only right for release names: a book or file
+// tagged "se" really is Northern Sami.
+var releaseRegionToB = map[string]string{
+	"se": "swe", "dk": "dan",
+}
+
+// NormalizeReleaseLanguageCode is NormalizeLanguageCode for a language code
+// read from a scene release name, which may be one of the country codes in
+// releaseRegionToB instead of a language code.
+func NormalizeReleaseLanguageCode(code string) string {
+	if b, ok := releaseRegionToB[strings.ToLower(strings.TrimSpace(code))]; ok {
+		return b
+	}
+	return NormalizeLanguageCode(code)
+}
+
+// languageNames gives the English name of each language Bindery recognises,
+// keyed by the ISO 639-2/B code NormalizeLanguageCode produces, so a message
+// can say "Swedish" rather than "swe".
+var languageNames = map[string]string{
+	"aar": "Afar", "abk": "Abkhazian", "afr": "Afrikaans", "aka": "Akan",
+	"alb": "Albanian", "amh": "Amharic", "ara": "Arabic", "arg": "Aragonese",
+	"arm": "Armenian", "asm": "Assamese", "ava": "Avaric", "ave": "Avestan",
+	"aym": "Aymara", "aze": "Azerbaijani", "bak": "Bashkir", "bam": "Bambara",
+	"baq": "Basque", "bel": "Belarusian", "ben": "Bengali", "bis": "Bislama",
+	"bos": "Bosnian", "bre": "Breton", "bul": "Bulgarian", "bur": "Burmese",
+	"cat": "Catalan", "cha": "Chamorro", "che": "Chechen", "chi": "Chinese",
+	"chu": "Church Slavic", "chv": "Chuvash", "cor": "Cornish",
+	"cos": "Corsican", "cre": "Cree", "cze": "Czech", "dan": "Danish",
+	"div": "Divehi", "dut": "Dutch", "dzo": "Dzongkha", "eng": "English",
+	"epo": "Esperanto", "est": "Estonian", "ewe": "Ewe", "fao": "Faroese",
+	"fij": "Fijian", "fin": "Finnish", "fre": "French",
+	"fry": "Western Frisian", "ful": "Fulah", "geo": "Georgian",
+	"ger": "German", "gla": "Scottish Gaelic", "gle": "Irish",
+	"glg": "Galician", "glv": "Manx", "gre": "Greek", "grn": "Guarani",
+	"guj": "Gujarati", "hat": "Haitian Creole", "hau": "Hausa", "heb": "Hebrew",
+	"her": "Herero", "hin": "Hindi", "hmo": "Hiri Motu", "hrv": "Croatian",
+	"hun": "Hungarian", "ibo": "Igbo", "ice": "Icelandic", "ido": "Ido",
+	"iii": "Sichuan Yi", "iku": "Inuktitut", "ile": "Interlingue",
+	"ina": "Interlingua", "ind": "Indonesian", "ipk": "Inupiaq",
+	"ita": "Italian", "jav": "Javanese", "jpn": "Japanese",
+	"kal": "Kalaallisut", "kan": "Kannada", "kas": "Kashmiri", "kau": "Kanuri",
+	"kaz": "Kazakh", "khm": "Khmer", "kik": "Kikuyu", "kin": "Kinyarwanda",
+	"kir": "Kyrgyz", "kom": "Komi", "kon": "Kongo", "kor": "Korean",
+	"kua": "Kuanyama", "kur": "Kurdish", "lao": "Lao", "lat": "Latin",
+	"lav": "Latvian", "lim": "Limburgish", "lin": "Lingala",
+	"lit": "Lithuanian", "ltz": "Luxembourgish", "lub": "Luba-Katanga",
+	"lug": "Ganda", "mac": "Macedonian", "mah": "Marshallese",
+	"mal": "Malayalam", "mao": "Maori", "mar": "Marathi", "may": "Malay",
+	"mlg": "Malagasy", "mlt": "Maltese", "mon": "Mongolian", "nau": "Nauru",
+	"nav": "Navajo", "nbl": "South Ndebele", "nde": "North Ndebele",
+	"ndo": "Ndonga", "nep": "Nepali", "nor": "Norwegian", "nya": "Chichewa",
+	"oci": "Occitan", "oji": "Ojibwa", "ori": "Odia", "orm": "Oromo",
+	"oss": "Ossetian", "pan": "Punjabi", "per": "Persian", "pli": "Pali",
+	"pol": "Polish", "por": "Portuguese", "pus": "Pashto", "que": "Quechua",
+	"roh": "Romansh", "rum": "Romanian", "run": "Rundi", "rus": "Russian",
+	"sag": "Sango", "san": "Sanskrit", "sin": "Sinhala", "slo": "Slovak",
+	"slv": "Slovenian", "sme": "Northern Sami", "smo": "Samoan", "sna": "Shona",
+	"snd": "Sindhi", "som": "Somali", "sot": "Southern Sotho", "spa": "Spanish",
+	"srd": "Sardinian", "srp": "Serbian", "ssw": "Swati", "sun": "Sundanese",
+	"swa": "Swahili", "swe": "Swedish", "tah": "Tahitian", "tam": "Tamil",
+	"tat": "Tatar", "tel": "Telugu", "tgk": "Tajik", "tgl": "Tagalog",
+	"tha": "Thai", "tib": "Tibetan", "tir": "Tigrinya", "ton": "Tongan",
+	"tsn": "Tswana", "tso": "Tsonga", "tuk": "Turkmen", "tur": "Turkish",
+	"twi": "Twi", "uig": "Uyghur", "ukr": "Ukrainian", "urd": "Urdu",
+	"uzb": "Uzbek", "ven": "Venda", "vie": "Vietnamese", "vol": "Volapuk",
+	"wel": "Welsh", "wln": "Walloon", "wol": "Wolof", "xho": "Xhosa",
+	"yid": "Yiddish", "yor": "Yoruba", "zha": "Zhuang", "zul": "Zulu",
+}
+
+// LanguageName returns the English name of a language code in any spelling
+// NormalizeLanguageCode accepts ("sv", "swe", "sv-SE" all give "Swedish"). A
+// code with no known name is returned normalised, so the result is never
+// empty for a non-empty input.
+func LanguageName(code string) string {
+	n := NormalizeLanguageCode(code)
+	if name, ok := languageNames[n]; ok {
+		return name
+	}
+	return n
 }
 
 // LanguageCodeVariants returns the provider-facing ISO spellings that are
@@ -161,6 +379,11 @@ func LanguageCodeVariants(codes []string) []string {
 		for terminology, bibliographic := range iso639TermToB {
 			if bibliographic == normalized {
 				add(terminology)
+			}
+		}
+		for standard, macro := range iso639NorwegianToB {
+			if macro == normalized {
+				add(standard)
 			}
 		}
 	}

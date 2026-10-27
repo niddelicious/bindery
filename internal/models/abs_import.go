@@ -32,18 +32,21 @@ type ABSImportRunEntity struct {
 }
 
 type ABSProvenance struct {
-	ID          int64     `json:"id"`
-	SourceID    string    `json:"sourceId"`
-	LibraryID   string    `json:"libraryId"`
-	EntityType  string    `json:"entityType"`
-	ExternalID  string    `json:"externalId"`
-	LocalID     int64     `json:"localId"`
-	ItemID      string    `json:"itemId"`
-	Format      string    `json:"format"`
-	FileIDs     []string  `json:"fileIds"`
-	ImportRunID *int64    `json:"importRunId,omitempty"`
-	CreatedAt   time.Time `json:"createdAt"`
-	UpdatedAt   time.Time `json:"updatedAt"`
+	ID          int64    `json:"id"`
+	SourceID    string   `json:"sourceId"`
+	LibraryID   string   `json:"libraryId"`
+	EntityType  string   `json:"entityType"`
+	ExternalID  string   `json:"externalId"`
+	LocalID     int64    `json:"localId"`
+	ItemID      string   `json:"itemId"`
+	Format      string   `json:"format"`
+	FileIDs     []string `json:"fileIds"`
+	ImportRunID *int64   `json:"importRunId,omitempty"`
+	// KeepIdentity marks a book link made through a file the book already
+	// tracked (#1691). Imports through it keep the book's own author and title.
+	KeepIdentity bool      `json:"keepIdentity,omitempty"`
+	CreatedAt    time.Time `json:"createdAt"`
+	UpdatedAt    time.Time `json:"updatedAt"`
 }
 
 type ABSMetadataConflict struct {
@@ -85,4 +88,16 @@ type ABSReviewItem struct {
 	Status                  string    `json:"status"`
 	CreatedAt               time.Time `json:"createdAt"`
 	UpdatedAt               time.Time `json:"updatedAt"`
+}
+
+// ABSSeriesMatchState records what the Hardcover series match concluded for one
+// ABS item (#2173). Outcome is "matched" or "miss"; InputHash digests the inputs
+// the match read, so a changed item no longer agrees with it.
+type ABSSeriesMatchState struct {
+	SourceID  string
+	LibraryID string
+	ItemID    string
+	InputHash string
+	Outcome   string
+	CheckedAt time.Time
 }

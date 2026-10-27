@@ -38,8 +38,25 @@ export function metadataSourceLink(
     return { url: `https://d-nb.info/${controlNumber}`, label: 'DNB' }
   }
 
+  // Book IDs are NB record ids; author IDs are authority-file ids with no
+  // public NB page.
+  if (kind === 'book' && lowerID.startsWith('nb:')) {
+    const record = lowerID.slice(3)
+    if (!/^[0-9a-f]{32}$/.test(record)) return null
+    return { url: `https://www.nb.no/items/${record}`, label: 'Nasjonalbiblioteket' }
+  }
+
+  // Book IDs are the record's ARK, whose public page is the BnF catalogue
+  // record. Author IDs are authority record numbers; their ARK needs a
+  // check character Bindery does not store, so authors get no link.
+  if (kind === 'book' && lowerID.startsWith('bnf:')) {
+    const ark = lowerID.slice(4)
+    if (!/^cb[0-9]{8,9}[0-9bcdfghjkmnpqrstvwxz]$/.test(ark)) return null
+    return { url: `https://catalogue.bnf.fr/ark:/12148/${ark}`, label: 'BnF' }
+  }
+
   // No reliable public URL for these providers.
-  if (lowerID.startsWith('hc:') || lowerID.startsWith('dnb:') || lowerID.startsWith('abs:') || lowerID.startsWith('calibre:')) {
+  if (lowerID.startsWith('hc:') || lowerID.startsWith('dnb:') || lowerID.startsWith('nb:') || lowerID.startsWith('bnf:') || lowerID.startsWith('abs:') || lowerID.startsWith('calibre:')) {
     return null
   }
 
@@ -63,6 +80,8 @@ const PROVIDER_NAMES: Record<string, string> = {
   hardcover: 'Hardcover',
   googlebooks: 'Google Books',
   dnb: 'DNB',
+  nb: 'Nasjonalbiblioteket',
+  bnf: 'BnF',
   calibre: 'Calibre',
   audiobookshelf: 'Audiobookshelf',
 }
@@ -82,9 +101,29 @@ export function providerFromBookForeignId(foreignId: string | undefined | null):
   if (id.startsWith('gb:')) return 'googlebooks'
   if (id.startsWith('hc:')) return 'hardcover'
   if (id.startsWith('dnb:')) return 'dnb'
+  if (id.startsWith('nb:')) return 'nb'
+  if (id.startsWith('bnf:')) return 'bnf'
   if (id.startsWith('calibre:')) return 'calibre'
   if (id.startsWith('abs:')) return 'audiobookshelf'
   return 'openlibrary'
+}
+
+// When a record's provider data was retrieved, for the providers whose
+// licence asks for the date next to the credit: BnF's Licence Ouverte /
+// Open Licence 2.0 asks for the source and the date of the data (#3144).
+// Bindery keeps no fetch time per field, so this is the row's own: when its
+// metadata was last fetched (a rebind, or an author's metadata refresh),
+// else when it was added. Returns a calendar date (YYYY-MM-DD) or null.
+export function metadataRetrievedDate(
+  record: { lastMetadataRefreshAt?: string | null; createdAt?: string | null } | undefined | null,
+): string | null {
+  for (const value of [record?.lastMetadataRefreshAt, record?.createdAt]) {
+    if (!value) continue
+    const when = new Date(value)
+    // The zero time a Go time.Time marshals to is not a date.
+    if (!Number.isNaN(when.getTime()) && when.getUTCFullYear() > 1) return when.toISOString().slice(0, 10)
+  }
+  return null
 }
 
 // Public page for a Hardcover series (#1708).

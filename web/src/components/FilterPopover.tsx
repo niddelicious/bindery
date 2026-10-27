@@ -50,6 +50,7 @@ export function FilterGroup<T extends string>({
               type="button"
               role="radio"
               aria-checked={active}
+              data-value={opt.value}
               aria-label={opt.ariaLabel}
               onClick={() => onChange(opt.value)}
               className={`flex items-center gap-2 px-2 py-1.5 rounded text-left text-sm transition-colors ${
@@ -58,7 +59,7 @@ export function FilterGroup<T extends string>({
                   : 'text-slate-700 dark:text-zinc-300 hover:bg-slate-200 dark:hover:bg-zinc-700'
               }`}
             >
-              <span aria-hidden="true" className={`w-3 text-emerald-600 dark:text-emerald-400 ${active ? '' : 'opacity-0'}`}>
+              <span aria-hidden="true" className={`w-3 text-accent-text ${active ? '' : 'opacity-0'}`}>
                 ✓
               </span>
               <span className="truncate">{opt.label}</span>
@@ -123,7 +124,7 @@ export default function FilterPopover({
         aria-controls={open ? panelId : undefined}
         aria-label={ariaLabel}
         onClick={() => setOpen(o => !o)}
-        className={`${btn.secondary} ${btnSize.sm}`}
+        className={`touch-target ${btn.secondary} ${btnSize.sm}`}
       >
         {label}
         {activeCount > 0 && (
@@ -137,7 +138,7 @@ export default function FilterPopover({
       {open && (
         <div
           id={panelId}
-          className="absolute left-0 top-full mt-1 z-20 min-w-[13rem] max-h-[70vh] overflow-y-auto rounded-lg border border-slate-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 shadow-lg divide-y divide-slate-200 dark:divide-zinc-700"
+          className="absolute left-0 top-full mt-1 z-20 min-w-[13rem] max-h-[70dvh] overflow-y-auto rounded-lg border border-slate-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 shadow-lg divide-y divide-slate-200 dark:divide-zinc-700"
         >
           {children}
         </div>

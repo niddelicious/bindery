@@ -33,7 +33,7 @@ func newAuthorDiscoverer(discover authorDiscoverFunc, bulkRunning func() bool) s
 				Err:     err,
 				// hardcover.ErrRateLimited is checked too: the bare sentinel does
 				// not carry the shared mark, only its throttle errors do.
-				Backoff: errors.Is(err, metadata.ErrRateLimited) || errors.Is(err, hardcover.ErrRateLimited),
+				Backoff: metadata.IsProviderHold(err) || errors.Is(err, metadata.ErrRateLimited) || errors.Is(err, hardcover.ErrRateLimited),
 				Busy:    errors.Is(err, api.ErrAuthorSyncRunning),
 			}
 			out.Unavailable = !out.Backoff && !out.Busy && metadata.IsProviderUnavailable(err)

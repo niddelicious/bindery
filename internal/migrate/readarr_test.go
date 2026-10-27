@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	neturl "net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -744,4 +745,46 @@ func TestImportReadarr_NameOnlyMatchDoesNotBypassGuard(t *testing.T) {
 		t.Errorf("authors result = %+v, want the row failed rather than added", res)
 	}
 	assertNoAuthorBound(t, repo, dnbAuthorID)
+}
+
+// S9: the Readarr database path is spliced into a `file:` DSN, so a path with
+// "?", "#" or "%" in it must be taken literally and must not make SQLite open
+// (and create) some other file read-write.
+func TestImportReadarr_PathWithURISyntaxIsTakenLiterally(t *testing.T) {
+	built := newReadarrDB(t)
+	base := t.TempDir()
+	awkward := filepath.Join(base, "readarr ?mode=rwc#1 %41")
+	if err := os.MkdirAll(awkward, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(awkward, "readarr.db")
+	if err := os.Rename(built, path); err != nil {
+		t.Fatal(err)
+	}
+
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	res, err := ImportReadarr(context.Background(), path, db.NewAuthorRepo(database), db.NewIndexerRepo(database),
+		db.NewDownloadClientRepo(database), db.NewBlocklistRepo(database), db.NewSettingsRepo(database), nil, nil)
+	if err != nil {
+		t.Fatalf("ImportReadarr(%q): %v", path, err)
+	}
+	if res == nil {
+		t.Fatal("nil result")
+	}
+
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(awkward) {
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("opening the database created files beside it: %q, want only %q", names, filepath.Base(awkward))
+	}
 }

@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/vavallee/bindery/internal/db"
 	"github.com/vavallee/bindery/internal/models"
@@ -189,6 +191,63 @@ func TestRebind_KeepsAPinnedMediaType(t *testing.T) {
 	}
 	if len(editions) != 1 || editions[0].ForeignID != "hc:correct-audio" {
 		t.Fatalf("expected hydrated edition, got %+v", editions)
+	}
+}
+
+// editingLookup runs edit while the provider request is in flight, committing
+// a change to the book between Rebind's read and its write (#2926).
+type editingLookup struct {
+	book *models.Book
+	edit func()
+}
+
+func (s *editingLookup) GetBookFromProvider(_ context.Context, _, _ string) (*models.Book, error) {
+	s.edit()
+	return s.book, nil
+}
+
+// TestRebind_ConflictWhenBookChangesDuringFetch: the full row rebind write
+// must not overwrite a change made during the provider call. It reports a
+// conflict and leaves the row as the concurrent writer left it.
+func TestRebind_ConflictWhenBookChangesDuringFetch(t *testing.T) {
+	h, books, _, _, author, book, ctx := rebindFixture(t)
+	h.WithMetaLookup(&editingLookup{
+		book: &models.Book{
+			Title: "Correct Book", SortTitle: "Correct Book",
+			Author: &models.Author{ForeignID: author.ForeignID, Name: author.Name},
+		},
+		edit: func() {
+			current, err := books.GetByID(ctx, book.ID)
+			if err != nil || current == nil {
+				t.Errorf("load book for concurrent edit: %v", err)
+				return
+			}
+			current.Monitored = false
+			if err := books.Update(ctx, current); err != nil {
+				t.Errorf("concurrent edit: %v", err)
+			}
+		},
+	})
+
+	rec := httptest.NewRecorder()
+	h.Rebind(rec, rebindRequest(book.ID, map[string]any{
+		"provider": "openlibrary", "foreign_id": "OL2W",
+	}))
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("want 409, got %d: %s", rec.Code, rec.Body.String())
+	}
+	// The UI tells this apart from the duplicate foreign ID 409 by reason.
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body["reason"] != "changed" {
+		t.Fatalf("409 body = %s, want reason \"changed\"", rec.Body.String())
+	}
+	stored, err := books.GetByID(ctx, book.ID)
+	if err != nil || stored == nil {
+		t.Fatalf("reload book: %v", err)
+	}
+	if stored.Monitored || stored.ForeignID != "OL1W" || stored.Title != "Wrong Book" {
+		t.Fatalf("concurrent edit overwritten: monitored=%v foreignId=%q title=%q", stored.Monitored, stored.ForeignID, stored.Title)
 	}
 }
 
@@ -377,5 +436,128 @@ func TestRebind_HistoryEventWritten(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected a %q history event, got %v", models.HistoryEventBookRebound, events)
+	}
+}
+
+// rebindFromRichRecord gives the fixture book a full set of provider fields,
+// so a rebind to a record without them shows what is cleared (#3104).
+func rebindFromRichRecord(t *testing.T, h *BookHandler, books *db.BookRepo, book *models.Book, locked ...string) {
+	t.Helper()
+	d := time.Date(2001, 5, 6, 0, 0, 0, 0, time.UTC)
+	book.ReleaseDate = &d
+	book.Language = "eng"
+	book.Description = "Old description"
+	book.Genres = []string{"Old"}
+	book.OriginalTitle = "Old original"
+	book.AverageRating = 4.5
+	book.RatingsCount = 10
+	book.ImageURL = "https://example.test/old.jpg"
+	book.Narrator = "Kept Narrator"
+	book.LockedFields = locked
+	if err := books.Update(context.Background(), book); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRebind_ClearsFieldsTheNewRecordLacks(t *testing.T) {
+	for _, force := range []bool{false, true} {
+		t.Run("force="+strconv.FormatBool(force), func(t *testing.T) {
+			h, books, _, _, author, book, ctx := rebindFixture(t)
+			rebindFromRichRecord(t, h, books, book)
+			h.WithMetaLookup(&stubLookup{book: &models.Book{
+				Title: "Correct Book", SortTitle: "Correct Book",
+				Author: &models.Author{ForeignID: author.ForeignID, Name: author.Name},
+			}})
+			rec := httptest.NewRecorder()
+			h.Rebind(rec, rebindRequest(book.ID, map[string]any{"provider": "openlibrary", "foreign_id": "OL2W", "force": force}))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+			}
+			got, _ := books.GetByID(ctx, book.ID)
+			if got.ReleaseDate != nil {
+				t.Errorf("release date kept: %v", got.ReleaseDate)
+			}
+			if got.Language != "" || got.Description != "" || len(got.Genres) != 0 {
+				t.Errorf("provider fields kept: %+v", got)
+			}
+			if got.AverageRating != 4.5 || got.OriginalTitle != "Old original" {
+				t.Errorf("rating or original title cleared: %v %q", got.AverageRating, got.OriginalTitle)
+			}
+			var body struct {
+				Cleared []string `json:"cleared"`
+			}
+			_ = json.Unmarshal(rec.Body.Bytes(), &body)
+			if len(body.Cleared) != 4 {
+				t.Errorf("response cleared = %v, want the four fields", body.Cleared)
+			}
+			ev, _ := h.history.ListByBook(ctx, book.ID)
+			if len(ev) == 0 || !strings.Contains(ev[0].Data, `"cleared"`) {
+				t.Errorf("history event lacks cleared: %+v", ev)
+			}
+			if got.ImageURL != "https://example.test/old.jpg" || got.Narrator != "Kept Narrator" {
+				t.Errorf("a non-listed field was cleared: image=%q narrator=%q", got.ImageURL, got.Narrator)
+			}
+		})
+	}
+}
+
+func TestRebind_LockedFieldSurvivesAMissingValue(t *testing.T) {
+	h, books, _, _, author, book, ctx := rebindFixture(t)
+	rebindFromRichRecord(t, h, books, book, models.BookFieldReleaseDate, models.BookFieldDescription)
+	h.WithMetaLookup(&stubLookup{book: &models.Book{
+		Title: "Correct Book", SortTitle: "Correct Book",
+		Author: &models.Author{ForeignID: author.ForeignID, Name: author.Name},
+	}})
+	rec := httptest.NewRecorder()
+	h.Rebind(rec, rebindRequest(book.ID, map[string]any{"provider": "openlibrary", "foreign_id": "OL2W"}))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	got, _ := books.GetByID(ctx, book.ID)
+	if got.ReleaseDate == nil || got.Description != "Old description" {
+		t.Errorf("locked fields were cleared: date=%v desc=%q", got.ReleaseDate, got.Description)
+	}
+	if got.Language != "" {
+		t.Errorf("unlocked language kept: %q", got.Language)
+	}
+}
+
+func TestRebind_NewRecordValueStillWinsOverALock(t *testing.T) {
+	h, books, _, _, author, book, ctx := rebindFixture(t)
+	rebindFromRichRecord(t, h, books, book, models.BookFieldDescription)
+	h.WithMetaLookup(&stubLookup{book: &models.Book{
+		Title: "Correct Book", SortTitle: "Correct Book", Description: "New description",
+		Author: &models.Author{ForeignID: author.ForeignID, Name: author.Name},
+	}})
+	rec := httptest.NewRecorder()
+	h.Rebind(rec, rebindRequest(book.ID, map[string]any{"provider": "openlibrary", "foreign_id": "OL2W"}))
+	got, _ := books.GetByID(ctx, book.ID)
+	if got.Description != "New description" {
+		t.Errorf("description = %q, the existing rebind semantics adopt the new value", got.Description)
+	}
+}
+
+// A record whose secondary lookup failed says so in UnknownFields; the rebind
+// must keep the old values rather than read the gap as "the record lacks it"
+// (#3104).
+func TestRebind_KeepsFieldsTheFetchCouldNotDetermine(t *testing.T) {
+	h, books, _, _, author, book, ctx := rebindFixture(t)
+	rebindFromRichRecord(t, h, books, book)
+	h.WithMetaLookup(&stubLookup{book: &models.Book{
+		Title: "Correct Book", SortTitle: "Correct Book",
+		UnknownFields: []string{models.BookFieldReleaseDate, models.BookFieldLanguage},
+		Author:        &models.Author{ForeignID: author.ForeignID, Name: author.Name},
+	}})
+	rec := httptest.NewRecorder()
+	h.Rebind(rec, rebindRequest(book.ID, map[string]any{"provider": "openlibrary", "foreign_id": "OL2W"}))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	got, _ := books.GetByID(ctx, book.ID)
+	if got.ReleaseDate == nil || got.Language != "eng" {
+		t.Errorf("undetermined fields were erased: date=%v language=%q", got.ReleaseDate, got.Language)
+	}
+	if got.Description != "" {
+		t.Errorf("description is determined absent and should clear, got %q", got.Description)
 	}
 }

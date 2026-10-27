@@ -19,7 +19,7 @@ import (
 //
 // No production caller mutates a returned Genres slice in place today, which is
 // why the contract is pinned here rather than fixed at a call site.
-func newGenreAliasingAggregator() *Aggregator {
+func newGenreAliasingAggregator() *aggregatorCore {
 	enricher := &mockProvider{name: "hardcover", searchBooks: []models.Book{
 		{Title: "Aliased Book", Genres: []string{"Fantasy", "Adventure"}},
 	}}

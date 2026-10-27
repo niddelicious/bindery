@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/vavallee/bindery/internal/abs"
+	"github.com/vavallee/bindery/internal/db"
 )
 
 // TestSettingDescriptors_WellFormed checks that every descriptor describes
@@ -315,9 +316,32 @@ func TestValidateSettingValue_KnownKeysUnchanged(t *testing.T) {
 		{"pair gating timeout rejects zero", SettingImportDropPairGatingTimeoutHours, "0", true},
 		{"pair gating timeout rejects text", SettingImportDropPairGatingTimeoutHours, "soon", true},
 
+		{"audiobook content check accepts off", SettingImportAudiobookContentCheck, "off", false},
+		{"audiobook content check accepts warn", SettingImportAudiobookContentCheck, "warn", false},
+		{"audiobook content check accepts block", SettingImportAudiobookContentCheck, "block", false},
+		{"audiobook content check accepts empty (default warn)", SettingImportAudiobookContentCheck, "", false},
+		{"audiobook content check rejects a typo", SettingImportAudiobookContentCheck, "blok", true},
+		{"audiobook content check rejects skip, which is not offered", SettingImportAudiobookContentCheck, "skip", true},
+
+		{"ebook content check accepts off", SettingImportEbookContentCheck, "off", false},
+		{"ebook content check accepts warn", SettingImportEbookContentCheck, "warn", false},
+		{"ebook content check accepts block", SettingImportEbookContentCheck, "block", false},
+		{"ebook content check accepts empty (default warn)", SettingImportEbookContentCheck, "", false},
+		{"ebook content check rejects a typo", SettingImportEbookContentCheck, "blok", true},
+		{"ebook content check rejects skip, which is not offered", SettingImportEbookContentCheck, "skip", true},
+
 		{"import mode accepts external", SettingImportMode, "external", false},
 		{"import mode accepts empty", SettingImportMode, "", false},
 		{"import mode rejects symlink", SettingImportMode, "symlink", true},
+
+		{"audiobook import mode accepts empty (same as import.mode)", SettingImportAudiobookMode, "", false},
+		{"audiobook import mode accepts auto", SettingImportAudiobookMode, "auto", false},
+		{"audiobook import mode accepts copy", SettingImportAudiobookMode, "copy", false},
+		{"audiobook import mode accepts external", SettingImportAudiobookMode, "external", false},
+		{"audiobook import mode rejects a typo", SettingImportAudiobookMode, "moove", true},
+		{"audiobook import mode rejects symlink", SettingImportAudiobookMode, "symlink", true},
+		{"audiobook drop folder accepts empty (use import.drop_folder)", SettingImportAudiobookDropFolder, "", false},
+		{"audiobook drop folder rejects a missing path", SettingImportAudiobookDropFolder, "/definitely/not/a/real/bindery/path", true},
 
 		{"audiobook file template accepts a Part token", SettingNamingAudiobookFileTemplate, "{Title} - {Part}", false},
 		{"audiobook file template accepts empty", SettingNamingAudiobookFileTemplate, "", false},
@@ -347,6 +371,11 @@ func TestValidateSettingValue_KnownKeysUnchanged(t *testing.T) {
 		{"default root folder accepts empty", SettingDefaultLibraryRootFolderID, "", false},
 		{"default root folder rejects zero", SettingDefaultLibraryRootFolderID, "0", true},
 		{"default root folder rejects text", SettingDefaultLibraryRootFolderID, "library", true},
+
+		{"default audiobook root folder accepts an id", SettingDefaultAudiobookRootFolderID, "3", false},
+		{"default audiobook root folder accepts empty", SettingDefaultAudiobookRootFolderID, "", false},
+		{"default audiobook root folder rejects zero", SettingDefaultAudiobookRootFolderID, "0", true},
+		{"default audiobook root folder rejects text", SettingDefaultAudiobookRootFolderID, "audiobooks", true},
 
 		{"primary provider accepts dnb", SettingMetadataPrimaryProvider, "dnb", false},
 		{"primary provider accepts empty", SettingMetadataPrimaryProvider, "", false},
@@ -454,12 +483,17 @@ var webSettingKeys = []string{
 	"hardcover.api_token",
 	"hardcover.enhanced_series_enabled",
 	"hardcover.sync_interval",
+	"import.audiobook.content_check",
+	"import.audiobook.drop_folder",
 	"import.audiobook.flatten_multi_disc",
+	"import.audiobook.mode",
 	"import.drop_folder",
 	"import.drop_layout",
 	"import.drop_link_mode",
+	"import.ebook.content_check",
 	"import.mode",
 	"import.write_opf_sidecar",
+	"library.defaultAudiobookRootFolderId",
 	"library.defaultRootFolderId",
 	"log.retention_days",
 	"metadata.primary_provider",
@@ -629,6 +663,28 @@ func TestSettingDescriptorsCoverTelemetryFunnelKeys(t *testing.T) {
 		}
 		if d.State != SettingStateInternal {
 			t.Errorf("%s state = %q, want %q: Bindery writes it, an operator does not", key, d.State, SettingStateInternal)
+		}
+	}
+}
+
+// TestSettingDescriptorsCoverBackfillRevisionKeys keeps the startup backfill
+// markers described. They are written and read by internal/db, which this
+// package's source scan does not look at, so without this test a new backfill
+// would appear on the Advanced tab as an unrecognised key that "nothing reads".
+func TestSettingDescriptorsCoverBackfillRevisionKeys(t *testing.T) {
+	keys := db.BackfillRevisionKeys()
+	if len(keys) < 5 {
+		t.Fatalf("db.BackfillRevisionKeys returned %d keys, want at least 5", len(keys))
+	}
+	for _, key := range keys {
+		if !IsKnownSettingKey(key) {
+			t.Errorf("%s is a backfill revision marker with no descriptor in settings_registry.go", key)
+			continue
+		}
+		for _, d := range SettingDescriptors() {
+			if d.Key == key && d.State != SettingStateInternal {
+				t.Errorf("%s: state %q, want internal", key, d.State)
+			}
 		}
 	}
 }

@@ -306,10 +306,11 @@ func TestProwlarrTest_Success(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
-	var out map[string]string
+	var out map[string]any
 	json.NewDecoder(rec.Body).Decode(&out)
-	if out["ok"] != "true" {
-		t.Errorf("expected ok=true, got %v", out)
+	// A JSON boolean, not the string "true" it used to be.
+	if out["ok"] != true {
+		t.Errorf("expected ok=true (boolean), got %#v", out["ok"])
 	}
 	if out["version"] != "1.21.2.4649" {
 		t.Errorf("version not surfaced: %v", out)
@@ -336,10 +337,10 @@ func TestProwlarrTest_UpstreamError(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 envelope, got %d: %s", rec.Code, rec.Body.String())
 	}
-	var out map[string]string
+	var out map[string]any
 	json.NewDecoder(rec.Body).Decode(&out)
-	if out["ok"] != "false" {
-		t.Errorf("expected ok=false on upstream error, got %v", out)
+	if out["ok"] != false {
+		t.Errorf("expected ok=false (boolean) on upstream error, got %#v", out["ok"])
 	}
 	if out["error"] == "" {
 		t.Errorf("expected a non-empty error message, got %v", out)

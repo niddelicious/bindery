@@ -100,7 +100,7 @@ func TestGetAuthorWorksForAuthor_CacheBypassRefetchesAndRefreshesCache(t *testin
 		}},
 	}
 	hardcover := &mockAuthorWorksByNameProvider{mockProvider: mockProvider{name: "hardcover"}}
-	agg := &Aggregator{
+	agg := &aggregatorCore{requests: &requestCache{},
 		primary:   primary,
 		enrichers: []Provider{hardcover},
 		cache:     newTTLCache(time.Minute),
@@ -229,7 +229,7 @@ func TestGetAuthorWorksForAuthor_CacheBypassPartialAnswerKeepsCachedCatalogue(t 
 		}}},
 		intact: true,
 	}
-	agg := &Aggregator{primary: primary, cache: newTTLCache(time.Hour)}
+	agg := &aggregatorCore{requests: &requestCache{}, primary: primary, cache: newTTLCache(time.Hour)}
 	author := models.Author{ForeignID: "OL2611A", Name: "Ann Leckie"}
 	ctx := context.Background()
 
@@ -293,7 +293,7 @@ func TestGetAuthorWorksForAuthor_CacheBypassProviderErrorServesCachedCatalogue(t
 		}}},
 		intact: true,
 	}
-	agg := &Aggregator{primary: primary, cache: newTTLCache(time.Hour)}
+	agg := &aggregatorCore{requests: &requestCache{}, primary: primary, cache: newTTLCache(time.Hour)}
 	author := models.Author{ForeignID: "OL2611A", Name: "Ann Leckie"}
 	ctx := context.Background()
 
@@ -311,7 +311,7 @@ func TestGetAuthorWorksForAuthor_CacheBypassProviderErrorServesCachedCatalogue(t
 	}
 
 	// With nothing cached there is nothing to fall back to.
-	cold := &Aggregator{primary: primary, cache: newTTLCache(time.Hour)}
+	cold := &aggregatorCore{requests: &requestCache{}, primary: primary, cache: newTTLCache(time.Hour)}
 	if _, err := cold.GetAuthorWorksForAuthor(WithCacheBypass(ctx), author); err == nil {
 		t.Fatal("bypassed GetAuthorWorksForAuthor with a cold cache swallowed the provider error")
 	}
@@ -327,7 +327,7 @@ func TestGetAuthorWorksForAuthor_CacheBypassSupplementFailureServesCachedCatalog
 	}}}
 	hc := &mockAuthorWorksByNameProvider{mockProvider: mockProvider{name: "hardcover"},
 		authorWorksByName: []models.Book{{ForeignID: "hc:mh", Title: "Moon Harvest", IsCompilation: true, MetadataProvider: "hardcover"}}}
-	agg := &Aggregator{primary: primary, enrichers: []Provider{hc}, cache: newTTLCache(time.Hour)}
+	agg := &aggregatorCore{requests: &requestCache{}, primary: primary, enrichers: []Provider{hc}, cache: newTTLCache(time.Hour)}
 	author := models.Author{ForeignID: "OL2611A", Name: "Ann Leckie"}
 	ctx := context.Background()
 
@@ -355,7 +355,7 @@ func TestGetAuthorWorksForAuthor_CacheBypassSupplementFailureServesCachedCatalog
 // the pre-refresh list for a day.
 func TestGetAuthorWorksUnenriched_ServesRefreshedRawOverStaleEnriched(t *testing.T) {
 	primary := &mockWorksProvider{mockProvider: mockProvider{name: "ol", authorWorks: []models.Book{olWork("OL1W", "Ancillary Justice")}}}
-	agg := &Aggregator{primary: primary, cache: newTTLCache(time.Hour)}
+	agg := &aggregatorCore{requests: &requestCache{}, primary: primary, cache: newTTLCache(time.Hour)}
 	author := models.Author{ForeignID: "OL2611A", Name: "Ann Leckie"}
 	ctx := context.Background()
 
@@ -404,7 +404,7 @@ func (m *mockAudibleCatalogue) SearchBooksByAuthor(_ context.Context, _ string) 
 // sync the cached list.
 func TestGetAuthorAudiobooks_CacheBypassRefetchesAndKeepsCacheOnError(t *testing.T) {
 	aud := &mockAudibleCatalogue{books: []models.Book{{ASIN: "B001", Title: "Ancillary Justice", MediaType: models.MediaTypeAudiobook}}}
-	agg := &Aggregator{audible: aud, cache: newTTLCache(time.Hour)}
+	agg := &aggregatorCore{requests: &requestCache{}, audible: aud, cache: newTTLCache(time.Hour)}
 	ctx := context.Background()
 
 	if got, err := agg.GetAuthorAudiobooks(ctx, "Ann Leckie"); err != nil || len(got) != 1 {
@@ -461,7 +461,7 @@ func TestGetAuthorWorksForAuthor_CacheBypassEmptyAnswerKeepsCachedWorks(t *testi
 		{ForeignID: "dnb:1001", Title: "Der Process", MetadataProvider: "dnb"},
 		{ForeignID: "dnb:1002", Title: "Das Schloss", MetadataProvider: "dnb"},
 	}}}
-	agg := &Aggregator{primary: primary, cache: newTTLCache(time.Hour)}
+	agg := &aggregatorCore{requests: &requestCache{}, primary: primary, cache: newTTLCache(time.Hour)}
 	author := models.Author{ForeignID: "dnb:118559230", Name: "Franz Kafka"}
 	ctx := context.Background()
 
@@ -498,7 +498,7 @@ func TestGetAuthorWorksForAuthor_CacheBypassEmptyAnswerKeepsCachedWorks(t *testi
 	}
 
 	// With nothing cached, an empty answer is simply the answer.
-	cold := &Aggregator{primary: primary, cache: newTTLCache(time.Hour)}
+	cold := &aggregatorCore{requests: &requestCache{}, primary: primary, cache: newTTLCache(time.Hour)}
 	if got, err := cold.GetAuthorWorksForAuthor(WithCacheBypass(ctx), author); err != nil || len(got) != 0 {
 		t.Fatalf("bypassed read with a cold cache = %v, %v; want the empty answer", workTitles(got), err)
 	}

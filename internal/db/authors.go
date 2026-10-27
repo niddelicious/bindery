@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -57,11 +58,11 @@ func (e *AuthorIdentifierConflictError) Unwrap() error {
 const authorSelectCols = `id, foreign_id, name, sort_name, description, image_url, disambiguation,
 	       ratings_count, average_rating, monitored, quality_profile_id, metadata_profile_id, root_folder_id,
 	       audiobook_root_folder_id, monitor_mode, monitor_latest_count, monitor_new_items, metadata_provider, last_metadata_refresh_at,
-	       created_at, updated_at, COALESCE(owner_user_id, 0)`
+	       created_at, updated_at, COALESCE(owner_user_id, 0), CAST(updated_at AS TEXT), description_source, image_source`
 const authorSelectColsA = `a.id, a.foreign_id, a.name, a.sort_name, a.description, a.image_url, a.disambiguation,
 		       a.ratings_count, a.average_rating, a.monitored, a.quality_profile_id, a.metadata_profile_id, a.root_folder_id,
 		       a.audiobook_root_folder_id, a.monitor_mode, a.monitor_latest_count, a.monitor_new_items, a.metadata_provider, a.last_metadata_refresh_at,
-		       a.created_at, a.updated_at, COALESCE(a.owner_user_id, 0)`
+		       a.created_at, a.updated_at, COALESCE(a.owner_user_id, 0), CAST(a.updated_at AS TEXT), a.description_source, a.image_source`
 
 func (r *AuthorRepo) List(ctx context.Context) ([]models.Author, error) {
 	return r.ListByUser(ctx, 0)
@@ -161,10 +162,12 @@ func authorSortOrder(sort string) string {
 		return "book_count ASC, sort_key ASC"
 	case "books-desc":
 		return "book_count DESC, sort_key ASC"
+	// Unrated authors (0) sort last in both directions, as books do:
+	// "Lowest rated" listed every unrated author first.
 	case "rating-asc":
-		return "average_rating ASC, sort_key ASC"
+		return "average_rating <= 0, average_rating ASC, sort_key ASC"
 	case "rating-desc":
-		return "average_rating DESC, sort_key ASC"
+		return "average_rating <= 0, average_rating DESC, sort_key ASC"
 	case "monitored-asc":
 		return "monitored ASC, sort_key ASC"
 	case "monitored-desc":
@@ -262,18 +265,25 @@ func (r *AuthorRepo) ListPageFiltered(ctx context.Context, f AuthorListFilter, l
 	// user infer how many books another user's author has — a small leak, but
 	// the same class as the one #1872 closed, and free to avoid here. NULL-owned
 	// books stay visible to everyone, matching listAuthorsByUser.
-	bookCountExpr := "(SELECT COUNT(*) FROM books b WHERE b.author_id = authors.id) AS book_count"
+	//
+	// available_count is the subset the library already holds, by
+	// InLibraryPredicate: imported, or wanted with at least one tracked file, the
+	// same rule as the Books page and the author page. The predicate has no bind
+	// parameters, so it adds nothing to selectArgs below.
+	bookScope := "b.author_id = authors.id"
 	var selectArgs []any
 	if f.UserID != 0 {
-		bookCountExpr = "(SELECT COUNT(*) FROM books b WHERE b.author_id = authors.id" +
-			" AND (b.owner_user_id = ? OR b.owner_user_id IS NULL)) AS book_count"
-		selectArgs = append(selectArgs, f.UserID)
+		bookScope += " AND (b.owner_user_id = ? OR b.owner_user_id IS NULL)"
+		// One bind per subquery below.
+		selectArgs = append(selectArgs, f.UserID, f.UserID)
 	}
+	bookCountExpr := "(SELECT COUNT(*) FROM books b WHERE " + bookScope + ") AS book_count, " +
+		"(SELECT COUNT(*) FROM books b WHERE " + bookScope + " AND " + InLibraryPredicate("b", "") + ") AS available_count"
 
 	//nolint:gosec // query is built only from static columns, a parameterised WHERE, and a whitelisted ORDER BY (authorSortOrder); all user values are bound via args
 	listQuery := "SELECT " + authorSelectCols + ", " + bookCountExpr + " FROM authors" + where +
 		" ORDER BY " + searchOrder + authorSortOrder(f.Sort) + " LIMIT ? OFFSET ?"
-	// Order matters: the subquery's placeholder sits in the SELECT list, ahead
+	// Order matters: the subqueries' placeholders sit in the SELECT list, ahead
 	// of every WHERE placeholder, and the ranking placeholders sit in ORDER BY,
 	// which the parser reaches last. The count query has neither, so it takes
 	// args alone.
@@ -287,12 +297,12 @@ func (r *AuthorRepo) ListPageFiltered(ctx context.Context, f AuthorListFilter, l
 
 	var authors []models.Author
 	for rows.Next() {
-		var bookCount int
-		a, err := scanAuthorFrom(trailingScanner{s: rows, extra: []any{&bookCount}})
+		var bookCount, availableCount int
+		a, err := scanAuthorFrom(trailingScanner{s: rows, extra: []any{&bookCount, &availableCount}})
 		if err != nil {
 			return nil, 0, err
 		}
-		a.Statistics = &models.AuthorStats{BookCount: bookCount}
+		a.Statistics = &models.AuthorStats{BookCount: bookCount, AvailableBooks: availableCount}
 		authors = append(authors, a)
 	}
 	if err := rows.Err(); err != nil {
@@ -541,11 +551,12 @@ func (r *AuthorRepo) CreateForUser(ctx context.Context, a *models.Author, ownerU
 		INSERT INTO authors (foreign_id, name, sort_name, sort_key, name_sort_key, search_key, description, image_url, disambiguation,
 		                     ratings_count, average_rating, monitored, quality_profile_id, metadata_profile_id, root_folder_id,
 		                     audiobook_root_folder_id, monitor_mode, monitor_latest_count, monitor_new_items, metadata_provider, owner_user_id,
-		                     created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		                     created_at, updated_at, description_source, image_source)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		a.ForeignID, a.Name, a.SortName, authorSortKey(a.SortName), authorSortKey(a.Name), textutil.FoldForSearch(a.Name), a.Description, a.ImageURL, a.Disambiguation,
 		a.RatingsCount, a.AverageRating, a.Monitored, a.QualityProfileID, a.MetadataProfileID, a.RootFolderID,
-		a.AudiobookRootFolderID, a.MonitorMode, a.MonitorLatestCount, a.MonitorNewItems, a.MetadataProvider, ownerArg, timeValueArg(now), timeValueArg(now))
+		a.AudiobookRootFolderID, a.MonitorMode, a.MonitorLatestCount, a.MonitorNewItems, a.MetadataProvider, ownerArg, timeValueArg(now), timeValueArg(now),
+		encodeProfileSource(a.DescriptionSource), encodeProfileSource(a.ImageSource))
 	if err != nil {
 		return fmt.Errorf("create author: %w", err)
 	}
@@ -557,6 +568,7 @@ func (r *AuthorRepo) CreateForUser(ctx context.Context, a *models.Author, ownerU
 	a.ID = id
 	a.CreatedAt = now
 	a.UpdatedAt = now
+	a.UpdatedAtRaw = timeValueText(now)
 	// Reflect the persisted owner back onto the struct, exactly as
 	// QualityProfileRepo.CreateForUser and MetadataProfileRepo.CreateForUser
 	// already do. Without this the caller holds an author it believes is
@@ -746,8 +758,10 @@ func (r *AuthorRepo) UpgradeSyntheticDNB(ctx context.Context, currentForeignID s
 		    sort_key          = CASE WHEN ? != '' THEN ? ELSE sort_key END,
 		    name_sort_key     = CASE WHEN ? != '' THEN ? ELSE name_sort_key END,
 		    search_key        = CASE WHEN ? != '' THEN ? ELSE search_key END,
-		    description       = CASE WHEN ? != '' THEN ? ELSE description END,
-		    image_url         = CASE WHEN ? != '' THEN ? ELSE image_url END,
+		    description       = CASE WHEN ? != '' AND COALESCE(json_extract(NULLIF(description_source, ''), '$.provider'), '') != ? THEN ? ELSE description END,
+		    description_source = CASE WHEN ? != '' AND COALESCE(json_extract(NULLIF(description_source, ''), '$.provider'), '') != ? THEN '' ELSE description_source END,
+		    image_url         = CASE WHEN ? != '' AND COALESCE(json_extract(NULLIF(image_source, ''), '$.provider'), '') != ? THEN ? ELSE image_url END,
+		    image_source      = CASE WHEN ? != '' AND COALESCE(json_extract(NULLIF(image_source, ''), '$.provider'), '') != ? THEN '' ELSE image_source END,
 		    disambiguation    = CASE WHEN ? != '' THEN ? ELSE disambiguation END,
 		    metadata_provider = COALESCE(NULLIF(?, ''), metadata_provider),
 		    updated_at        = ?
@@ -758,8 +772,14 @@ func (r *AuthorRepo) UpgradeSyntheticDNB(ctx context.Context, currentForeignID s
 		target.SortName, authorSortKey(target.SortName), // sort_key CASE WHEN ?!='' THEN ? ELSE sort_key
 		target.Name, authorSortKey(target.Name), // name_sort_key CASE WHEN ?!='' THEN ? ELSE name_sort_key
 		target.Name, textutil.FoldForSearch(target.Name), // search_key CASE WHEN ?!='' THEN ? ELSE search_key
-		target.Description, target.Description, // description CASE WHEN ? != '' THEN ?
-		target.ImageURL, target.ImageURL, // image_url
+		// A bio or photo the user set by hand (provider models.ProfileSourceUser
+		// in its credit column) is kept (#3287); a provider value that does
+		// replace the stored one drops its credit, as models.MergeProfileField
+		// does for a primary value.
+		target.Description, models.ProfileSourceUser, target.Description, // description
+		target.Description, models.ProfileSourceUser, // description_source cleared with it
+		target.ImageURL, models.ProfileSourceUser, target.ImageURL, // image_url
+		target.ImageURL, models.ProfileSourceUser, // image_source cleared with it
 		target.Disambiguation, target.Disambiguation, // disambiguation
 		target.MetadataProvider, // metadata_provider = COALESCE(NULLIF(?,''), metadata_provider)
 		timeValueArg(now),       // updated_at
@@ -791,51 +811,95 @@ func (r *AuthorRepo) UpgradeSyntheticDNB(ctx context.Context, currentForeignID s
 }
 
 func (r *AuthorRepo) Update(ctx context.Context, a *models.Author) error {
+	_, err := r.updateAuthor(ctx, a, "")
+	return err
+}
+
+// UpdateIfUnchanged is Update guarded on the row not having changed since a
+// was read: expectedUpdatedAt is the snapshot's UpdatedAtRaw, compared as
+// stored text like BookRepo.UpdateIfUnchanged. It reports false, without
+// writing anything (the author_identifiers row included) or reloading a,
+// when a concurrent write got there first. For callers that write an author
+// after a provider call, so an edit saved during the call is not undone
+// (#2926).
+func (r *AuthorRepo) UpdateIfUnchanged(ctx context.Context, a *models.Author, expectedUpdatedAt string) (bool, error) {
+	if a == nil || a.ID == 0 || expectedUpdatedAt == "" {
+		return false, fmt.Errorf("update author: invalid author snapshot")
+	}
+	return r.updateAuthor(ctx, a, expectedUpdatedAt)
+}
+
+// updateAuthor writes every column of a in one transaction with its
+// identifier row. A non-empty expectedUpdatedAt adds the stored-text
+// updated_at precondition.
+func (r *AuthorRepo) updateAuthor(ctx context.Context, a *models.Author, expectedUpdatedAt string) (bool, error) {
 	now := time.Now().UTC()
 	normalizeAuthorMonitorDefaults(a)
 
 	if _, ok := r.exec.(*sql.Tx); ok {
-		if err := r.update(ctx, r.exec, a, now); err != nil {
-			return err
+		updated, err := r.update(ctx, r.exec, a, now, expectedUpdatedAt)
+		if err != nil || !updated {
+			return false, err
 		}
 		a.UpdatedAt = now
-		return nil
+		a.UpdatedAtRaw = timeValueText(now)
+		return true, nil
 	}
 
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("begin update author %d: %w", a.ID, err)
+		return false, fmt.Errorf("begin update author %d: %w", a.ID, err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if err := r.update(ctx, tx, a, now); err != nil {
-		return err
+	updated, err := r.update(ctx, tx, a, now, expectedUpdatedAt)
+	if err != nil || !updated {
+		return false, err
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit update author %d: %w", a.ID, err)
+		return false, fmt.Errorf("commit update author %d: %w", a.ID, err)
 	}
 	a.UpdatedAt = now
-	return nil
+	a.UpdatedAtRaw = timeValueText(now)
+	return true, nil
 }
 
-func (r *AuthorRepo) update(ctx context.Context, exec dbExecutor, a *models.Author, now time.Time) error {
-	_, err := exec.ExecContext(ctx, `
+func (r *AuthorRepo) update(ctx context.Context, exec dbExecutor, a *models.Author, now time.Time, expectedUpdatedAt string) (bool, error) {
+	query := `
 		UPDATE authors SET foreign_id=?, name=?, sort_name=?, sort_key=?, name_sort_key=?, search_key=?, description=?, image_url=?, disambiguation=?,
 		                   ratings_count=?, average_rating=?, monitored=?, quality_profile_id=?,
 		                   metadata_profile_id=?, root_folder_id=?, audiobook_root_folder_id=?, monitor_mode=?,
-		                   monitor_latest_count=?, monitor_new_items=?, metadata_provider=?, last_metadata_refresh_at=?, updated_at=?
-		WHERE id=?`,
+		                   monitor_latest_count=?, monitor_new_items=?, metadata_provider=?, last_metadata_refresh_at=?, updated_at=?,
+		                   description_source=?, image_source=?
+		WHERE id=?`
+	args := []any{
 		a.ForeignID, a.Name, a.SortName, authorSortKey(a.SortName), authorSortKey(a.Name), textutil.FoldForSearch(a.Name), a.Description, a.ImageURL, a.Disambiguation,
 		a.RatingsCount, a.AverageRating, a.Monitored, a.QualityProfileID,
 		a.MetadataProfileID, a.RootFolderID, a.AudiobookRootFolderID, a.MonitorMode,
-		a.MonitorLatestCount, a.MonitorNewItems, a.MetadataProvider, timeArg(a.LastMetadataRefreshAt), timeValueArg(now), a.ID)
+		a.MonitorLatestCount, a.MonitorNewItems, a.MetadataProvider, timeArg(a.LastMetadataRefreshAt), timeValueArg(now),
+		encodeProfileSource(a.DescriptionSource), encodeProfileSource(a.ImageSource), a.ID,
+	}
+	if expectedUpdatedAt != "" {
+		query += ` AND CAST(updated_at AS TEXT)=?`
+		args = append(args, expectedUpdatedAt)
+	}
+	res, err := exec.ExecContext(ctx, query, args...)
 	if err != nil {
-		return fmt.Errorf("update author %d: %w", a.ID, err)
+		return false, fmt.Errorf("update author %d: %w", a.ID, err)
+	}
+	if expectedUpdatedAt != "" {
+		n, err := res.RowsAffected()
+		if err != nil {
+			return false, fmt.Errorf("check update for author %d: %w", a.ID, err)
+		}
+		if n == 0 {
+			return false, nil
+		}
 	}
 	if err := r.upsertIdentifierTx(ctx, exec, a.ID, a.ForeignID, now); err != nil {
-		return err
+		return false, err
 	}
-	return nil
+	return true, nil
 }
 
 // Delete removes the author and its author_identifiers rows.
@@ -1006,7 +1070,7 @@ func scanAuthorRow(row *sql.Row) (models.Author, error) {
 }
 
 // trailingScanner lets a query select the standard author columns plus extra
-// derived ones without duplicating scanAuthorFrom's 22-destination list, which
+// derived ones without duplicating scanAuthorFrom's 23-destination list, which
 // would then be free to drift from authorSelectCols on the next column added.
 type trailingScanner struct {
 	s     rowScanner
@@ -1022,15 +1086,22 @@ func scanAuthorFrom(s rowScanner) (models.Author, error) {
 	var monitored int
 	// Time columns scanned as strings + parseFlexibleTime so legacy rows
 	// written by Go's default time.String() shape (#914) still load.
-	var lastMetadataRefreshAtStr, createdAtStr, updatedAtStr sql.NullString
+	// updatedAtRaw is CAST(updated_at AS TEXT): the driver reformats a
+	// DATETIME column it can parse, so only the cast keeps the stored text a
+	// guarded write compares against (UpdateIfUnchanged).
+	var lastMetadataRefreshAtStr, createdAtStr, updatedAtStr, updatedAtRaw sql.NullString
+	var descriptionSource, imageSource string
 	err := s.Scan(&a.ID, &a.ForeignID, &a.Name, &a.SortName, &a.Description, &a.ImageURL,
 		&a.Disambiguation, &a.RatingsCount, &a.AverageRating, &monitored,
 		&a.QualityProfileID, &a.MetadataProfileID, &a.RootFolderID, &a.AudiobookRootFolderID,
 		&a.MonitorMode, &a.MonitorLatestCount, &a.MonitorNewItems, &a.MetadataProvider,
-		&lastMetadataRefreshAtStr, &createdAtStr, &updatedAtStr, &a.OwnerUserID)
+		&lastMetadataRefreshAtStr, &createdAtStr, &updatedAtStr, &a.OwnerUserID, &updatedAtRaw,
+		&descriptionSource, &imageSource)
 	if err != nil {
 		return a, err
 	}
+	a.DescriptionSource = decodeProfileSource(descriptionSource)
+	a.ImageSource = decodeProfileSource(imageSource)
 	if lm, perr := parseFlexibleTime(lastMetadataRefreshAtStr); perr != nil {
 		slog.Warn("unparseable author.last_metadata_refresh_at, leaving nil", "author_id", a.ID, "value", lastMetadataRefreshAtStr.String, "error", perr)
 	} else {
@@ -1038,6 +1109,7 @@ func scanAuthorFrom(s rowScanner) (models.Author, error) {
 	}
 	a.CreatedAt = parseFlexibleTimeValue(createdAtStr, "authors.created_at")
 	a.UpdatedAt = parseFlexibleTimeValue(updatedAtStr, "authors.updated_at")
+	a.UpdatedAtRaw = updatedAtRaw.String
 	a.Monitored = monitored == 1
 	normalizeAuthorMonitorDefaults(&a)
 	return a, nil
@@ -1081,4 +1153,30 @@ func (r *AuthorRepo) UnmonitoredAuthorIDs(ctx context.Context) (map[int64]bool, 
 		ids[id] = true
 	}
 	return ids, rows.Err()
+}
+
+// encodeProfileSource stores an author profile credit (#3287) as JSON text,
+// and nil as the empty string the column defaults to.
+func encodeProfileSource(src *models.ProfileSource) string {
+	if src == nil {
+		return ""
+	}
+	b, err := json.Marshal(src)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// decodeProfileSource reads a credit back. Empty or unreadable text is no
+// credit: a malformed row must not stop the author from loading.
+func decodeProfileSource(text string) *models.ProfileSource {
+	if text == "" {
+		return nil
+	}
+	var src models.ProfileSource
+	if err := json.Unmarshal([]byte(text), &src); err != nil || src.Provider == "" {
+		return nil
+	}
+	return &src
 }

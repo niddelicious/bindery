@@ -179,6 +179,23 @@ func registerOIDCDiscoveryRoutes(r chi.Router, h oidcDiscoveryRouteHandler) {
 	})
 }
 
+// oidcRedirectBaseRouteHandler is the surface registerOIDCRedirectBaseRoute needs.
+type oidcRedirectBaseRouteHandler interface {
+	GetRedirectBase(http.ResponseWriter, *http.Request)
+}
+
+// registerOIDCRedirectBaseRoute mounts GET /auth/oidc/redirect-base, which is
+// admin-only (#1640). It reports the base URL Bindery resolved for the OIDC
+// redirect_uri and whether BINDERY_OIDC_REDIRECT_BASE_URL is set, and exists
+// only to drive the admin settings preview. The login page does not call it, so
+// gating it costs nothing for sign-in.
+func registerOIDCRedirectBaseRoute(r chi.Router, h oidcRedirectBaseRouteHandler) {
+	r.Group(func(r chi.Router) {
+		r.Use(auth.RequireAdmin)
+		r.Get("/auth/oidc/redirect-base", h.GetRedirectBase)
+	})
+}
+
 // useAPIAuth installs the auth stack every /api route sits behind: identity
 // and mode resolution, the requester allow list, then the two CSRF guards.
 // Shared by both API trees in main.go (/api and /api/v1) and by the route
@@ -206,6 +223,27 @@ func registerStorageRoutes(r chi.Router, h storageRouteHandler) {
 	r.Group(func(r chi.Router) {
 		r.Use(auth.RequireAdmin)
 		r.Get("/system/storage", h.Get)
+	})
+}
+
+type dbIntegrityRouteHandler interface {
+	Check(http.ResponseWriter, *http.Request)
+	Preview(http.ResponseWriter, *http.Request)
+	Cleanup(http.ResponseWriter, *http.Request)
+}
+
+// registerDBIntegrityRoutes mounts the on demand foreign key drift report
+// (#3356) and its cleanup (#3357). Admin-only: a scan reads the whole database
+// and names the schema's tables, and the cleanup deletes rows. All POST, never
+// GET, so a prefetcher or crawler cannot start a scan or a repair, and all
+// behind the CSRF guards useAPIAuth installs. The cleanup additionally needs a
+// token from the preview route and an explicit confirm field.
+func registerDBIntegrityRoutes(r chi.Router, h dbIntegrityRouteHandler) {
+	r.Group(func(r chi.Router) {
+		r.Use(auth.RequireAdmin)
+		r.Post("/system/db-integrity", h.Check)
+		r.Post("/system/db-integrity/cleanup/preview", h.Preview)
+		r.Post("/system/db-integrity/cleanup", h.Cleanup)
 	})
 }
 
@@ -258,5 +296,68 @@ func registerLibraryScanStatusRoute(r chi.Router, h libraryScanStatusRouteHandle
 	r.Group(func(r chi.Router) {
 		r.Use(auth.RequireAdmin)
 		r.Get("/library/scan/status", h.ScanStatus)
+	})
+}
+
+// blocklistRouteHandler is the surface registerBlocklistRoutes needs.
+type blocklistRouteHandler interface {
+	List(http.ResponseWriter, *http.Request)
+	Delete(http.ResponseWriter, *http.Request)
+	BulkDelete(http.ResponseWriter, *http.Request)
+}
+
+// registerBlocklistRoutes mounts the /blocklist routes admin only. The
+// blocklist is app wide (no owner column) and every search consults it, so a
+// non-admin who could list it saw every release anyone had blocked, and one who
+// could delete from it re-enabled releases an admin had blocked for everybody.
+// docs/multi-user.md already placed Blocklist under the admin only System tab.
+// POST /history/{id}/blocklist stays open: it adds an entry only for a history
+// event the caller owns.
+func registerBlocklistRoutes(r chi.Router, h blocklistRouteHandler) {
+	r.Group(func(r chi.Router) {
+		r.Use(auth.RequireAdmin)
+		r.Get("/blocklist", h.List)
+		r.Delete("/blocklist/bulk", h.BulkDelete)
+		r.Delete("/blocklist/{id}", h.Delete)
+	})
+}
+
+// profileRouteHandler is the surface registerQualityProfileRoutes and
+// registerMetadataProfileRoutes need.
+type profileRouteHandler interface {
+	List(http.ResponseWriter, *http.Request)
+	Get(http.ResponseWriter, *http.Request)
+	Create(http.ResponseWriter, *http.Request)
+	Update(http.ResponseWriter, *http.Request)
+	Delete(http.ResponseWriter, *http.Request)
+}
+
+// registerQualityProfileRoutes mounts the /qualityprofile routes. Profiles are
+// instance wide configuration: reads open to every authenticated user (the
+// author forms fill their pickers from the list, and requesters are kept out by
+// auth.RequesterAllowList), mutations admin only.
+func registerQualityProfileRoutes(r chi.Router, h profileRouteHandler) {
+	r.Get("/qualityprofile", h.List)
+	r.Get("/qualityprofile/{id}", h.Get)
+	r.Group(func(r chi.Router) {
+		r.Use(auth.RequireAdmin)
+		r.Post("/qualityprofile", h.Create)
+		r.Put("/qualityprofile/{id}", h.Update)
+		r.Delete("/qualityprofile/{id}", h.Delete)
+	})
+}
+
+// registerMetadataProfileRoutes mounts the /metadataprofile routes with the
+// same split as registerQualityProfileRoutes. Writes used to be open to every
+// user; a metadata profile filters what every author refresh adds, and the
+// Settings UI already showed the tab to admins only.
+func registerMetadataProfileRoutes(r chi.Router, h profileRouteHandler) {
+	r.Get("/metadataprofile", h.List)
+	r.Get("/metadataprofile/{id}", h.Get)
+	r.Group(func(r chi.Router) {
+		r.Use(auth.RequireAdmin)
+		r.Post("/metadataprofile", h.Create)
+		r.Put("/metadataprofile/{id}", h.Update)
+		r.Delete("/metadataprofile/{id}", h.Delete)
 	})
 }

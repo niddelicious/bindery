@@ -203,7 +203,7 @@ func TestSQLiteFileURI_IsReallyReadOnly(t *testing.T) {
 	path := filepath.Join(dir, "sound.db")
 	writeSQLiteFile(t, path, "live")
 
-	database, err := sql.Open("sqlite", sqliteFileURI(path, "mode=ro"))
+	database, err := sql.Open("sqlite", SQLiteFileURI(path, "mode=ro"))
 	if err != nil {
 		t.Fatalf("open read-only: %v", err)
 	}
@@ -219,7 +219,7 @@ func TestSQLiteFileURI_IsReallyReadOnly(t *testing.T) {
 }
 
 // TestCheckSQLiteFile_AwkwardPath pins the percent-encoding half of
-// sqliteFileURI. "?", "#" and "%" are syntax to SQLite's URI parser, so a data
+// SQLiteFileURI. "?", "#" and "%" are syntax to SQLite's URI parser, so a data
 // directory carrying any of them in its name would otherwise make the check
 // look at the wrong path (or fail to parse), and a valid backup would be parked
 // as .restore-failed on every start.
@@ -297,5 +297,19 @@ func TestOpen_AppliesPendingRestore(t *testing.T) {
 	}
 	if marker != "from-backup" {
 		t.Fatalf("expected the staged backup to be swapped in, marker=%q", marker)
+	}
+}
+
+func TestSQLiteFileURI(t *testing.T) {
+	for _, c := range []struct{ path, query, want string }{
+		{"/data/bindery.db", "mode=ro", "file:/data/bindery.db?mode=ro"},
+		{"/data/my lib/metadata.db", "mode=ro&immutable=1", "file:/data/my%20lib/metadata.db?mode=ro&immutable=1"},
+		{"/data/a?b#c%d/x.db", "mode=ro", "file:/data/a%3Fb%23c%25d/x.db?mode=ro"},
+		{"/data/lib ?mode=rwc#x/metadata.db", "mode=ro", "file:/data/lib%20%3Fmode=rwc%23x/metadata.db?mode=ro"},
+		{"C:/Calibre Library/metadata.db", "mode=ro", "file:/C:/Calibre%20Library/metadata.db?mode=ro"}, // Windows drive form (backslashes are converted on Windows)
+	} {
+		if got := SQLiteFileURI(c.path, c.query); got != c.want {
+			t.Errorf("SQLiteFileURI(%q, %q) = %q, want %q", c.path, c.query, got, c.want)
+		}
 	}
 }

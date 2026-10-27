@@ -179,10 +179,10 @@ func lookupUnit(root, path string, books []models.Book, authorNames map[int64]st
 	layoutAuthor, layoutTitle, _ := authorTitleFromLayout(path, root)
 	var embedded EpubMetadata
 	if ep := firstEpubIn(path); ep != "" {
-		if meta, err := ReadEpubMetadata(ep); err == nil {
+		if meta, err := ReadEbookMetadata(ep); err == nil {
 			embedded = meta
 		} else {
-			slog.Debug("bulk import: epub metadata unreadable; falling back to layout/filename", "path", ep, "error", err)
+			slog.Debug("bulk import: ebook metadata unreadable; falling back to layout/filename", "path", ep, "error", err)
 		}
 	}
 
@@ -331,11 +331,12 @@ func narrowByAuthor(candidates []models.Book, author string, match func(parsed, 
 	return nil, author
 }
 
-// firstEpubIn returns an EPUB to read embedded metadata from for a unit: the
-// path itself when it is an EPUB, or the first EPUB found within a directory
-// unit (bounded walk). Returns "" when there is nothing to read.
+// firstEpubIn returns an ebook to read embedded metadata from for a unit: the
+// path itself when it is an EPUB or a Kindle file (#3016), or the first one
+// found within a directory unit (bounded walk). Returns "" when there is
+// nothing to read.
 func firstEpubIn(path string) string {
-	if IsEpubFile(path) {
+	if HasEmbeddedMetadata(path) {
 		return path
 	}
 	info, err := os.Stat(path)
@@ -353,7 +354,7 @@ func firstEpubIn(path string) string {
 		if count > limit {
 			return filepath.SkipAll
 		}
-		if !d.IsDir() && IsEpubFile(p) {
+		if !d.IsDir() && HasEmbeddedMetadata(p) {
 			found = p
 			return filepath.SkipAll
 		}
@@ -488,16 +489,16 @@ func lookupParsed(parsed ParsedFile, books []models.Book, authorNames map[int64]
 func (s *Scanner) matchBookForDownload(ctx context.Context, files []string, releaseTitle string) (*models.Book, *models.Author) {
 	// Tier 1: embedded EPUB metadata.
 	for _, f := range files {
-		if !IsEpubFile(f) {
+		if !HasEmbeddedMetadata(f) {
 			continue
 		}
-		meta, err := ReadEpubMetadata(f)
+		meta, err := ReadEbookMetadata(f)
 		if err != nil {
-			slog.Debug("epub metadata unreadable; will try filename", "file", f, "error", err)
+			slog.Debug("ebook metadata unreadable; will try filename", "file", f, "error", err)
 			continue
 		}
 		if b, a := s.matchByTitleAuthor(ctx, meta.Title, meta.Author); b != nil {
-			slog.Info("matched download via embedded EPUB metadata",
+			slog.Info("matched download via embedded ebook metadata",
 				"file", f, "title", meta.Title, "author", meta.Author, "isbn", meta.ISBN, "bookID", b.ID)
 			return b, a
 		}
@@ -506,7 +507,17 @@ func (s *Scanner) matchBookForDownload(ctx context.Context, files []string, rele
 	// Tier 2: release filename, via the same catalogue lookup manual import
 	// uses, but with no layout roots: the folders above a completed download
 	// are the client's and the release's, never an author's.
+	//
+	// The tracks of a multi-file audiobook are skipped: their names are track
+	// names ("01. Track 1.mp3", "11 - Spor 11.mp3"), not titles, and the first
+	// of hundreds to loosely resemble a catalogue title won before the
+	// release title below was consulted. A lone audio file keeps its say; a
+	// single-file audiobook is often named after the book.
+	tracks := countAudioFiles(files) > 1
 	for _, f := range files {
+		if tracks && IsAudioFile(f) {
+			continue
+		}
 		res, err := s.lookup(ctx, f)
 		if err != nil {
 			slog.Debug("filename lookup failed", "file", f, "error", err)
@@ -516,6 +527,14 @@ func (s *Scanner) matchBookForDownload(ctx context.Context, files []string, rele
 			a, err := s.authors.GetByID(ctx, res.Book.AuthorID)
 			if err != nil {
 				slog.Warn("matched book but failed to load author", "bookID", res.Book.ID, "error", err)
+			}
+			// Nobody reviews this match, so a lone loose title match is not
+			// enough: the title must match exactly or the author must agree,
+			// the rule bulk folder import applies (#1402).
+			if !filenameMatchCorroborated(f, res, a) {
+				slog.Debug("filename lookup match not corroborated; not used",
+					"file", f, "title", res.ParsedTitle, "book", res.Book.Title)
+				continue
 			}
 			slog.Info("matched download via filename lookup",
 				"file", f, "title", res.ParsedTitle, "author", res.ParsedAuthor, "bookID", res.Book.ID)
@@ -681,9 +700,13 @@ func unmatchedReason(files []string) string {
 	parsed := ParseFilename(f)
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s. Parsed from filename: title=%q author=%q", base, parsed.Title, parsed.Author)
-	if IsEpubFile(f) {
-		if meta, err := ReadEpubMetadata(f); err == nil && (meta.Title != "" || meta.Author != "") {
-			fmt.Fprintf(&b, "; embedded EPUB: title=%q author=%q", meta.Title, meta.Author)
+	if HasEmbeddedMetadata(f) {
+		if meta, err := ReadEbookMetadata(f); err == nil && (meta.Title != "" || meta.Author != "") {
+			kind := "EPUB"
+			if IsKindleFile(f) {
+				kind = "Kindle file"
+			}
+			fmt.Fprintf(&b, "; embedded %s: title=%q author=%q", kind, meta.Title, meta.Author)
 			if meta.ISBN != "" {
 				fmt.Fprintf(&b, " isbn=%s", meta.ISBN)
 			}
@@ -701,6 +724,35 @@ func lookupDetectFormat(path string) string {
 		return models.MediaTypeAudiobook
 	}
 	return detectDownloadFormat([]string{path})
+}
+
+// filenameMatchCorroborated reports whether a confident filename lookup is
+// strong enough to bind an unmatched download without anyone reviewing it: an
+// ASIN match, an exact (normalised) title, or a parsed author that agrees with
+// the book's. A loose title overlap with no author is what bound a track file
+// named "11. Track 11.mp3" to an unrelated book with an 11 in its title.
+func filenameMatchCorroborated(file string, res LookupResult, author *models.Author) bool {
+	if res.Book == nil {
+		return false
+	}
+	if asin := ParseFilename(file).ASIN; asin != "" && asin == res.Book.ASIN {
+		return true
+	}
+	if normalizeTitle(res.Book.Title) == normalizeTitle(res.ParsedTitle) {
+		return true
+	}
+	return author != nil && res.ParsedAuthor != "" && lookupAuthorMatch(res.ParsedAuthor, author.Name)
+}
+
+// countAudioFiles counts the audio files among files.
+func countAudioFiles(files []string) int {
+	n := 0
+	for _, f := range files {
+		if IsAudioFile(f) {
+			n++
+		}
+	}
+	return n
 }
 
 // lookupAuthorMatch returns true when parsed and catalogue author names refer

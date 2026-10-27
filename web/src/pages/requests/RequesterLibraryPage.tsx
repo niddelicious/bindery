@@ -4,6 +4,8 @@ import { useTranslation } from 'react-i18next'
 import { api } from '../../api/client'
 import type { RequesterLibraryBook } from '../../api/client'
 import { mediaTypeLabel } from './requestLabels'
+import CoverImage from '../../components/CoverImage'
+import { primaryFill } from '../../components/buttons'
 
 const PAGE_SIZE = 60
 
@@ -39,7 +41,7 @@ export default function RequesterLibraryPage() {
     <div className="space-y-6">
       <div className="flex items-center justify-between gap-4 flex-wrap">
         <h2 className="text-2xl font-bold">{t('requests.library.title')}</h2>
-        <Link to="/request" className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 rounded-md text-sm font-medium text-white">
+        <Link to="/request" className={`px-4 py-2 ${primaryFill} rounded-md text-sm font-medium`}>
           {t('requests.library.requestSomething')}
         </Link>
       </div>
@@ -50,12 +52,13 @@ export default function RequesterLibraryPage() {
         className="flex gap-2 max-w-md"
       >
         <input
+          enterKeyHint="search"
           type="search"
           value={query}
           onChange={e => setQuery(e.target.value)}
           aria-label={t('requests.library.searchLabel')}
           placeholder={t('requests.library.searchPlaceholder')}
-          className="flex-1 min-w-0 bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-emerald-500"
+          className="flex-1 min-w-0 bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded-md px-3 py-2 text-sm"
         />
         <button type="submit" className="px-4 py-2 rounded-md text-sm border border-slate-300 dark:border-zinc-700">{t('common.search')}</button>
       </form>
@@ -68,15 +71,15 @@ export default function RequesterLibraryPage() {
       <ul className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-4" aria-label={t('requests.library.title')}>
         {items.map(b => (
           <li key={b.id} className="min-w-0">
-            {b.coverUrl ? (
-              <img src={b.coverUrl} alt="" loading="lazy" className="w-full aspect-[2/3] object-cover rounded-md bg-slate-200 dark:bg-zinc-800" />
-            ) : (
-              <div aria-hidden="true" className="w-full aspect-[2/3] rounded-md bg-slate-200 dark:bg-zinc-800" />
-            )}
-            <div className="mt-2 text-sm font-medium leading-snug break-words">{b.title}</div>
-            <div className="text-xs text-fg-muted">{b.authorName}</div>
+            <CoverImage src={b.coverUrl} alt="" loading="lazy" decoding="async" className="w-full aspect-[2/3] object-cover rounded-md bg-slate-200 dark:bg-zinc-800"
+              fallback={
+                <div aria-hidden="true" className="w-full aspect-[2/3] rounded-md bg-slate-200 dark:bg-zinc-800" />
+              }
+            />
+            <div className="mt-2 text-sm font-medium leading-snug [overflow-wrap:anywhere]">{b.title}</div>
+            <div className="text-xs text-fg-muted [overflow-wrap:anywhere]">{b.authorName}</div>
             {b.series && (
-              <div className="text-xs text-fg-muted">
+              <div className="text-xs text-fg-muted [overflow-wrap:anywhere]">
                 {b.seriesPosition ? t('requests.library.seriesWithPosition', { series: b.series, position: b.seriesPosition }) : b.series}
               </div>
             )}

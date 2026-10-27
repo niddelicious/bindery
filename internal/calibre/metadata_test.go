@@ -111,6 +111,7 @@ func TestIdentifiersForBook_NormalizesProviderIdentifiers(t *testing.T) {
 		{"googlebooks", "googlebooks", "gb:zyTCAlFPjgYC", "google", "zyTCAlFPjgYC"},
 		{"google", "google", "gb:zyTCAlFPjgYC", "google", "zyTCAlFPjgYC"},
 		{"dnb", "dnb", "dnb:123456789", "dnb", "123456789"},
+		{"bnf", "bnf", "bnf:cb48780493c", "bnf", "cb48780493c"},
 		{"fallback", "Other.Provider", " provider:value ", "other_provider", "provider:value"},
 	}
 	for _, tt := range tests {

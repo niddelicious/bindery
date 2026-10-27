@@ -61,7 +61,7 @@ func TestLiveAggregatorCanonicalPrimaryBookTortureCorpus(t *testing.T) {
 					}
 					assertCanonicalProviderSource(t, source, tc)
 
-					canonical, ok := agg.canonicalPrimaryBook(ctx, isbnInput, *source)
+					canonical, ok := agg.core().canonicalPrimaryBook(ctx, isbnInput, *source)
 					sleepAfterCanonicalPrimaryLiveLookup()
 					if !ok {
 						t.Fatalf("canonicalPrimaryBook(%q source=%s) ok = false, want true", isbnInput, describeCanonicalLiveBook(source))
@@ -89,7 +89,7 @@ func TestLiveAggregatorCanonicalPrimaryBookTortureCorpus(t *testing.T) {
 						Author:           &models.Author{Name: authorInput},
 						MetadataProvider: "torture-fixture",
 					}
-					canonical, ok := agg.canonicalPrimaryBook(ctx, "", source)
+					canonical, ok := agg.core().canonicalPrimaryBook(ctx, "", source)
 					sleepAfterCanonicalPrimaryLiveLookup()
 					assertNoForbiddenCanonicalLiveMatch(t, canonical, tc)
 					if tc.expectedOpenLibraryWork == "" {

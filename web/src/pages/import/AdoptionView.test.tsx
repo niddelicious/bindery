@@ -84,6 +84,46 @@ afterEach(() => {
 })
 
 describe('AdoptionView', () => {
+  // #2944: two 1008 byte .txt files under the audiobooks root were listed as
+  // ordinary ebooks with a one click Confirm into the book their folder named.
+  it('labels a file too small to be a book and offers Ignore, not adoption', async () => {
+    const tiny = item({
+      id: 60, parsedTitle: 'Die 6. Geisel', parsedAuthor: 'James Patterson', authorFolder: 'James Patterson',
+      relPath: 'James Patterson/Die 6. Geisel ()/Die 6. Geisel.txt', rootPath: '/data/media/audiobooks',
+      rootFormat: 'audiobook', sizeBytes: 1008, reason: 'too_small',
+    })
+    serve(listResponse([tiny]))
+    let ignored = false
+    server.use(http.post(apiUrl('/library/unmatched/60/ignore'), () => {
+      ignored = true
+      return HttpResponse.json({ ...tiny, state: 'ignored' })
+    }))
+    const table = await renderView()
+
+    const row = within(table).getByRole('row', { name: 'Die 6. Geisel' })
+    expect(within(row).getByText('Too small to be a book')).toBeInTheDocument()
+    expect(within(row).getByText('In your audiobooks folder')).toBeInTheDocument()
+    expect(within(row).queryByRole('button', { name: 'Confirm' })).toBeNull()
+    expect(within(row).queryByRole('button', { name: 'Choose book' })).toBeNull()
+    fireEvent.click(within(row).getByRole('button', { name: 'Ignore' }))
+    await waitFor(() => expect(ignored).toBe(true))
+  })
+
+  it('labels an ebook under the audiobooks root and makes its match a possible one', async () => {
+    const misplaced = item({
+      id: 61, parsedTitle: 'The Martian', relPath: 'Andy Weir/The Martian/The Martian.epub',
+      rootPath: '/audiobooks', rootFormat: 'audiobook', sizeBytes: 300_000,
+      candidates: [{ book: martian, score: 1 }], topScore: 1,
+    })
+    serve(listResponse([misplaced]))
+    const table = await renderView()
+
+    const row = within(table).getByRole('row', { name: 'The Martian' })
+    expect(within(row).getByText('In your audiobooks folder')).toBeInTheDocument()
+    expect(within(row).getByText('Possible match')).toBeInTheDocument()
+    expect(within(row).queryByRole('button', { name: 'Confirm' })).toBeNull()
+  })
+
   it('confirms a strong suggestion in one click, then undoes it', async () => {
     serve(listResponse([suggested, unsuggested]))
     let adoptBody: unknown = null
@@ -149,7 +189,28 @@ describe('AdoptionView', () => {
     fireEvent.click(within(row).getByRole('button', { name: 'Confirm' }))
 
     expect(await within(row).findByRole('alert')).toHaveTextContent('already belongs to a book')
+    // The whole error wraps instead of truncating behind a hover tooltip.
+    expect(within(row).getByRole('alert')).not.toHaveClass('truncate')
     expect(within(row).getByRole('button', { name: 'Confirm' })).toBeInTheDocument()
+  })
+
+  // The full reason lived only in a title tooltip, which a touch screen never
+  // shows. Tapping the short hint reveals it inline.
+  it('reveals the full reason behind the short hint on tap', async () => {
+    serve(listResponse([unsuggested]))
+    const table = await renderView()
+    const row = within(table).getByRole('row', { name: 'Mystery Notes' })
+
+    const hint = within(row).getByRole('button', { name: 'No close title by Andy Weir' })
+    expect(hint).toHaveAttribute('aria-expanded', 'false')
+    const detail = document.getElementById(hint.getAttribute('aria-controls')!)!
+    expect(detail).not.toBeVisible()
+    expect(detail.textContent).toBe(hint.getAttribute('title'))
+    expect(detail.textContent!.length).toBeGreaterThan(hint.textContent!.length)
+
+    fireEvent.click(hint)
+    expect(hint).toHaveAttribute('aria-expanded', 'true')
+    expect(detail).toBeVisible()
   })
 
   it('offers a weak suggestion as a possible match that opens the editor preselected', async () => {
@@ -166,6 +227,81 @@ describe('AdoptionView', () => {
     const editor = await screen.findByRole('region', { name: 'Which book is A Martyrs Tale?' })
     expect(within(editor).getByRole('radio', { name: /The Martian/ })).toBeChecked()
     expect(within(editor).getByRole('button', { name: 'Adopt as The Martian' })).toBeEnabled()
+  })
+
+  it('shows an imported suggestion as such and says the files were added alongside (#2879)', async () => {
+    const owned = { ...martian, status: 'imported' }
+    const copy = item({
+      id: 5, parsedTitle: 'The Martian', relPath: 'Andy Weir/The Martian (2)/The Martian.epub',
+      candidates: [{ book: owned, score: 1 }], topScore: 1,
+    })
+    serve(listResponse([copy]))
+    server.use(
+      http.get(apiUrl('/book'), () => HttpResponse.json({ items: [], total: 0 })),
+      http.post(apiUrl('/library/unmatched/5/adopt'), () =>
+        HttpResponse.json({ ...copy, state: 'adopted', book: owned, message: 'This book already had a file of this format.' })),
+    )
+    const table = await renderView()
+    const row = within(table).getByRole('row', { name: 'The Martian' })
+
+    expect(within(row).getByText('Possible match')).toBeInTheDocument()
+    expect(within(row).getByText('In library')).toBeInTheDocument()
+    expect(within(row).queryByRole('button', { name: 'Confirm' })).toBeNull()
+
+    fireEvent.click(within(row).getByRole('button', { name: 'The Martian' }))
+    const editor = await screen.findByRole('region', { name: 'Which book is The Martian?' })
+    expect(within(editor).getByRole('radio', { name: /The Martian/ })).toBeChecked()
+    expect(within(editor).getByText('In library')).toBeInTheDocument()
+    expect(within(editor).getByRole('note')).toHaveTextContent('This book already has its files.')
+
+    fireEvent.click(within(editor).getByRole('button', { name: 'Adopt as The Martian' }))
+    expect(await within(table).findByText(/Added alongside the file it already had\./)).toBeInTheDocument()
+  })
+
+  // #2942: files naming Katy Evans in a James Patterson folder. A Patterson
+  // look alike is never the preselected one click adopt, and the row says
+  // which authors disagree.
+  it('shows an author conflict and does not preselect the folder author\'s book (#2942)', async () => {
+    const katt = { id: 51, title: 'Katt vs. Dogg', authorId: 9, authorName: 'James Patterson', status: 'wanted', mediaType: 'audiobook', monitored: true }
+    const misfiled = item({
+      id: 6, format: 'audiobook', fileCount: 7, parsedTitle: 'Tycoon', parsedAuthor: 'Katy Evans', authorFolder: 'James Patterson',
+      relPath: 'James Patterson/$10,000,000 Marriage Proposition',
+      authorConflict: { files: 'Katy Evans', folder: 'James Patterson' },
+      candidates: [{ book: katt, score: 0.8, folderAuthorOnly: true }], topScore: 0.8,
+    })
+    serve(listResponse([misfiled]))
+    server.use(http.get(apiUrl('/book'), () => HttpResponse.json({ items: [], total: 0 })))
+    const table = await renderView()
+    const row = within(table).getByRole('row', { name: 'Tycoon' })
+
+    expect(within(row).getByText('Files say Katy Evans, folder says James Patterson')).toBeInTheDocument()
+    expect(within(row).queryByText('Possible match')).toBeNull()
+    expect(within(row).queryByRole('button', { name: 'Confirm' })).toBeNull()
+
+    fireEvent.click(within(row).getByRole('button', { name: 'Choose book' }))
+    const editor = await screen.findByRole('region', { name: 'Which book is Tycoon?' })
+    expect(within(editor).getByRole('note', { name: 'Author conflict' })).toHaveTextContent('The files say Katy Evans, but the folder says James Patterson.')
+    expect(within(editor).getByRole('radio', { name: /Katt vs\. Dogg/ })).not.toBeChecked()
+    expect(within(editor).getByText('Folder author only')).toBeInTheDocument()
+    expect(within(editor).queryByRole('button', { name: 'Adopt as Katt vs. Dogg' })).toBeNull()
+    expect(within(editor).getByRole('button', { name: 'Pick a book' })).toBeDisabled()
+  })
+
+  it('keeps a conflicting row out of its folder\'s Add author group (#2942)', async () => {
+    const jp = (id: number, title: string, extra: Partial<AdoptionItem> = {}) => item({
+      id, parsedTitle: title, parsedAuthor: 'James Patterson', authorFolder: 'James Patterson',
+      relPath: `James Patterson/${title}`, reason: 'author_not_in_library', ...extra,
+    })
+    serve(listResponse([
+      jp(21, 'Along Came a Spider'), jp(22, 'Kiss the Girls'),
+      jp(23, 'Tycoon', { parsedAuthor: 'Katy Evans', authorConflict: { files: 'Katy Evans', folder: 'James Patterson' } }),
+    ]))
+    const table = await renderView()
+
+    expect(within(table).getByRole('row', { name: 'James Patterson, 2 books' })).toBeInTheDocument()
+    const row = within(table).getByRole('row', { name: 'Tycoon' })
+    expect(within(row).getByText('Files say Katy Evans, folder says James Patterson')).toBeInTheDocument()
+    expect(within(row).getByRole('button', { name: 'Add author' })).toBeInTheDocument()
   })
 
   it('asks a metadata provider only when the search is submitted', async () => {
@@ -251,7 +387,7 @@ describe('AdoptionView', () => {
       HttpResponse.json(new URL(request.url).searchParams.get('state') === 'ignored' ? listResponse([ignoredItem]) : listResponse([]))))
     fireEvent.click(screen.getByRole('radio', { name: /Ignored/ }))
     const table = await screen.findByRole('table', { name: /Ignored books in your library/ })
-    expect(within(table).getByRole('button', { name: 'Unignore' })).toBeInTheDocument()
+    expect(await within(table).findByRole('button', { name: 'Unignore' })).toBeInTheDocument()
   })
 
   it('shows books whose author is missing as one group with a single Add author', async () => {
@@ -279,5 +415,160 @@ describe('AdoptionView', () => {
     expect(within(inner).getByRole('button', { name: 'Choose book' })).toBeInTheDocument()
     expect(within(inner).getByRole('button', { name: 'More actions for Record of a Spaceborn Few' })).toBeInTheDocument()
     expect(within(inner).queryByRole('button', { name: 'Add author' })).toBeNull()
+  })
+})
+
+describe('AdoptionView confidence', () => {
+  // "Staat van Orde" was offered as a Possible match for "Star Wars
+  // Battlefront II", at the same weight as a near miss.
+  it('does not offer a suggestion below the weak-match score, and lists it collapsed in the editor', async () => {
+    const miss = item({
+      id: 70, parsedTitle: 'Staat van Orde', relPath: 'Andy Weir/Staat van Orde.epub',
+      candidates: [{ book: { ...martian, title: 'Star Wars Battlefront II' }, score: 0.31 }], topScore: 0.31,
+    })
+    serve(listResponse([miss]))
+    const table = await renderView()
+    const row = within(table).getByRole('row', { name: 'Staat van Orde' })
+    expect(within(row).queryByText('Possible match')).toBeNull()
+    expect(within(row).getByText('No good match')).toBeInTheDocument()
+
+    fireEvent.click(within(row).getByRole('button', { name: 'See 1 suggestion' }))
+    const editor = await screen.findByRole('region', { name: 'Which book is Staat van Orde?' })
+    expect(within(editor).getByText('Low-confidence suggestions (1)')).toBeInTheDocument()
+    // Never chosen for the reader.
+    expect(within(editor).getByRole('radio', { name: /Star Wars Battlefront II/ })).not.toBeChecked()
+  })
+
+  it('confirms every strong match on the page in one step, after asking', async () => {
+    const second = item({
+      id: 5, parsedTitle: 'Project Hail Mary', relPath: 'Andy Weir/Project Hail Mary.epub',
+      candidates: [{ book: { ...martian, id: 43, title: 'Project Hail Mary' }, score: 0.99 }], topScore: 0.99,
+    })
+    serve(listResponse([suggested, second, weak]))
+    const adopted: string[] = []
+    server.use(http.post(apiUrl('/library/unmatched/:id/adopt'), async ({ params, request }) => {
+      adopted.push(`${String(params.id)}:${JSON.stringify(await request.json())}`)
+      return HttpResponse.json({ ...suggested, id: Number(params.id), state: 'adopted' })
+    }))
+    await renderView()
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm 2 strong matches' }))
+    const dialog = await screen.findByTestId('confirm-dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm all' }))
+    await waitFor(() => expect(adopted).toEqual(['1:{"bookId":42}', '5:{"bookId":43}']))
+    expect(await screen.findByTestId('strong-result')).toHaveTextContent('Adopted 2.')
+  })
+
+  // Each adopt moves files: the dialog says which file goes to which book.
+  it('names every file and the book it goes to in the confirmation', async () => {
+    const second = item({
+      id: 5, parsedTitle: 'Project Hail Mary', relPath: 'Andy Weir/Project Hail Mary.epub',
+      candidates: [{ book: { ...martian, id: 43, title: 'Project Hail Mary' }, score: 0.99 }], topScore: 0.99,
+    })
+    serve(listResponse([suggested, second]))
+    await renderView()
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm 2 strong matches' }))
+    const dialog = await screen.findByTestId('confirm-dialog')
+    const pairs = within(within(dialog).getByRole('list', { name: 'Files and the books they go to' })).getAllByRole('listitem')
+    expect(pairs.map(li => li.textContent)).toEqual([
+      'Andy Weir/The Martian.epub → goes to The Martian · Andy Weir',
+      'Andy Weir/Project Hail Mary.epub → goes to Project Hail Mary · Andy Weir',
+    ])
+  })
+
+  it('stops at the first failed adopt and says how far it got', async () => {
+    const second = item({
+      id: 5, parsedTitle: 'Project Hail Mary', relPath: 'Andy Weir/Project Hail Mary.epub',
+      candidates: [{ book: { ...martian, id: 43, title: 'Project Hail Mary' }, score: 0.99 }], topScore: 0.99,
+    })
+    const third = item({
+      id: 6, parsedTitle: 'Artemis', relPath: 'Andy Weir/Artemis.epub',
+      candidates: [{ book: { ...martian, id: 44, title: 'Artemis' }, score: 0.99 }], topScore: 0.99,
+    })
+    serve(listResponse([suggested, second, third]))
+    const tried: string[] = []
+    server.use(http.post(apiUrl('/library/unmatched/:id/adopt'), ({ params }) => {
+      tried.push(String(params.id))
+      if (params.id === '5') return HttpResponse.json({ error: 'already adopted' }, { status: 409 })
+      return HttpResponse.json({ ...suggested, id: Number(params.id), state: 'adopted' })
+    }))
+    await renderView()
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm 3 strong matches' }))
+    fireEvent.click(within(await screen.findByTestId('confirm-dialog')).getByRole('button', { name: 'Confirm all' }))
+    expect(await screen.findByTestId('strong-result')).toHaveTextContent('Adopted 1 of 3, then stopped: Project Hail Mary could not be adopted. Its row says why.')
+    // Artemis was never sent.
+    expect(tried).toEqual(['1', '5'])
+  })
+
+  // A reload while the dialog is open can change what the row is. Each case
+  // is one re-check in the batch; without it the file would be adopted.
+  it.each([
+    ['its book became settled (imported)', { candidates: [{ book: { ...martian, id: 43, title: 'Project Hail Mary', status: 'imported' }, score: 0.99 }] }],
+    ['its top suggestion is a different book', { candidates: [{ book: { ...martian, id: 44, title: 'Artemis' }, score: 0.99 }] }],
+    ['it was ignored elsewhere', { state: 'ignored' as const }],
+  ])('skips a row whose %s after a reload', async (_case, change) => {
+    const second = item({
+      id: 5, parsedTitle: 'Project Hail Mary', relPath: 'Andy Weir/Project Hail Mary.epub',
+      candidates: [{ book: { ...martian, id: 43, title: 'Project Hail Mary' }, score: 0.99 }], topScore: 0.99,
+    })
+    let reloaded = false
+    server.use(
+      http.get(apiUrl('/library/unmatched'), () => HttpResponse.json(listResponse(reloaded ? [suggested, { ...second, ...change }] : [suggested, second]))),
+      http.get(apiUrl('/library/unmatched/summary'), () => HttpResponse.json({ ...listResponse([]).summary, scan: listResponse([]).scan })),
+    )
+    const tried: string[] = []
+    server.use(http.post(apiUrl('/library/unmatched/:id/adopt'), ({ params }) => {
+      tried.push(String(params.id))
+      return HttpResponse.json({ ...suggested, id: Number(params.id), state: 'adopted' })
+    }))
+    await renderView()
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm 2 strong matches' }))
+    const dialog = await screen.findByTestId('confirm-dialog')
+    // A list reload lands while the dialog is open.
+    reloaded = true
+    fireEvent.change(screen.getByPlaceholderText('Search titles, authors and folders'), { target: { value: 'a' } })
+    await waitFor(() => expect(requestedURLs().filter(u => u.includes('/library/unmatched?')).length).toBeGreaterThan(1))
+    fireEvent.change(screen.getByPlaceholderText('Search titles, authors and folders'), { target: { value: '' } })
+    await waitFor(() => expect(requestedURLs().filter(u => u.includes('/library/unmatched?')).length).toBeGreaterThan(2))
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm all' }))
+    expect(await screen.findByTestId('strong-result')).toHaveTextContent('Adopted 1. 1 changed since you confirmed and were left alone.')
+    expect(tried).toEqual(['1'])
+  })
+
+  it('lets the keyboard scroll the list of files in the confirmation', async () => {
+    serve(listResponse([suggested, item({
+      id: 5, parsedTitle: 'Project Hail Mary', relPath: 'Andy Weir/Project Hail Mary.epub',
+      candidates: [{ book: { ...martian, id: 43, title: 'Project Hail Mary' }, score: 0.99 }], topScore: 0.99,
+    })]))
+    await renderView()
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm 2 strong matches' }))
+    const dialog = await screen.findByTestId('confirm-dialog')
+    expect(within(dialog).getByRole('list', { name: 'Files and the books they go to' })).toHaveAttribute('tabindex', '0')
+  })
+
+  it('leaves a row alone that was decided by hand while the dialog was open', async () => {
+    const second = item({
+      id: 5, parsedTitle: 'Project Hail Mary', relPath: 'Andy Weir/Project Hail Mary.epub',
+      candidates: [{ book: { ...martian, id: 43, title: 'Project Hail Mary' }, score: 0.99 }], topScore: 0.99,
+    })
+    serve(listResponse([suggested, second]))
+    const tried: string[] = []
+    server.use(
+      http.post(apiUrl('/library/unmatched/:id/adopt'), ({ params }) => {
+        tried.push(String(params.id))
+        return HttpResponse.json({ ...suggested, id: Number(params.id), state: 'adopted' })
+      }),
+      http.post(apiUrl('/library/unmatched/:id/ignore'), ({ params }) => HttpResponse.json({ ...second, id: Number(params.id), state: 'ignored' })),
+    )
+    const table = await renderView()
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm 2 strong matches' }))
+    const dialog = await screen.findByTestId('confirm-dialog')
+    // Decide the second row by hand first, then confirm the batch.
+    const row = within(table).getByRole('row', { name: 'Project Hail Mary' })
+    fireEvent.click(within(row).getByRole('button', { name: 'More actions for Project Hail Mary' }))
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Ignore' }))
+    await within(row).findByRole('button', { name: /Undo/ })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm all' }))
+    expect(await screen.findByTestId('strong-result')).toHaveTextContent('Adopted 1. 1 changed since you confirmed and were left alone.')
+    expect(tried).toEqual(['1'])
   })
 })

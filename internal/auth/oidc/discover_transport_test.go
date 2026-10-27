@@ -2,6 +2,8 @@ package oidc
 
 import (
 	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/vavallee/bindery/internal/httpsec"
@@ -41,17 +43,28 @@ func TestDiscoverTransport_DialGuardWhenDirect(t *testing.T) {
 }
 
 // With an outbound proxy configured the dial targets the proxy rather than the
-// IdP, so the per-dial re-check is skipped and the shared transport is returned
-// unchanged. Without this a loopback or LAN proxy would be rejected by the
-// guard meant for the IdP.
-func TestDiscoverTransport_NoDialGuardWhenProxied(t *testing.T) {
+// IdP; that dial is exempt from the policy so a loopback or LAN proxy is not
+// rejected by the guard meant for the IdP, and the request still arrives.
+func TestDiscoverTransport_LoopbackProxyStillWorks(t *testing.T) {
 	t.Cleanup(func() { _, _ = httpsec.ConfigureOutboundProxy("", "", true) })
-	if _, err := httpsec.ConfigureOutboundProxy("http://127.0.0.1:0", "", true); err != nil {
+	var hits int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer proxy.Close()
+	if _, err := httpsec.ConfigureOutboundProxy(proxy.URL, "", false); err != nil {
 		t.Fatalf("ConfigureOutboundProxy: %v", err)
 	}
 
 	policy := httpsec.PolicyLAN
-	if got := discoverTransport(&policy); got != httpsec.DefaultProxyTransport() {
-		t.Errorf("with a proxy configured, discoverTransport must return the shared proxy transport unchanged; got %#v", got)
+	client := &http.Client{Transport: discoverTransport(&policy)}
+	resp, err := client.Get("http://idp.example.test/.well-known/openid-configuration")
+	if err != nil {
+		t.Fatalf("request through the loopback proxy: %v", err)
+	}
+	_ = resp.Body.Close()
+	if atomic.LoadInt32(&hits) != 1 {
+		t.Errorf("proxy hits = %d; want 1", atomic.LoadInt32(&hits))
 	}
 }

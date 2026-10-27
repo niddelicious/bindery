@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/vavallee/bindery/internal/db"
+	"github.com/vavallee/bindery/internal/downloader"
 	"github.com/vavallee/bindery/internal/httpsec"
 	"github.com/vavallee/bindery/internal/models"
 )
@@ -394,8 +395,9 @@ func TestDownloadClientTestConfig_Unreachable(t *testing.T) {
 	rec := httptest.NewRecorder()
 	body := `{"name":"qBit","type":"qbittorrent","host":"` + host + `","port":` + strconv.Itoa(port) + `,"username":"u","password":"p","enabled":true}`
 	h.TestConfig(rec, httptest.NewRequest(http.MethodPost, "/downloadclient/test", bytes.NewBufferString(body)))
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 for unreachable client, got %d: %s", rec.Code, rec.Body.String())
+	// An unreachable client is the far side being down, not a bad request: 502.
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502 for unreachable client, got %d: %s", rec.Code, rec.Body.String())
 	}
 	var out struct {
 		Error string `json:"error"`
@@ -408,23 +410,29 @@ func TestDownloadClientTestConfig_Unreachable(t *testing.T) {
 	}
 }
 
-// TestDownloadClientHandler_LifetimeCtxFallsBackToBackground is the #846
-// follow-up guard for the async health-probe goroutine spawned by Create/Update.
-func TestDownloadClientHandler_LifetimeCtxFallsBackToBackground(t *testing.T) {
-	h := &DownloadClientHandler{}
-	if h.bgCtx() != context.Background() {
-		t.Error("bgCtx without WithLifetimeCtx must return context.Background()")
+// TestDownloadClientHandler_HealthProbeCancelsOnLifetimeCtx is the #846 guard
+// for the health probe Create and Update start (#1844): it runs on the
+// lifetime ctx, so shutdown ends an in-flight probe instead of leaving it for
+// its 15s timeout. The probe dials a client that never answers, and the test
+// fails if the spawn site goes back to context.Background().
+func TestDownloadClientHandler_HealthProbeCancelsOnLifetimeCtx(t *testing.T) {
+	defer httpsec.AllowLoopbackForTests()()
+	srv := newHangingServer(t)
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	host, portStr, _ := net.SplitHostPort(u.Host)
+	port, _ := strconv.Atoi(portStr)
+
+	h, _ := downloadClientFixture(t)
+	h.WithHealth(downloader.NewHealthStore())
+	lifetime, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	h.WithLifetimeCtx(ctx)
-	if h.bgCtx() != ctx {
-		t.Error("bgCtx with WithLifetimeCtx must return the supplied ctx")
-	}
-	h.WithLifetimeCtx(nil) //nolint:staticcheck // SA1012 testing nil-tolerance contract
-	if h.bgCtx() != ctx {
-		t.Error("WithLifetimeCtx(nil) must not clobber a previously installed ctx")
-	}
+	h.WithLifetimeCtx(lifetime)
+
+	h.refreshClientHealthAsync(models.DownloadClient{ID: 1, Name: "qBit", Type: "qbittorrent", Host: host, Port: port, Enabled: true})
+	srv.waitCancelledBy(t, cancel)
 }
 
 // TestDownloadClientCreate_RejectsMalformedHost covers #2203: a Host copied

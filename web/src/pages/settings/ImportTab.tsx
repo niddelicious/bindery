@@ -1,24 +1,11 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, useId } from 'react'
 import { useTranslation } from 'react-i18next'
-import { api, BINDERY_BASE, Book, HardcoverList, ImportList, ImportListSyncProgress, ManagedUser, ManualImportLookup } from '../../api/client'
+import { api, BINDERY_BASE, Book, HardcoverList, ImportList, ImportListSyncProgress, ManagedUser, ManualImportLookup, MigrateResult, ReadarrImportProgress } from '../../api/client'
 import { inputCls } from './formStyles'
 import GoodreadsImportSection from './GoodreadsImportSection'
-
-interface MigrateResult {
-  requested?: number
-  added?: number
-  skipped?: number
-  errors?: number
-  addedNames?: string[]
-  failures?: Record<string, string>
-}
-
-interface ReadarrResult {
-  authors?: MigrateResult
-  indexers?: MigrateResult
-  downloadClients?: MigrateResult
-  blocklist?: MigrateResult
-}
+import { secretInputAttrs } from '../../util/inputAttrs'
+import { primaryFill } from '../../components/buttons'
+import { errorText } from '../../util/errorText'
 
 // onNavigate threads SettingsPage's soft (no-reload) tab switch into the
 // "Configure … in General settings →" link so it doesn't full-page-reload.
@@ -29,42 +16,89 @@ export interface ImportTabProps {
 export default function ImportTab({ onNavigate }: ImportTabProps = {}) {
   const { t } = useTranslation()
   const [csvResult, setCsvResult] = useState<MigrateResult | null>(null)
-  const [readarrResult, setReadarrResult] = useState<ReadarrResult | null>(null)
+  const [readarrProgress, setReadarrProgress] = useState<ReadarrImportProgress | null>(null)
   const [uploading, setUploading] = useState<'csv' | 'readarr' | null>(null)
   const [err, setErr] = useState<string | null>(null)
+  const uploadStartedRef = useRef(false)
 
   const upload = async (endpoint: 'csv' | 'readarr', file: File) => {
     setUploading(endpoint)
     setErr(null)
     setCsvResult(null)
-    setReadarrResult(null)
+    // Only a new Readarr upload clears the Readarr view. A CSV upload must not
+    // hide a catalogue backfill that is still running.
+    if (endpoint === 'readarr') {
+      uploadStartedRef.current = true
+      setReadarrProgress(null)
+    }
     try {
       const fd = new FormData()
       fd.append('file', file)
-      const data = await api.uploadMigrate<MigrateResult | ReadarrResult>(endpoint, fd)
-      if (endpoint === 'csv') setCsvResult(data as MigrateResult)
-      else setReadarrResult(data as ReadarrResult)
+      if (endpoint === 'csv') {
+        setCsvResult(await api.uploadMigrate<MigrateResult>(endpoint, fd))
+      } else {
+        // 202: the import runs in the background and is followed by polling.
+        setReadarrProgress(await api.uploadMigrate<ReadarrImportProgress>(endpoint, fd))
+      }
     } catch (e) {
-      setErr(e instanceof Error ? e.message : 'Upload failed')
+      setErr(errorText(e, t('settings.import.uploadFailed', 'Upload failed')))
     } finally {
       setUploading(null)
     }
   }
+
+  // A returning visitor mid-import (or mid catalogue backfill, which can run
+  // for tens of minutes) picks the progress back up.
+  useEffect(() => {
+    let cancelled = false
+    api.readarrImportStatus()
+      .then(p => {
+        // A late answer must not overwrite state after unmount or after an
+        // upload from this page has started.
+        if (cancelled || uploadStartedRef.current) return
+        if (p?.running || p?.catalogueRunning) setReadarrProgress(p)
+      })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [])
+
+  // Poll while the database import or the catalogue backfill behind it is
+  // running. The backfill outlives the import, so `running` alone would stop
+  // the poll early. It ends when both are false; a restarted server reports
+  // both false (counters gone) and ends it too.
+  const readarrActive = Boolean(readarrProgress?.running || readarrProgress?.catalogueRunning)
+  useEffect(() => {
+    if (!readarrActive) return
+    let cancelled = false
+    const timer = setInterval(async () => {
+      try {
+        const next = await api.readarrImportStatus()
+        if (!cancelled) setReadarrProgress(next)
+      } catch {
+        // Transient poll failure: keep polling rather than dropping the view.
+      }
+    }, 2000)
+    return () => { cancelled = true; clearInterval(timer) }
+  }, [readarrActive])
+
+  const readarrResult = readarrProgress?.result
+  const catalogueTotal = readarrProgress?.catalogueTotal ?? 0
+  const catalogueDone = Math.min(readarrProgress?.catalogueDone ?? 0, catalogueTotal)
 
   const renderResult = (r: MigrateResult | undefined, label: string) => {
     if (!r) return null
     return (
       <div className="p-3 border border-slate-200 dark:border-zinc-800 rounded bg-slate-100 dark:bg-zinc-900 space-y-1">
         <div className="text-sm font-medium">{label}</div>
-        <div className="text-xs text-slate-600 dark:text-zinc-500">
-          {r.requested ?? 0} requested · {r.added ?? 0} added · {r.skipped ?? 0} skipped (already exist) · {r.errors ?? 0} failed
+        <div className="text-xs text-fg-muted">
+          {r.requested ?? 0} {t('settings.import.resultRequested', 'requested')} · {r.added ?? 0} {t('settings.import.resultAdded', 'added')} · {r.skipped ?? 0} {t('settings.import.resultSkipped', 'skipped (already exist)')} · {r.errors ?? 0} {t('settings.import.resultFailed', 'failed')}
         </div>
         {r.failures && Object.keys(r.failures).length > 0 && (
           <details className="text-xs">
-            <summary className="cursor-pointer text-red-600 dark:text-red-400">Show {Object.keys(r.failures).length} failures</summary>
+            <summary className="cursor-pointer text-red-700 dark:text-red-400">{t('settings.import.showFailures', { count: Object.keys(r.failures).length, defaultValue: 'Show {{count}} failures' })}</summary>
             <ul className="mt-2 space-y-0.5 font-mono">
               {Object.entries(r.failures).map(([name, reason]) => (
-                <li key={name}><span className="text-slate-800 dark:text-zinc-200">{name}</span>: <span className="text-slate-500 dark:text-zinc-500">{reason}</span></li>
+                <li key={name}><span className="text-slate-800 dark:text-zinc-200">{name}</span>: <span className="text-fg-muted">{reason}</span></li>
               ))}
             </ul>
           </details>
@@ -77,10 +111,10 @@ export default function ImportTab({ onNavigate }: ImportTabProps = {}) {
     <div className="space-y-8 max-w-2xl">
       <section>
         <h3 className="text-base font-semibold mb-2 text-slate-800 dark:text-zinc-200">{t('settings.import.csvHeading')}</h3>
-        <p className="text-xs text-slate-600 dark:text-zinc-500 mb-3">
+        <p className="text-xs text-fg-muted mb-3">
           {t('settings.import.csvDescription')}
         </p>
-        <label className="inline-flex items-center gap-2 px-3 py-2 bg-emerald-600 hover:bg-emerald-500 rounded text-sm font-medium cursor-pointer">
+        <label className={`inline-flex items-center gap-2 px-3 py-2 ${primaryFill} rounded text-sm font-medium cursor-pointer`}>
           {uploading === 'csv' ? t('settings.import.importingCsv') : t('settings.import.uploadCsv')}
           <input
             type="file"
@@ -90,30 +124,46 @@ export default function ImportTab({ onNavigate }: ImportTabProps = {}) {
             onChange={e => { const f = e.target.files?.[0]; if (f) upload('csv', f); e.currentTarget.value = '' }}
           />
         </label>
-        {csvResult && <div className="mt-4">{renderResult(csvResult, 'Authors')}</div>}
+        {csvResult && <div className="mt-4">{renderResult(csvResult, t('settings.import.resultAuthors', 'Authors'))}</div>}
       </section>
 
       <section>
         <h3 className="text-base font-semibold mb-2 text-slate-800 dark:text-zinc-200">{t('settings.import.readarrHeading')}</h3>
-        <p className="text-xs text-slate-600 dark:text-zinc-500 mb-3">
+        <p className="text-xs text-fg-muted mb-3">
           {t('settings.import.readarrDescription')}
         </p>
-        <label className="inline-flex items-center gap-2 px-3 py-2 bg-emerald-600 hover:bg-emerald-500 rounded text-sm font-medium cursor-pointer">
+        <label className={`inline-flex items-center gap-2 px-3 py-2 ${primaryFill} rounded text-sm font-medium cursor-pointer`}>
           {uploading === 'readarr' ? t('settings.import.importingReadarr') : t('settings.import.uploadReadarr')}
           <input
             type="file"
             accept=".db,.sqlite,application/x-sqlite3,application/octet-stream"
             className="hidden"
-            disabled={uploading !== null}
+            disabled={uploading !== null || readarrProgress?.running === true}
             onChange={e => { const f = e.target.files?.[0]; if (f) upload('readarr', f); e.currentTarget.value = '' }}
           />
         </label>
+        {readarrProgress?.running && (
+          <p className="mt-3 text-xs text-fg-muted">{t('settings.import.importingReadarr')}</p>
+        )}
+        {readarrProgress?.error && !readarrProgress.running && (
+          <p className="mt-3 text-xs text-red-700 dark:text-red-400">{readarrProgress.error}</p>
+        )}
         {readarrResult && (
           <div className="mt-4 space-y-2">
-            {renderResult(readarrResult.authors, 'Authors')}
-            {renderResult(readarrResult.indexers, 'Indexers')}
-            {renderResult(readarrResult.downloadClients, 'Download clients')}
-            {renderResult(readarrResult.blocklist, 'Blocklist')}
+            {renderResult(readarrResult.authors, t('settings.import.resultAuthors', 'Authors'))}
+            {renderResult(readarrResult.indexers, t('settings.import.resultIndexers', 'Indexers'))}
+            {renderResult(readarrResult.downloadClients, t('settings.import.resultDownloadClients', 'Download clients'))}
+            {renderResult(readarrResult.blocklist, t('settings.import.resultBlocklist', 'Blocklist'))}
+          </div>
+        )}
+        {catalogueTotal > 0 && (
+          <div className="mt-3 text-xs text-fg-muted" data-testid="readarr-catalogue-progress">
+            <p>
+              {readarrProgress?.catalogueRunning
+                ? t('settings.import.catalogueFetching', { done: catalogueDone, total: catalogueTotal })
+                : t('settings.import.catalogueFetched', { done: catalogueDone, total: catalogueTotal })}
+            </p>
+            {readarrProgress?.catalogueRunning && <p className="mt-1">{t('settings.import.catalogueHint')}</p>}
           </div>
         )}
       </section>
@@ -132,6 +182,7 @@ export default function ImportTab({ onNavigate }: ImportTabProps = {}) {
 }
 
 function ManualImportSection() {
+  const fid = useId()
   const { t } = useTranslation()
   const [path, setPath] = useState('')
   const [looking, setLooking] = useState(false)
@@ -160,7 +211,7 @@ function ManualImportSection() {
       setFormat(r.detectedFormat)
       if (r.match === 'confident' && r.book) setSelectedBook(r.book)
     } catch (e) {
-      setErr(e instanceof Error ? e.message : 'Lookup failed')
+      setErr(errorText(e, t('settings.import.lookupFailed', 'Lookup failed')))
     } finally {
       setLooking(false)
     }
@@ -174,7 +225,7 @@ function ManualImportSection() {
       await api.manualImport({ path: path.trim(), bookId: selectedBook.id, format: format || undefined })
       setSuccess(true)
     } catch (e) {
-      setErr(e instanceof Error ? e.message : 'Import failed')
+      setErr(errorText(e, t('settings.import.importFailed', 'Import failed')))
     } finally {
       setImporting(false)
     }
@@ -183,7 +234,7 @@ function ManualImportSection() {
   return (
     <section>
       <h3 className="text-base font-semibold mb-2 text-slate-800 dark:text-zinc-200">{t('settings.import.manualImportHeading')}</h3>
-      <p className="text-xs text-slate-600 dark:text-zinc-500 mb-3">{t('settings.import.manualImportDescription')}</p>
+      <p className="text-xs text-fg-muted mb-3">{t('settings.import.manualImportDescription')}</p>
 
       <div className="flex gap-2 mb-3">
         <input
@@ -220,7 +271,7 @@ function ManualImportSection() {
                   setSelectedBook(result.candidates?.find(b => b.id === id) ?? null)
                 }}
               >
-                <option value="">— select —</option>
+                <option value="">{t('settings.import.manualImportSelect', '— select —')}</option>
                 {result.candidates?.map(b => (
                   <option key={b.id} value={b.id}>{b.title} {b.author ? `(${b.author.authorName})` : ''}</option>
                 ))}
@@ -234,8 +285,8 @@ function ManualImportSection() {
           {result.match !== 'none' && (
             <div className="flex items-center gap-3">
               <div>
-                <label className="block text-xs text-slate-500 dark:text-zinc-500 mb-1">{t('settings.import.manualImportFormatLabel')}</label>
-                <select className={inputCls} value={format} onChange={e => setFormat(e.target.value)}>
+                <label htmlFor={`${fid}-1`} className="block text-xs text-fg-muted mb-1">{t('settings.import.manualImportFormatLabel')}</label>
+                <select id={`${fid}-1`} className={inputCls} value={format} onChange={e => setFormat(e.target.value)}>
                   <option value="">{t('settings.import.manualImportFormatAuto')}</option>
                   <option value="ebook">{t('settings.import.manualImportFormatEbook')}</option>
                   <option value="audiobook">{t('settings.import.manualImportFormatAudiobook')}</option>
@@ -244,7 +295,7 @@ function ManualImportSection() {
               <button
                 onClick={handleImport}
                 disabled={importing || !selectedBook}
-                className="mt-4 px-3 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded text-sm font-medium"
+                className={`mt-4 px-3 py-2 ${primaryFill} disabled:opacity-50 rounded text-sm font-medium`}
               >
                 {importing ? t('settings.import.manualImportImporting') : t('settings.import.manualImportConfirm')}
               </button>
@@ -254,10 +305,10 @@ function ManualImportSection() {
       )}
 
       {success && (
-        <p className="text-sm text-emerald-600 dark:text-emerald-400">{t('settings.import.manualImportSuccess')}</p>
+        <p className="text-sm text-accent-text">{t('settings.import.manualImportSuccess')}</p>
       )}
       {err && (
-        <p className="text-sm text-red-600 dark:text-red-400">{err}</p>
+        <p className="text-sm text-red-700 dark:text-red-400">{err}</p>
       )}
     </section>
   )
@@ -272,10 +323,10 @@ function FolderImportLink() {
     <section>
       <h3 className="text-base font-semibold mb-2 text-slate-800 dark:text-zinc-200">{t('settings.import.folderMovedHeading', 'Import from a folder')}</h3>
       <div className="flex flex-wrap items-center justify-between gap-3 p-3 border border-slate-200 dark:border-zinc-800 rounded-lg bg-slate-100 dark:bg-zinc-900">
-        <p className="text-xs text-slate-600 dark:text-zinc-500 max-w-xl">
+        <p className="text-xs text-fg-muted max-w-xl">
           {t('settings.import.folderMovedBody', 'Scanning a folder and importing what it matches is on the Import page now, beside the books a library scan could not match.')}
         </p>
-        <a href={`${BINDERY_BASE}/import?view=folder`} className="px-3 py-1.5 rounded-md text-sm font-medium bg-emerald-600 hover:bg-emerald-500 text-white">
+        <a href={`${BINDERY_BASE}/import?view=folder`} className={`px-3 py-1.5 rounded-md text-sm font-medium ${primaryFill}`}>
           {t('settings.import.folderMovedLink', 'Open Import')}
         </a>
       </div>
@@ -321,7 +372,7 @@ function HardcoverListsSection({ onNavigate }: { onNavigate?: (tab: string) => v
       const all = await api.listImportLists()
       setLists(sortImportLists(all.filter(l => l.type === 'hardcover')))
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load saved Hardcover lists')
+      setError(errorText(err, t('settings.import.hardcoverLoadSavedFailed', 'Failed to load saved Hardcover lists')))
     }
     try {
       const { account, lists: remote } = await api.hardcoverLists(token || undefined)
@@ -330,11 +381,11 @@ function HardcoverListsSection({ onNavigate }: { onNavigate?: (tab: string) => v
     } catch (err) {
       setHcLists([])
       setHcAccount('')
-      setError(err instanceof Error ? err.message : 'Failed to load Hardcover lists')
+      setError(errorText(err, t('settings.import.hardcoverLoadFailed', 'Failed to load Hardcover lists')))
     } finally {
       setLoadingLists(false)
     }
-  }, [])
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     void loadLists('')
@@ -366,7 +417,7 @@ function HardcoverListsSection({ onNavigate }: { onNavigate?: (tab: string) => v
       const updated = await api.updateImportList(il.id, { mediaType })
       updateLocalList(updated)
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to update media type')
+      setError(errorText(err, t('settings.import.updateMediaTypeFailed', 'Failed to update media type')))
     }
   }
 
@@ -381,7 +432,7 @@ function HardcoverListsSection({ onNavigate }: { onNavigate?: (tab: string) => v
       const updated = await api.updateImportList(il.id, { monitorNew })
       updateLocalList(updated)
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to update download setting')
+      setError(errorText(err, t('settings.import.updateMonitorNewFailed', 'Failed to update download setting')))
     }
   }
 
@@ -392,7 +443,7 @@ function HardcoverListsSection({ onNavigate }: { onNavigate?: (tab: string) => v
       const updated = await api.updateImportList(il.id, { ownerUserId })
       updateLocalList(updated)
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to update owner')
+      setError(errorText(err, t('settings.import.updateOwnerFailed', 'Failed to update owner')))
     }
   }
 
@@ -422,7 +473,7 @@ function HardcoverListsSection({ onNavigate }: { onNavigate?: (tab: string) => v
       })
       setLists(prev => sortImportLists([...prev, created]))
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to update Hardcover import list')
+      setError(errorText(err, t('settings.import.hardcoverUpdateFailed', 'Failed to update Hardcover import list')))
     } finally {
       setActionSlug(null)
     }
@@ -455,7 +506,7 @@ function HardcoverListsSection({ onNavigate }: { onNavigate?: (tab: string) => v
         setLists(sortImportLists(all.filter(l => l.type === 'hardcover')))
       }
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : 'Sync failed')
+      setError(errorText(e, t('settings.import.hardcoverSyncFailed', 'Sync failed')))
     }
   }
 
@@ -501,7 +552,7 @@ function HardcoverListsSection({ onNavigate }: { onNavigate?: (tab: string) => v
       updateLocalList(updated)
       setOverrideDraft(prev => ({ ...prev, [il.id]: '' }))
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to save token override')
+      setError(errorText(err, t('settings.import.tokenOverrideSaveFailed', 'Failed to save token override')))
     } finally {
       setActionSlug(null)
     }
@@ -514,7 +565,7 @@ function HardcoverListsSection({ onNavigate }: { onNavigate?: (tab: string) => v
       const updated = await api.updateImportList(il.id, { clearApiKey: true })
       updateLocalList(updated)
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to clear token override')
+      setError(errorText(err, t('settings.import.tokenOverrideClearFailed', 'Failed to clear token override')))
     } finally {
       setActionSlug(null)
     }
@@ -563,12 +614,13 @@ function HardcoverListsSection({ onNavigate }: { onNavigate?: (tab: string) => v
           {loadingLists ? t('settings.import.hardcoverListLoading') : t('common.refresh', 'Refresh')}
         </button>
       </div>
-      <p className="text-xs text-slate-600 dark:text-zinc-500 mb-3">
+      <p className="text-xs text-fg-muted mb-3">
         {t('settings.import.hardcoverDescription')}
       </p>
 
       <div className="mb-3 flex flex-col sm:flex-row gap-2">
         <input
+          {...secretInputAttrs}
           className={inputCls}
           type="password"
           placeholder={t('settings.import.hardcoverTokenPlaceholder')}
@@ -594,7 +646,7 @@ function HardcoverListsSection({ onNavigate }: { onNavigate?: (tab: string) => v
       </div>
 
       {rows.length === 0 && !loadingLists && (
-        <p className="text-sm text-slate-500 dark:text-zinc-600">{t('settings.import.hardcoverEmpty')}</p>
+        <p className="text-sm text-fg-muted">{t('settings.import.hardcoverEmpty')}</p>
       )}
 
       <div className="space-y-2">
@@ -618,18 +670,18 @@ function HardcoverListsSection({ onNavigate }: { onNavigate?: (tab: string) => v
                   <span className="min-w-0">
                     <span className="flex flex-wrap items-center gap-2">
                       <span className="text-sm font-medium">{row.name}</span>
-                      <span className="text-[10px] px-1.5 py-0.5 bg-slate-200 dark:bg-zinc-800 text-slate-600 dark:text-zinc-400 rounded">{row.slug}</span>
+                      <span className="text-[10px] px-1.5 py-0.5 bg-slate-200 dark:bg-zinc-800 text-fg-muted rounded">{row.slug}</span>
                       {(row.local?.account || (!row.local && hcAccount)) && <span className="text-[10px] px-1.5 py-0.5 bg-sky-100 dark:bg-sky-950 text-sky-700 dark:text-sky-400 rounded">@{row.local?.account || hcAccount}</span>}
                       {row.stale && <span className="text-[10px] px-1.5 py-0.5 bg-amber-100 dark:bg-amber-950 text-amber-700 dark:text-amber-400 rounded">{t('settings.import.hardcoverSavedOnly', 'Saved only')}</span>}
-                      {il && <span className="text-[10px] px-1.5 py-0.5 bg-slate-200 dark:bg-zinc-800 text-slate-600 dark:text-zinc-400 rounded">{il.apiKeyConfigured ? t('settings.import.hardcoverOverrideConfigured', 'Override token') : t('settings.import.hardcoverGlobalToken', 'Global token')}</span>}
+                      {il && <span className="text-[10px] px-1.5 py-0.5 bg-slate-200 dark:bg-zinc-800 text-fg-muted rounded">{il.apiKeyConfigured ? t('settings.import.hardcoverOverrideConfigured', 'Override token') : t('settings.import.hardcoverGlobalToken', 'Global token')}</span>}
                     </span>
-                    <span className="block text-xs text-slate-500 dark:text-zinc-600 mt-0.5">
+                    <span className="block text-xs text-fg-muted mt-0.5">
                       {il?.lastSyncAt
                         ? t('settings.import.hardcoverLastSync', { date: new Date(il.lastSyncAt).toLocaleString() })
                         : il
                           ? t('settings.import.hardcoverNeverSynced')
                           : t('settings.import.hardcoverNotSelected', 'Not selected')}
-                      {row.remote && ` · ${row.booksCount} books`}
+                      {row.remote && t('settings.import.hardcoverListBooks', { count: row.booksCount })}
                     </span>
                   </span>
                 </label>
@@ -685,14 +737,14 @@ function HardcoverListsSection({ onNavigate }: { onNavigate?: (tab: string) => v
                     >
                       {t('settings.import.hardcoverTokenOverride', 'Token override')}
                     </button>
-                    <button onClick={() => handleDelete(il.id)} className="text-xs text-red-600 dark:text-red-400 hover:underline">{t('common.delete')}</button>
+                    <button onClick={() => handleDelete(il.id)} className="text-xs text-red-700 dark:text-red-400 hover:underline">{t('common.delete')}</button>
                   </div>
                 )}
               </div>
               {/* Live sync line: shown while this list is syncing and left in
                   place afterwards so the run's outcome is visible (#1854). */}
               {il && syncProgress?.listId === il.id && (
-                <p className={`mt-2 text-xs ${syncProgress.error ? 'text-red-600 dark:text-red-400' : 'text-emerald-600 dark:text-emerald-400'}`}>
+                <p className={`mt-2 text-xs ${syncProgress.error ? 'text-red-700 dark:text-red-400' : 'text-accent-text'}`}>
                   {syncProgress.running
                     ? `${syncProgress.message ?? t('settings.import.hardcoverSyncing', 'Syncing…')}${syncProgress.stats.total > 0 ? ` (${syncProgress.stats.processed}/${syncProgress.stats.total})` : ''}`
                     : syncProgress.error
@@ -708,6 +760,7 @@ function HardcoverListsSection({ onNavigate }: { onNavigate?: (tab: string) => v
               {il && overrideOpen[il.id] && (
                 <div className="mt-3 flex flex-col sm:flex-row gap-2">
                   <input
+                    {...secretInputAttrs}
                     className={inputCls}
                     type="password"
                     placeholder={il.apiKeyConfigured ? t('settings.import.hardcoverTokenOverridePlaceholderConfigured', 'Override token is hidden. Enter a new token to replace it.') : t('settings.import.hardcoverTokenOverridePlaceholder', 'Paste a per-list token override')}
@@ -717,7 +770,7 @@ function HardcoverListsSection({ onNavigate }: { onNavigate?: (tab: string) => v
                   <button
                     onClick={() => handleSaveOverride(il)}
                     disabled={busy || !(overrideDraft[il.id] ?? '').trim()}
-                    className="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded text-xs font-medium"
+                    className={`px-3 py-2 ${primaryFill} disabled:opacity-50 rounded text-xs font-medium`}
                   >
                     {t('common.save')}
                   </button>
@@ -744,7 +797,7 @@ function HardcoverListsSection({ onNavigate }: { onNavigate?: (tab: string) => v
             <span className="block mt-1 text-xs">
               <button
                 onClick={() => onNavigate ? onNavigate('api-keys') : window.location.assign('/settings?tab=api-keys')}
-                className="text-emerald-600 dark:text-emerald-400 hover:underline"
+                className="text-accent-text hover:underline"
               >
                 {t('settings.import.configureHardcoverToken', 'Configure the Hardcover API token in API Keys settings →')}
               </button>

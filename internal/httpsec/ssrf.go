@@ -36,7 +36,22 @@ const (
 	// influenced by untrusted input (cover/image proxy, webhooks) — those keep
 	// PolicyStrict / PolicyLAN.
 	PolicyLANLoopback
+
+	// PolicyService is PolicyLANLoopback for admin-typed service URLs, with one
+	// optional extra: when BINDERY_ALLOW_LINK_LOCAL_SERVICES is truthy it also
+	// permits link-local (169.254/16, fe80::/10), for rootless Podman with
+	// pasta, where the host is only reachable at 169.254.1.2 (#2036). Cloud
+	// metadata addresses stay refused either way. Use it ONLY for the URLs an
+	// operator types into a settings form (indexers, Prowlarr, download client
+	// control endpoints, Audiobookshelf, Grimmory, the Calibre plugin). Data
+	// chosen by a remote party (indexer download links, covers, webhooks) keeps
+	// its own policy and never sees link-local.
+	PolicyService
 )
+
+// LinkLocalServicesEnvVar is the opt-in that lets PolicyService reach
+// link-local addresses.
+const LinkLocalServicesEnvVar = "BINDERY_ALLOW_LINK_LOCAL_SERVICES"
 
 // Resolver abstracts net.LookupIP so tests can inject a fake resolver without
 // hitting real DNS.
@@ -64,6 +79,14 @@ func (netResolver) LookupIP(host string) ([]net.IP, error) {
 // defaultResolver is the live resolver used in production.
 var defaultResolver Resolver = netResolver{}
 
+// linkLocalServicesAllowed reports whether the operator opted in to link-local
+// service URLs. Read on every check so the dial guard and the save-time
+// validation can never disagree.
+func linkLocalServicesAllowed() bool { return envIsTruthy(LinkLocalServicesEnvVar) }
+
+// LinkLocalServicesEnabled reports whether the operator turned the opt-in on.
+func LinkLocalServicesEnabled() bool { return linkLocalServicesAllowed() }
+
 // cloudMetadataHosts lists well-known metadata endpoints that must never be
 // reachable from a webhook, regardless of policy.
 var cloudMetadataHosts = map[string]bool{
@@ -83,7 +106,9 @@ func ValidateOutboundURL(raw string, policy Policy) error {
 func validateWithResolver(raw string, policy Policy, r Resolver) error {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return fmt.Errorf("url not allowed: invalid url: %w", err)
+		// Redact before wrapping: fmt.Errorf formats the message now, so a
+		// later RedactURLError on the result could not reach the URL inside.
+		return fmt.Errorf("url not allowed: invalid url: %w", RedactURLError(err))
 	}
 
 	scheme := strings.ToLower(u.Scheme)
@@ -161,12 +186,17 @@ func checkIP(ip net.IP, policy Policy) error {
 	// infrastructure URLs, where reaching a co-located service over 127.0.0.1 is
 	// the intended, normal case) or when explicitly allowed for tests via
 	// AllowLoopbackForTests (never opt in from production code).
-	if ip.IsLoopback() && policy != PolicyLANLoopback && !testAllowLoopback {
+	if ip.IsLoopback() && policy != PolicyLANLoopback && policy != PolicyService && !testAllowLoopback {
 		return errors.New("url not allowed: points to loopback address")
 	}
 
-	// Always blocked: link-local (169.254/16, fe80::/10).
-	if ip.IsLinkLocalUnicast() {
+	// Blocked: link-local (169.254/16, fe80::/10). The one exception is the
+	// admin-typed service class when the operator opted in; cloud metadata is
+	// checked next and is never excused.
+	if ip.IsLinkLocalUnicast() && (policy != PolicyService || !linkLocalServicesAllowed()) {
+		if policy == PolicyService && !isCloudMetadata(ip) {
+			return errors.New("url not allowed: points to link-local address (set " + LinkLocalServicesEnvVar + "=1 to allow link-local service URLs, e.g. rootless Podman with pasta)")
+		}
 		return errors.New("url not allowed: points to link-local address")
 	}
 
@@ -207,10 +237,12 @@ func isRFC1918(ip net.IP) bool {
 }
 
 // isCloudMetadata returns true for known cloud-metadata IP addresses:
-// 169.254.169.254 (AWS/Azure/DO) and fd00:ec2::254 (AWS IMDSv6).
+// 169.254.169.254 (AWS/Azure/DO), 169.254.170.2 (AWS ECS task credentials)
+// and fd00:ec2::254 (AWS IMDSv6).
 func isCloudMetadata(ip net.IP) bool {
 	if ip4 := ip.To4(); ip4 != nil {
-		return ip4[0] == 169 && ip4[1] == 254 && ip4[2] == 169 && ip4[3] == 254
+		return ip4[0] == 169 && ip4[1] == 254 &&
+			((ip4[2] == 169 && ip4[3] == 254) || (ip4[2] == 170 && ip4[3] == 2))
 	}
 	// fd00:ec2::254 in 16-byte form.
 	ec2v6 := net.ParseIP("fd00:ec2::254")
@@ -240,6 +272,12 @@ func ValidateIP(ip net.IP, policy Policy) error {
 	return checkIP(ip, policy)
 }
 
+// redirectHopKey marks a dial that belongs to a followed redirect. A redirect
+// target is chosen by the remote service's response, so it never gets the
+// link-local allowance that only the admin-typed base URL has. RedirectGuard
+// sets it on the follow-up request.
+type redirectHopKey struct{}
+
 // resolveIPAddr is the resolver NewDialContext uses. It is a package var only
 // so a test can present a controlled pair of addresses: there is no way to make
 // a real DNS name resolve to a chosen A/AAAA pair from a unit test. Never
@@ -257,6 +295,13 @@ var resolveIPAddr = net.DefaultResolver.LookupIPAddr
 func NewDialContext(policy Policy) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	dialer := &net.Dialer{}
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		// A dial for a redirect hop drops the link-local allowance, so a
+		// hostname that only resolves to link-local at connect time is refused
+		// too. Loopback and LAN behave as before.
+		policy := policy
+		if policy == PolicyService && ctx.Value(redirectHopKey{}) != nil {
+			policy = PolicyLANLoopback
+		}
 		// addr is "host:port" as provided by the HTTP transport.
 		host, port, err := net.SplitHostPort(addr)
 		if err != nil {

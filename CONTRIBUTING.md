@@ -204,11 +204,22 @@ rather than declared up front. Implement only what your source supports:
 |-----------|-----------|
 | `metadata.SeriesCatalogProvider` | Series search and ordered series catalogues |
 | `metadata.CoverProvider` | Cover art lookup |
+| `metadata.CacheScopedProvider` | Bind live credentials/options to a provider cache request |
 
 Register the provider in `cmd/bindery/main.go`, at the
 `metadata.NewAggregator(primaryProvider, enrichers...)` call. A source is either
 the *primary* (the one that defines canonical identity) or an *enricher* (one
 that fills gaps). Most new sources are enrichers.
+
+Search and edition cache identity includes the provider instance. Providers with
+live credentials or context-dependent query options must implement
+`CacheScopedProvider`: return a provider bound to the resolved configuration and
+an opaque scope that changes with that configuration. Keep credentials out of
+scope strings. The bound provider must use the same snapshot for all pages and
+retries and retain optional capabilities such as author catalogues and cover
+lookup. Immutable providers need no extra implementation. See
+[metadata request caching](docs/DEPLOYMENT.md#metadata-request-caching) for TTLs,
+bounds, and cancellation behavior.
 
 Return `metadata.ErrProviderNotConfigured` when credentials are missing, rather
 than an error. The aggregator treats it as "skip me" instead of a failure, which
@@ -269,6 +280,14 @@ fragment per PR; format and examples are in
 4. Add or adjust tests. Backend: follow the `internal/api/*_test.go` pattern (in-memory SQLite via `db.OpenMemory`, `httptest` handlers). Frontend: `vitest` + `@testing-library/react` with `jsdom`.
 5. Run the full local check suite above — every item must pass.
 6. Open a PR. Tie it to the tracking issue with `Closes #NN` in the body when applicable.
+
+## Claiming an issue
+
+Comment on the issue to say you are working on it. A maintainer will assign it to you; people without triage rights cannot self-assign, so the comment is the request. Search open issues and open PRs for the same thing first, so two people do not build it twice.
+
+A claim with no PR, comment or commit for 14 days gets one nudge. If there is still nothing after another 14 days, a maintainer unassigns it and says so on the issue, and the work is open to anyone again. That is not a penalty, plans change and it keeps issues from sitting reserved.
+
+Your PR branch is yours; maintainers only merge main into it. If a PR stays idle past a deadline stated on it, a maintainer may take it over and will say so on the PR. For anything large or design heavy, open or comment on the issue before writing code, as the README asks.
 
 ## Commit messages
 

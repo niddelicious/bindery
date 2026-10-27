@@ -188,8 +188,36 @@ describe('validateTemplate', () => {
   })
 })
 
+describe('validateTemplate {ext} checks (#3217)', () => {
+  it('flags {ext} in an audiobook template only', () => {
+    expect(validateTemplate('{Title}.{ext}', 'audiobook').extInAudiobook).toBe(true)
+    expect(validateTemplate('{Title}{ .ext}', 'audiobook').extInAudiobook).toBe(true)
+    expect(validateTemplate('{Author}/{Title}', 'audiobook').extInAudiobook).toBe(false)
+    expect(validateTemplate('{Title}.{ext}', 'book').extInAudiobook).toBe(false)
+  })
+
+  it('flags an ebook {ext} with no dot before it', () => {
+    expect(validateTemplate('{Author}/{Title}{ext}').extNeedsDot).toBe(true)
+    expect(validateTemplate('{Title} {ext}').extNeedsDot).toBe(true)
+    expect(validateTemplate('{Title}.{ext}').extNeedsDot).toBe(false)
+    expect(validateTemplate('{Title}{ext}', 'audiobook').extNeedsDot).toBe(false)
+  })
+})
+
 describe('NamingTemplateField component', () => {
   beforeEach(() => vi.clearAllMocks())
+
+  it('blocks saving an audiobook template with {ext} and explains why', () => {
+    render(<Harness kind="audiobook" initial="{Author} - {Title}.{ext}" />)
+    expect(screen.getByRole('alert').textContent).toContain('errorExtInAudiobook')
+    expect((screen.getByTestId('naming-save-audiobook') as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it('warns about a missing dot before {ext} without blocking save', () => {
+    render(<Harness initial="{Author}/{Title}{ext}" />)
+    expect(screen.getByRole('alert').textContent).toContain('warnExtNeedsDot')
+    expect((screen.getByTestId('naming-save-book') as HTMLButtonElement).disabled).toBe(false)
+  })
 
   it('shows a live preview that updates as you type', () => {
     render(<Harness initial="{Author}/{Title}.{ext}" />)
@@ -230,8 +258,33 @@ describe('NamingTemplateField component', () => {
   it('greys out {ext} for the audiobook template and ignores clicks on it', () => {
     render(<Harness kind="audiobook" initial="{Title}" />)
     const extChip = screen.getByRole('button', { name: '{ext}' }) as HTMLButtonElement
-    expect(extChip.disabled).toBe(true)
+    expect(extChip).toHaveAttribute('aria-disabled', 'true')
     fireEvent.click(extChip)
     expect((screen.getByPlaceholderText('placeholder') as HTMLInputElement).value).toBe('{Title}')
+  })
+
+  // A token's meaning lived only in its title tooltip, which a touch screen
+  // never shows. Tapping a token now also writes its meaning under the picker,
+  // shown on coarse pointers only so a desktop looks the same as before.
+  it('shows the meaning of a tapped token inline on touch screens', () => {
+    render(<Harness kind="book" initial="" />)
+    expect(screen.queryByTestId('naming-token-meaning-book')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '{Title}' }))
+    const meaning = screen.getByTestId('naming-token-meaning-book')
+    expect(meaning).toHaveTextContent('settings.general.naming.tokenTitle')
+    expect(meaning).toHaveClass('hidden', 'pointer-coarse:block')
+  })
+
+  it('tells a touch user why a greyed token does nothing', () => {
+    render(<Harness kind="audiobook" initial="{Title}" />)
+    fireEvent.click(screen.getByRole('button', { name: '{ext}' }))
+    expect(screen.getByTestId('naming-token-meaning-audiobook')).toHaveTextContent('settings.general.naming.tokenIgnoredAudiobook')
+  })
+
+  it('lets the template input shrink and the Save button wrap under it on a narrow screen', () => {
+    render(<Harness kind="book" initial="{Title}" />)
+    const input = screen.getByPlaceholderText('placeholder')
+    expect(input).toHaveClass('min-w-0', 'basis-48', 'grow')
+    expect(input.parentElement).toHaveClass('flex-wrap')
   })
 })

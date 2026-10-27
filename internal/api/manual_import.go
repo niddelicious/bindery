@@ -2,7 +2,7 @@ package api
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -25,9 +25,16 @@ type manualImportScanner interface {
 	Lookup(ctx context.Context, path string) (importer.LookupResult, error)
 	LookupBatchLayout(ctx context.Context, root string, paths []string) ([]importer.LookupResult, error)
 	ImportFromPath(ctx context.Context, dl *models.Download, path, formatHint string)
+	// ImportFilesFromPath imports several files as one unit: an audiobook's
+	// loose tracks submitted as separate batch rows (#2935).
+	ImportFilesFromPath(ctx context.Context, dl *models.Download, dir string, files []string, formatHint string)
 	// PreviewImportDestination reports where importing a path against a book
 	// would place the file, without touching disk (#2055).
 	PreviewImportDestination(ctx context.Context, bookID int64, srcPath, formatHint string) (importer.DestinationPreview, error)
+	// RelinkFile moves a tracked file's book_files row to another book
+	// without touching the file on disk: Fix match's correct-match-only
+	// mode (#2055).
+	RelinkFile(ctx context.Context, bookID int64, paths []string, formatHint string) (importer.RelinkResult, error)
 }
 
 // ManualImportHandler serves the manual-import lookup and trigger endpoints.
@@ -43,6 +50,31 @@ type ManualImportHandler struct {
 	// trackedCache holds Scan's already-tracked index, rebuilt only when
 	// book_files changes (see trackedFileIndex, #2480).
 	trackedCache trackedFileCache
+	// excluded are folders Scan does not enter below the folder being
+	// imported: the download folders, as in the library scan. Cleaned and
+	// symlink-resolved at setup (see WithExcludedDirs).
+	excluded []string
+}
+
+// WithExcludedDirs sets folders folder import leaves out when they sit inside
+// the folder being imported, as the library scan does: the download folders.
+// Each is stored cleaned and, when it resolves, as its real path too, so the
+// walk, which runs on a symlink-resolved folder, compares plain strings. The
+// folder being imported is never left out, so importing a download folder
+// itself still works.
+func (h *ManualImportHandler) WithExcludedDirs(dirs ...string) *ManualImportHandler {
+	h.excluded = nil
+	for _, dir := range dirs {
+		if strings.TrimSpace(dir) == "" {
+			continue
+		}
+		dir = filepath.Clean(dir)
+		h.excluded = append(h.excluded, dir)
+		if resolved, err := filepath.EvalSymlinks(dir); err == nil && resolved != dir {
+			h.excluded = append(h.excluded, resolved)
+		}
+	}
+	return h
 }
 
 func NewManualImportHandler(scanner manualImportScanner, downloads *db.DownloadRepo, books *db.BookRepo) *ManualImportHandler {
@@ -95,6 +127,36 @@ func (h *ManualImportHandler) outsideRootsMessage(ctx context.Context) string {
 	return base + ": " + strings.Join(roots, ", ")
 }
 
+// unreadableMessage is the answer for a path that is written inside a library
+// root but cannot be resolved. Claiming it is "outside the library" while
+// listing the root that contains it sent a reporter chasing a configuration
+// fault that was really a missing file (#3332). Only the file's own name is
+// echoed, which the caller already supplied; the directory stays out of it.
+func unreadableMessage(path string) string {
+	return "Bindery cannot read this file: " + filepath.Base(path) +
+		". It may have been moved, renamed or the drive may be unmounted. " +
+		"Check the file exists at this path inside the container."
+}
+
+// containFailure maps a refused containment check to the status and message
+// the manual-import routes return. A real escape stays 403 with the roots
+// listed; an in-root path that cannot be read is 404 with a plain explanation.
+func (h *ManualImportHandler) containFailure(ctx context.Context, path string, res ContainResult) (int, string) {
+	if res == ContainUnreadable {
+		return http.StatusNotFound, unreadableMessage(path)
+	}
+	return http.StatusForbidden, h.outsideRootsMessage(ctx)
+}
+
+// pathNotAccessible logs why path could not be stat'ed and returns the fixed
+// client-facing text. The os error names the full path and the errno, so it
+// stays in the log. The path has already resolved inside a library root by the
+// time this runs, so reaching it takes a race or a permission change.
+func pathNotAccessible(path string, err error) string {
+	slog.Warn("manual import: path not accessible", "path", path, "error", err)
+	return "path not accessible"
+}
+
 // Lookup handles GET /api/v1/queue/manual-import/lookup?path=...
 // It parses the filename, searches the local catalogue, and returns a match
 // result along with the auto-detected format. No state is modified.
@@ -108,9 +170,10 @@ func (h *ManualImportHandler) Lookup(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "path must be absolute"})
 		return
 	}
-	resolved, ok := h.roots.ResolveContained(r.Context(), path)
-	if !ok {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": h.outsideRootsMessage(r.Context())})
+	resolved, res := h.roots.CheckContained(r.Context(), path)
+	if res != ContainOK {
+		status, msg := h.containFailure(r.Context(), path, res)
+		writeJSON(w, status, map[string]string{"error": msg})
 		return
 	}
 	// Operate on the symlink-resolved path so the containment check and the
@@ -118,7 +181,7 @@ func (h *ManualImportHandler) Lookup(w http.ResponseWriter, r *http.Request) {
 	// points outside it is rejected by ResolveContained above).
 	path = resolved
 	if _, err := os.Stat(path); err != nil { //nolint:gosec // #nosec G304 -- path is symlink-resolved and confirmed inside a configured library root; RequireAdmin middleware enforced at route level
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("path not accessible: %v", err)})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": pathNotAccessible(path, err)})
 		return
 	}
 	result, err := h.scanner.Lookup(r.Context(), path)
@@ -126,6 +189,10 @@ func (h *ManualImportHandler) Lookup(w http.ResponseWriter, r *http.Request) {
 		writeServerError(w, r, err)
 		return
 	}
+	// The catalogue book is a library row, so its stored cover goes through
+	// the proxy like every other book answer (#3146).
+	result.Book = proxiedBook(result.Book)
+	result.Candidates = proxiedBooks(result.Candidates)
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -143,40 +210,67 @@ type manualImportRequest struct {
 // symlink-resolved path. On failure it returns an HTTP status and a message.
 // It is the shared core of Import (one item) and ImportBatch (many).
 func (h *ManualImportHandler) prepareImport(ctx context.Context, rawPath string, bookID int64, format string) (*models.Download, string, int, string) {
+	path, book, status, msg := h.validateImport(ctx, rawPath, bookID, format)
+	if book == nil {
+		return nil, "", status, msg
+	}
+	dl, status, msg := h.createManualDownload(ctx, book)
+	if dl == nil {
+		return nil, "", status, msg
+	}
+	return dl, path, 0, ""
+}
+
+// validateImport is prepareImport's validation half: it resolves rawPath
+// inside a library root and loads the book, creating nothing. On failure the
+// book is nil and status and message describe why.
+func (h *ManualImportHandler) validateImport(ctx context.Context, rawPath string, bookID int64, format string) (string, *models.Book, int, string) {
 	path := filepath.Clean(rawPath)
 	if path == "" || path == "." {
-		return nil, "", http.StatusBadRequest, "path is required"
+		return "", nil, http.StatusBadRequest, "path is required"
 	}
 	if !filepath.IsAbs(path) {
-		return nil, "", http.StatusBadRequest, "path must be absolute"
+		return "", nil, http.StatusBadRequest, "path must be absolute"
 	}
 	// Resolve symlinks and confirm containment so a symlink inside a root that
 	// points outside it can't redirect the read/move to an arbitrary file.
-	resolved, ok := h.roots.ResolveContained(ctx, path)
-	if !ok {
-		return nil, "", http.StatusForbidden, h.outsideRootsMessage(ctx)
+	resolved, res := h.roots.CheckContained(ctx, path)
+	if res != ContainOK {
+		status, msg := h.containFailure(ctx, path, res)
+		return "", nil, status, msg
 	}
 	path = resolved
 	if bookID <= 0 {
-		return nil, "", http.StatusBadRequest, "bookId is required"
+		return "", nil, http.StatusBadRequest, "bookId is required"
 	}
 	if format != "" && format != models.MediaTypeEbook && format != models.MediaTypeAudiobook {
-		return nil, "", http.StatusBadRequest, "format must be \"ebook\" or \"audiobook\""
+		return "", nil, http.StatusBadRequest, "format must be \"ebook\" or \"audiobook\""
 	}
 	info, err := os.Stat(path) //nolint:gosec // #nosec G304 -- path is symlink-resolved and confirmed inside a configured library root; RequireAdmin middleware enforced at route level
 	if err != nil {
-		return nil, "", http.StatusBadRequest, fmt.Sprintf("path not accessible: %v", err)
+		return "", nil, http.StatusBadRequest, pathNotAccessible(path, err)
 	}
 	if !info.IsDir() && !importer.IsBookFile(path) {
-		return nil, "", http.StatusBadRequest, "path is not a recognised book file"
+		return "", nil, http.StatusBadRequest, "path is not a recognised book file"
 	}
 	book, err := h.books.GetByID(ctx, bookID)
-	if err != nil || book == nil {
-		return nil, "", http.StatusBadRequest, "book not found"
+	if err != nil {
+		slog.Error("manual import: book lookup failed", "book", bookID, "error", err)
+		return "", nil, http.StatusInternalServerError, "internal server error"
 	}
+	if book == nil {
+		return "", nil, http.StatusBadRequest, "book not found"
+	}
+	return path, book, 0, ""
+}
+
+// createManualDownload creates the synthetic Download record a manual import
+// of book runs under. On failure it returns nil with a status and message.
+func (h *ManualImportHandler) createManualDownload(ctx context.Context, book *models.Book) (*models.Download, int, string) {
+	bookID := book.ID
 	now := time.Now().UTC()
 	dl := &models.Download{
-		GUID:   "manual-" + uuid.New().String(),
+		GUID:   importer.ManualDownloadGUIDPrefix + uuid.New().String(),
 		BookID: &bookID,
 		Title:  book.Title,
 		Status: models.StateCompleted,
@@ -188,9 +282,9 @@ func (h *ManualImportHandler) prepareImport(ctx context.Context, rawPath string,
 	}
 	dl.CompletedAt = &now
 	if err := h.downloads.Create(ctx, dl); err != nil {
-		return nil, "", http.StatusInternalServerError, "failed to create import record"
+		return nil, http.StatusInternalServerError, "failed to create import record"
 	}
-	return dl, path, 0, ""
+	return dl, 0, ""
 }
 
 // Import handles POST /api/v1/queue/manual-import
@@ -198,8 +292,7 @@ func (h *ManualImportHandler) prepareImport(ctx context.Context, rawPath string,
 // kicks off the import asynchronously. Returns 202 with the new record.
 func (h *ManualImportHandler) Import(w http.ResponseWriter, r *http.Request) {
 	var req manualImportRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	dl, path, status, msg := h.prepareImport(r.Context(), req.Path, req.BookID, req.Format)
@@ -220,6 +313,24 @@ type reassignRequest struct {
 	TargetBookID int64 `json:"targetBookId"`
 	// Format is optional; auto-detected when empty. "ebook" or "audiobook".
 	Format string `json:"format"`
+	// Relocate chooses what Fix match does on disk (#2055). false corrects
+	// which book the file belongs to and leaves the file exactly where it is.
+	// true runs the full import against the target, which moves the file into
+	// its folder and renames it from the naming template. Absent means true,
+	// the behaviour this endpoint always had, so existing API callers are
+	// unchanged; the web UI always sends it and defaults to false.
+	Relocate *bool `json:"relocate,omitempty"`
+}
+
+// reassignLinkResponse is Reassign's answer in correct-match-only mode. The
+// work is done by the time it is sent, so it is 200 rather than 202.
+type reassignLinkResponse struct {
+	Relocated    bool   `json:"relocated"`
+	TargetBookID int64  `json:"targetBookId"`
+	FromBookID   int64  `json:"fromBookId,omitempty"`
+	Path         string `json:"path"`
+	Format       string `json:"format"`
+	Unchanged    bool   `json:"unchanged,omitempty"`
 }
 
 // Reassign handles POST /api/v1/queue/manual-import/reassign.
@@ -231,12 +342,15 @@ type reassignRequest struct {
 // the async import.
 func (h *ManualImportHandler) Reassign(w http.ResponseWriter, r *http.Request) {
 	var req reassignRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if strings.TrimSpace(req.Path) == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "path is required"})
+		return
+	}
+	if req.Relocate != nil && !*req.Relocate {
+		h.relink(w, r, req)
 		return
 	}
 	// Validate path containment, confirm the target book exists, and create the
@@ -255,9 +369,17 @@ func (h *ManualImportHandler) Reassign(w http.ResponseWriter, r *http.Request) {
 	// away, so a later delete of the "empty-looking" source removes the target's
 	// file. Detach against the caller's raw path (what the frontend read from the
 	// DB) first, then fall back to the resolved form.
-	if !h.detachSourceFile(r.Context(), req.Path, path) {
+	source := h.detachSourceFile(r.Context(), req.Path, path)
+	if source == nil {
 		slog.Warn("reassign: source file not tracked under raw or resolved path; source book may retain a stale reference",
 			"rawPath", req.Path, "resolvedPath", path)
+	}
+	// Moving the file is what Fix match asks for, so tell the import: it
+	// records the move in history, and if the source path is somehow still
+	// held by another book it moves that row instead of refusing (#2937).
+	fm := importer.FixMatch{SourcePaths: []string{filepath.Clean(req.Path), path}}
+	if source != nil {
+		fm.FromBookID, fm.FromTitle = source.ID, source.Title
 	}
 	ctx := context.WithoutCancel(r.Context())
 	targetID := req.TargetBookID
@@ -266,13 +388,39 @@ func (h *ManualImportHandler) Reassign(w http.ResponseWriter, r *http.Request) {
 	// a pre-existing unrelated file as proof of a successful move (#1368).
 	preexisting := h.targetFilePaths(ctx, targetID)
 	if !h.goBackground("manual-import-reassign", ctx, func(ctx context.Context) {
-		h.scanner.ImportFromPath(ctx, dl, path, req.Format)
+		// Marked here rather than on the outer ctx: with a jobs group wired
+		// the job runs on the group's context, not the one passed above.
+		h.scanner.ImportFromPath(importer.WithFixMatch(ctx, fm), dl, path, req.Format)
 		h.removeStaleSource(ctx, path, targetID, preexisting)
 	}) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "server is shutting down"})
 		return
 	}
 	writeJSON(w, http.StatusAccepted, dl)
+}
+
+// relink is Reassign with relocate=false (#2055): the same validation as the
+// import path, then the book_files row moves to the target book and nothing on
+// disk changes. Synchronous, because there is no file operation to wait on.
+func (h *ManualImportHandler) relink(w http.ResponseWriter, r *http.Request, req reassignRequest) {
+	path, book, status, msg := h.validateImport(r.Context(), req.Path, req.TargetBookID, req.Format)
+	if book == nil {
+		writeJSON(w, status, map[string]string{"error": msg})
+		return
+	}
+	res, err := h.scanner.RelinkFile(r.Context(), book.ID, []string{filepath.Clean(req.Path), path}, req.Format)
+	if err != nil {
+		writeServerError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, reassignLinkResponse{
+		Relocated:    false,
+		TargetBookID: book.ID,
+		FromBookID:   res.FromBookID,
+		Path:         res.Path,
+		Format:       res.Format,
+		Unchanged:    res.Unchanged,
+	})
 }
 
 // reassignPreviewResponse is the read-only answer to "where would this file end
@@ -320,19 +468,24 @@ func (h *ManualImportHandler) ReassignPreview(w http.ResponseWriter, r *http.Req
 	}
 	// Same containment rules as Lookup: resolve symlinks and confirm the path
 	// sits under a configured library root before reporting anything about it.
-	resolved, ok := h.roots.ResolveContained(r.Context(), path)
-	if !ok {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": h.outsideRootsMessage(r.Context())})
+	resolved, res := h.roots.CheckContained(r.Context(), path)
+	if res != ContainOK {
+		status, msg := h.containFailure(r.Context(), path, res)
+		writeJSON(w, status, map[string]string{"error": msg})
 		return
 	}
 	path = resolved
 	if _, statErr := os.Stat(path); statErr != nil { //nolint:gosec // #nosec G304 -- path is symlink-resolved and confirmed inside a configured library root; RequireAdmin middleware enforced at route level
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("path not accessible: %v", statErr)})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": pathNotAccessible(path, statErr)})
 		return
 	}
 	preview, err := h.scanner.PreviewImportDestination(r.Context(), bookID, path, format)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+	switch {
+	case errors.Is(err, importer.ErrPreviewBookNotFound):
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "book not found"})
+		return
+	case err != nil:
+		writeServerError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, reassignPreviewResponse{
@@ -345,29 +498,30 @@ func (h *ManualImportHandler) ReassignPreview(w http.ResponseWriter, r *http.Req
 }
 
 // detachSourceFile removes the book_files association for the file being
-// reassigned and reports whether a row was actually removed. book_files stores
-// the path exactly as recorded at import time, which for a symlinked library
-// differs from the EvalSymlinks-resolved path prepareImport produces (#1368).
+// reassigned and returns the book it was removed from (nil when no row was
+// removed). book_files stores the path exactly as recorded at import time,
+// which for a symlinked library differs from the EvalSymlinks-resolved path
+// prepareImport produces (#1368).
 // Try the caller's raw (un-resolved) path — the string the frontend read back
 // from the DB — then the resolved path, so the source is reliably emptied
 // regardless of which form the row holds.
-func (h *ManualImportHandler) detachSourceFile(ctx context.Context, rawPath, resolvedPath string) bool {
+func (h *ManualImportHandler) detachSourceFile(ctx context.Context, rawPath, resolvedPath string) *models.Book {
 	raw := filepath.Clean(rawPath)
 	removed, err := h.books.RemoveBookFile(ctx, raw)
 	if err != nil {
 		slog.Warn("reassign: detach source book file", "path", raw, "error", err)
 	}
 	if removed != nil {
-		return true
+		return removed
 	}
 	if resolvedPath == raw {
-		return false
+		return nil
 	}
 	removed, err = h.books.RemoveBookFile(ctx, resolvedPath)
 	if err != nil {
 		slog.Warn("reassign: detach source book file", "path", resolvedPath, "error", err)
 	}
-	return removed != nil
+	return removed
 }
 
 // targetFilePaths returns the set of on-disk paths currently tracked for the
@@ -420,11 +574,11 @@ func (h *ManualImportHandler) removeStaleSource(ctx context.Context, src string,
 	}
 	// Never delete src while a book still tracks it in book_files — another
 	// record may legitimately own this exact path. Fail safe on error (#1368).
-	if owned, err := h.books.PathOwnedByOtherBook(ctx, src, 0); err != nil {
+	if owned, err := pathGuardedByOtherBook(ctx, h.books, 0, src); err != nil {
 		slog.Warn("reassign cleanup: could not verify source ownership; leaving file in place", "path", src, "error", err)
 		return
 	} else if owned {
-		slog.Warn("reassign cleanup: source path still tracked by a book; leaving file in place", "path", src)
+		slog.Warn("reassign cleanup: source path still tracked by a book, or inside a folder one tracks; leaving file in place", "path", src)
 		return
 	}
 	if err := os.Remove(src); err != nil {
@@ -558,13 +712,14 @@ func (h *ManualImportHandler) resolveImportFolder(ctx context.Context, rawPath s
 	if !filepath.IsAbs(path) {
 		return "", http.StatusBadRequest, "path must be absolute"
 	}
-	resolved, ok := h.roots.ResolveContained(ctx, path)
-	if !ok {
-		return "", http.StatusForbidden, h.outsideRootsMessage(ctx)
+	resolved, res := h.roots.CheckContained(ctx, path)
+	if res != ContainOK {
+		status, msg := h.containFailure(ctx, path, res)
+		return "", status, msg
 	}
 	info, err := os.Stat(resolved) //nolint:gosec // #nosec G304 -- resolved by ResolveContained after symlink-aware root containment; route requires admin
 	if err != nil {
-		return "", http.StatusBadRequest, fmt.Sprintf("path not accessible: %v", err)
+		return "", http.StatusBadRequest, pathNotAccessible(resolved, err)
 	}
 	if !info.IsDir() {
 		return "", http.StatusBadRequest, "path must be a folder; use lookup for a single book"
@@ -653,7 +808,7 @@ func (h *ManualImportHandler) Scan(w http.ResponseWriter, r *http.Request) {
 			seen++
 			return seen <= skipToOffset
 		}
-		cands, roundTruncated := enumerateImportUnits(path, remaining, roundSkip)
+		cands, roundTruncated := enumerateImportUnits(path, remaining, roundSkip, h.excluded)
 		truncated = roundTruncated
 		alreadyConsumed += len(cands)
 		if len(cands) == 0 {
@@ -714,8 +869,8 @@ func (h *ManualImportHandler) Scan(w http.ResponseWriter, r *http.Request) {
 				ParsedTitle:     res.ParsedTitle,
 				ParsedAuthor:    res.ParsedAuthor,
 				DetectedFormat:  res.DetectedFormat,
-				Book:            res.Book,
-				Candidates:      res.Candidates,
+				Book:            proxiedBook(res.Book),
+				Candidates:      proxiedBooks(res.Candidates),
 				AlreadyImported: alreadyImported,
 			})
 		}
@@ -774,8 +929,7 @@ const (
 // with bounded concurrency. Returns 202 with the per-item validation results.
 func (h *ManualImportHandler) ImportBatch(w http.ResponseWriter, r *http.Request) {
 	var items []BatchImportItem
-	if err := json.NewDecoder(r.Body).Decode(&items); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	if !decodeJSON(w, r, &items) {
 		return
 	}
 	if len(items) == 0 {
@@ -790,21 +944,84 @@ func (h *ManualImportHandler) ImportBatch(w http.ResponseWriter, r *http.Request
 	type job struct {
 		dl     *models.Download
 		path   string
+		files  []string // set for a group of tracks; path is then their folder
 		format string
 	}
+	type validItem struct {
+		idx  int
+		path string
+		book *models.Book
+	}
+	results := make([]BatchImportResult, len(items))
 	var jobs []job
-	resp := BatchImportResponse{Results: make([]BatchImportResult, 0, len(items))}
-	for _, it := range items {
-		dl, path, _, msg := h.prepareImport(r.Context(), it.Path, it.BookID, it.Format)
-		if dl == nil {
-			resp.Results = append(resp.Results, BatchImportResult{Path: it.Path, Accepted: false, Error: msg})
+	var singles []validItem
+	// Audiobook tracks submitted as separate rows for the same book (#2935).
+	// Each used to run as its own single file audiobook, so the tracks raced
+	// each other into "Title" and "Title (2)" folders, overwrote one another
+	// under the file template, and every one after the first was marked
+	// imported without being moved. They are one audiobook, so they import as
+	// one: a single job over all of them, the shape a grabbed multi file
+	// download takes.
+	tracksByBook := make(map[int64][]validItem)
+	var trackBooks []int64
+	resp := BatchImportResponse{}
+	for i, it := range items {
+		path, book, _, msg := h.validateImport(r.Context(), it.Path, it.BookID, it.Format)
+		if book == nil {
+			results[i] = BatchImportResult{Path: it.Path, Accepted: false, Error: msg}
 			resp.Failed++
 			continue
 		}
-		jobs = append(jobs, job{dl: dl, path: path, format: it.Format})
-		resp.Results = append(resp.Results, BatchImportResult{Path: it.Path, Accepted: true, DownloadID: dl.ID})
-		resp.Accepted++
+		v := validItem{idx: i, path: path, book: book}
+		if isAudiobookTrack(path, it.Format) {
+			if _, seen := tracksByBook[book.ID]; !seen {
+				trackBooks = append(trackBooks, book.ID)
+			}
+			tracksByBook[book.ID] = append(tracksByBook[book.ID], v)
+			continue
+		}
+		singles = append(singles, v)
 	}
+	accept := func(members []validItem, dl *models.Download) {
+		for _, m := range members {
+			results[m.idx] = BatchImportResult{Path: items[m.idx].Path, Accepted: true, DownloadID: dl.ID}
+			resp.Accepted++
+		}
+	}
+	reject := func(members []validItem, msg string) {
+		for _, m := range members {
+			results[m.idx] = BatchImportResult{Path: items[m.idx].Path, Accepted: false, Error: msg}
+			resp.Failed++
+		}
+	}
+	for _, bookID := range trackBooks {
+		members := tracksByBook[bookID]
+		if len(members) == 1 {
+			singles = append(singles, members[0])
+			continue
+		}
+		dl, _, msg := h.createManualDownload(r.Context(), members[0].book)
+		if dl == nil {
+			reject(members, msg)
+			continue
+		}
+		files := make([]string, len(members))
+		for i, m := range members {
+			files[i] = m.path
+		}
+		jobs = append(jobs, job{dl: dl, path: deepestCommonDir(files), files: files, format: models.MediaTypeAudiobook})
+		accept(members, dl)
+	}
+	for _, v := range singles {
+		dl, _, msg := h.createManualDownload(r.Context(), v.book)
+		if dl == nil {
+			reject([]validItem{v}, msg)
+			continue
+		}
+		jobs = append(jobs, job{dl: dl, path: v.path, format: items[v.idx].Format})
+		accept([]validItem{v}, dl)
+	}
+	resp.Results = results
 
 	if len(jobs) > 0 {
 		started := h.goBackground("manual-batch-import", context.WithoutCancel(r.Context()), func(ctx context.Context) {
@@ -816,6 +1033,10 @@ func (h *ManualImportHandler) ImportBatch(w http.ResponseWriter, r *http.Request
 				go func(j job) {
 					defer wg.Done()
 					defer func() { <-sem }()
+					if len(j.files) > 0 {
+						h.scanner.ImportFilesFromPath(ctx, j.dl, j.path, j.files, j.format)
+						return
+					}
 					h.scanner.ImportFromPath(ctx, j.dl, j.path, j.format)
 				}(j)
 			}
@@ -828,6 +1049,37 @@ func (h *ManualImportHandler) ImportBatch(w http.ResponseWriter, r *http.Request
 	}
 
 	writeJSON(w, http.StatusAccepted, resp)
+}
+
+// isAudiobookTrack reports whether a validated batch path is one audio file
+// of an audiobook, as opposed to a folder or an ebook: the rows ImportBatch
+// gathers into one import per book (#2935).
+func isAudiobookTrack(path, format string) bool {
+	if format == models.MediaTypeEbook {
+		return false
+	}
+	if format != models.MediaTypeAudiobook && !importer.IsAudioFile(path) {
+		return false
+	}
+	info, err := os.Stat(path) //nolint:gosec // #nosec G304 -- path came back from validateImport, symlink-resolved inside a library root
+	return err == nil && !info.IsDir()
+}
+
+// deepestCommonDir returns the deepest folder that contains every one of
+// files, which are absolute, cleaned paths.
+func deepestCommonDir(files []string) string {
+	common := filepath.Dir(files[0])
+	for _, f := range files[1:] {
+		dir := filepath.Dir(f)
+		for common != dir && !strings.HasPrefix(dir, common+string(filepath.Separator)) {
+			parent := filepath.Dir(common)
+			if parent == common {
+				break
+			}
+			common = parent
+		}
+	}
+	return common
 }
 
 // downloadOwnerForRequest resolves the owner to stamp on a download created
@@ -861,8 +1113,7 @@ type matchDownloadRequest struct {
 // re-imports against the now-assigned book on its next poll.
 func (h *ManualImportHandler) MatchDownload(w http.ResponseWriter, r *http.Request) {
 	var req matchDownloadRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.DownloadID <= 0 || req.BookID <= 0 {
@@ -888,7 +1139,11 @@ func (h *ManualImportHandler) MatchDownload(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	book, err := h.books.GetByID(ctx, req.BookID)
-	if err != nil || book == nil {
+	if err != nil {
+		writeServerError(w, r, err)
+		return
+	}
+	if book == nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "book not found"})
 		return
 	}

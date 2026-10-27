@@ -54,6 +54,7 @@ func (h *PendingHandler) List(w http.ResponseWriter, r *http.Request) {
 		// (it is an admin-only setting); this list has to do the same. The DB
 		// copy keeps the key so force-grab can still re-send the signed URL.
 		it.ReleaseJSON = redactReleaseJSON(it.ReleaseJSON)
+		it.GUID = newznab.RedactDownloadURL(it.GUID)
 		out[i] = pendingItem{PendingRelease: it}
 		if it.BookID != 0 {
 			bookIDs = append(bookIDs, it.BookID)
@@ -72,11 +73,12 @@ func (h *PendingHandler) List(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-// redactReleaseJSON removes the indexer apikey from the nzbUrl inside a stored
-// pending-release blob. The blob is decoded into a generic map rather than into
-// newznab.SearchResult so that a field the struct does not know about survives
-// the round-trip; anything that fails to decode is returned untouched, since a
-// blob we cannot parse is also one we cannot vouch for editing.
+// redactReleaseJSON strips every credential from the URL-shaped fields (nzbUrl,
+// guid, infoUrl) of a stored pending-release blob. The blob is decoded into a
+// generic map rather than into newznab.SearchResult so that a field the struct
+// does not know about survives the round-trip; anything that fails to decode
+// is returned untouched, since a blob we cannot parse is also one we cannot
+// vouch for editing.
 func redactReleaseJSON(raw string) string {
 	if raw == "" {
 		return raw
@@ -85,15 +87,28 @@ func redactReleaseJSON(raw string) string {
 	if err := json.Unmarshal([]byte(raw), &release); err != nil {
 		return raw
 	}
-	rawURL, ok := release["nzbUrl"].(string)
-	if !ok {
+	changed := false
+	nzbURL, _ := release["nzbUrl"].(string)
+	guid, _ := release["guid"].(string)
+	redactedNZB, redactedGUID := newznab.RedactDownloadURL(nzbURL), newznab.RedactDownloadURL(guid)
+	for _, key := range []string{"nzbUrl", "guid", "infoUrl"} {
+		v, ok := release[key].(string)
+		if !ok {
+			continue
+		}
+		redacted := newznab.RedactDownloadURL(v)
+		if key == "infoUrl" {
+			// A detail link keeps its path; see redactInfoURL.
+			redacted = redactInfoURL(v, redactedNZB, redactedGUID)
+		}
+		if redacted != v {
+			release[key] = redacted
+			changed = true
+		}
+	}
+	if !changed {
 		return raw
 	}
-	redacted := newznab.RedactDownloadURL(rawURL)
-	if redacted == rawURL {
-		return raw
-	}
-	release["nzbUrl"] = redacted
 	out, err := json.Marshal(release)
 	if err != nil {
 		return raw
@@ -147,7 +162,11 @@ func (h *PendingHandler) Grab(w http.ResponseWriter, r *http.Request) {
 	}
 
 	pr, err := h.pending.GetByID(r.Context(), id)
-	if err != nil || pr == nil {
+	if err != nil {
+		writeServerError(w, r, err)
+		return
+	}
+	if pr == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "pending release not found"})
 		return
 	}
@@ -177,9 +196,12 @@ func (h *PendingHandler) Grab(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The release's type is authoritative, especially for dual-format books.
+	// The pending row is scoped to the format leg that found it, which is
+	// the release's own media type. Only an older row without one falls back
+	// to the book's, and grab() still resolves a dual-format "both" from the
+	// release title (#2933).
 	mediaType := pr.MediaType
-	if mediaType == "" {
+	if mediaType != models.MediaTypeEbook && mediaType != models.MediaTypeAudiobook {
 		mediaType = models.MediaTypeEbook
 		if h.books != nil {
 			if book, err := h.books.GetByID(r.Context(), pr.BookID); err == nil && book != nil {
@@ -197,7 +219,13 @@ func (h *PendingHandler) Grab(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 			return
 		}
-		writeServerError(w, r, err)
+		if errors.Is(err, errGrabBookNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "pending release not found"})
+			return
+		}
+		// A missing client is a 400 the user can fix and a refused send is a
+		// 502, the same as the queue grab route; the rest is a storage fault.
+		writeGrabError(w, r, err)
 		return
 	}
 

@@ -75,16 +75,20 @@ export class ApiError extends Error {
   }
 }
 
+// The code the backend puts on a "no enabled download client" 400
+// (internal/api/queue.go, codeNoDownloadClient).
+const NO_DOWNLOAD_CLIENT_CODE = 'no_download_client'
+
 // True when an error is the backend's "no enabled download client configured"
-// failure from a grab attempt (#959 / internal/api/queue.go). Detected by the
-// same substring pair the backend uses to classify it as a 400, so a missing
-// download client surfaces a contextual setup nudge instead of a raw error —
-// independent of whether the library is empty (#968). Tolerant of the protocol
-// variants noProtocolClientError produces ("no enabled usenet download client
-// configured …", etc).
+// failure from a grab attempt (#959 / internal/api/queue.go), so a missing
+// download client surfaces a contextual setup nudge instead of a raw error,
+// independent of whether the library is empty (#968). Classified from the
+// response (a 400 carrying the no_download_client code), not from the message
+// text: the message names the protocol and the clients the user has, and the
+// backend no longer relays upstream text in grab errors, so it is free to
+// change wording.
 export function isNoDownloadClientError(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : ''
-  return msg.includes('no enabled') && msg.includes('download client configured')
+  return err instanceof ApiError && err.status === 400 && err.body.code === NO_DOWNLOAD_CLIENT_CODE
 }
 
 // True when an error is the backend's "no enabled download client is

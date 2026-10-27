@@ -17,6 +17,7 @@ import (
 	"github.com/vavallee/bindery/internal/calibre"
 	"github.com/vavallee/bindery/internal/db"
 	"github.com/vavallee/bindery/internal/httpsec"
+	"github.com/vavallee/bindery/internal/importer"
 	"github.com/vavallee/bindery/internal/metadata/hardcover"
 	"github.com/vavallee/bindery/internal/models"
 	"github.com/vavallee/bindery/internal/pathmap"
@@ -62,9 +63,16 @@ const (
 // empty or unset means fall back to cfg.LibraryDir (the env-var default).
 const SettingDefaultLibraryRootFolderID = "library.defaultRootFolderId"
 
+// SettingDefaultAudiobookRootFolderID is the audiobook counterpart of
+// SettingDefaultLibraryRootFolderID: the root_folder.id audiobooks land under
+// when an author has no per-author AudiobookRootFolderID. Empty or unset means
+// fall back to cfg.AudiobookDir (BINDERY_AUDIOBOOK_DIR, itself defaulting to
+// the library dir) (#2166).
+const SettingDefaultAudiobookRootFolderID = "library.defaultAudiobookRootFolderId"
+
 // SettingMetadataPrimaryProvider is the KV key that selects the primary
 // metadata provider used for author/book search and lookup. Valid values are
-// "openlibrary" (default), "dnb", and "hardcover". Empty or unset falls back to
+// "openlibrary" (default), "dnb", "nb", "bnf", and "hardcover". Empty or unset falls back to
 // "openlibrary" for backwards compatibility.
 //
 // "hardcover" requires a Hardcover API token (SettingHardcoverAPIToken) —
@@ -74,10 +82,72 @@ const SettingDefaultLibraryRootFolderID = "library.defaultRootFolderId"
 // removed.
 const SettingMetadataPrimaryProvider = "metadata.primary_provider"
 
+// SettingMetadataAuthorWikidata switches on the Wikidata author enricher
+// (#3287): an author whose primary provider has no photo or bio gets one from
+// Wikimedia Commons and Wikipedia, found by the authority ID Bindery already
+// stores. Off by default, so an install that has not chosen it sends
+// Wikimedia nothing.
+const SettingMetadataAuthorWikidata = "metadata.author_enrichment.wikidata"
+
+// SettingMetadataEnrichersDisabled lists the metadata enrichers an operator
+// has turned off (#1890): a comma separated list of names from
+// MetadataEnrichers, plus the audiobook sources "audible" and "audnex"
+// (#2015), which are not enrichers but are switched the same way. Empty, the default, leaves every enricher on. The
+// primary provider is never switched off by it: a name that matches the
+// current primary is ignored, so changing the primary cannot leave an install
+// with no metadata source.
+const SettingMetadataEnrichersDisabled = "metadata.enrichers_disabled"
+
+// MetadataEnrichers lists the providers that run as enrichers and so may be
+// named in SettingMetadataEnrichersDisabled, in the order the UI presents
+// them. Nasjonalbiblioteket and BnF are not here: they are only ever queried
+// as the primary.
+var MetadataEnrichers = []string{"openlibrary", "hardcover", "googlebooks", "dnb"}
+
+// ParseMetadataEnrichersDisabled splits a stored
+// SettingMetadataEnrichersDisabled value into trimmed, lowercased, deduplicated
+// names in the order given. Names are not checked here; see
+// IsMetadataSourceToggleName.
+func ParseMetadataEnrichersDisabled(value string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, part := range strings.Split(value, ",") {
+		name := strings.ToLower(strings.TrimSpace(part))
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	return out
+}
+
+// MetadataAudiobookSources lists the two audiobook sources that are not
+// enrichers but can be named in SettingMetadataEnrichersDisabled (#2015):
+// the Audible catalogue and the audnex lookup.
+var MetadataAudiobookSources = []string{"audible", "audnex"}
+
+// MetadataSourceToggles is every name SettingMetadataEnrichersDisabled
+// accepts: the enrichers, then the audiobook sources.
+func MetadataSourceToggles() []string {
+	return append(append([]string(nil), MetadataEnrichers...), MetadataAudiobookSources...)
+}
+
+// IsMetadataSourceToggleName reports whether name may appear in
+// SettingMetadataEnrichersDisabled.
+func IsMetadataSourceToggleName(name string) bool {
+	for _, p := range MetadataSourceToggles() {
+		if name == p {
+			return true
+		}
+	}
+	return false
+}
+
 // MetadataPrimaryProviders lists the accepted values of
 // SettingMetadataPrimaryProvider, in the order the UI presents them. The first
 // entry is the default used when the setting is empty or unset.
-var MetadataPrimaryProviders = []string{"openlibrary", "dnb", "hardcover"}
+var MetadataPrimaryProviders = []string{"openlibrary", "dnb", "nb", "bnf", "hardcover"}
 
 // IsMetadataPrimaryProviderValid reports whether value names a provider that
 // may be promoted to primary. The empty string is valid and means "default".
@@ -197,6 +267,97 @@ const SettingNamingAudiobookFileTemplate = "naming.audiobook_file_template"
 // (configuredImportMode) to avoid an import cycle; keep the literal in sync.
 const SettingImportMode = "import.mode"
 
+// Per format import routing (#1632). A Calibre-Web-Automated + Audiobookshelf
+// library needs ebooks handed to CWA's ingest folder (external) while
+// audiobooks land in the audiobook root where ABS scans them, and one global
+// import.mode cannot say that. The importer reads both keys as string
+// literals (configuredImportModeFor, dropFolderFor) to avoid an import cycle;
+// keep the literals in sync.
+const (
+	// SettingImportAudiobookMode overrides SettingImportMode for audiobooks.
+	// Empty/unset (the default) means "same as import.mode", so an install
+	// that never sets it behaves exactly as before. Otherwise it takes the
+	// same values as import.mode; an explicit "auto" means auto for
+	// audiobooks even when import.mode names a mode.
+	SettingImportAudiobookMode = "import.audiobook.mode"
+	// SettingImportAudiobookDropFolder is the drop folder audiobooks are
+	// handed off into when their effective mode is external. Empty/unset
+	// falls back to SettingImportDropFolder, which keeps one shared folder
+	// (what Storyteller pair gating, #942, wants).
+	SettingImportAudiobookDropFolder = "import.audiobook.drop_folder"
+)
+
+// Post-download content checks (#3015, #3246). After a download is tied to a
+// wanted book, the importer compares what the files say about themselves (an
+// EPUB's title and author, an audiobook's album and track tags) with that book.
+// Each media type has its own setting: "off" skips the check, "warn" (the
+// default, and what an unset or unrecognised value reads as) imports and records
+// what was found on the bookImported event and webhook as contentCheck, and
+// "block" refuses the download like the language and format checks do. The
+// importer reads both keys as string literals to avoid an import cycle; keep the
+// literals in sync.
+const (
+	SettingImportEbookContentCheck     = "import.ebook.content_check"
+	SettingImportAudiobookContentCheck = "import.audiobook.content_check"
+)
+
+// contentCheckValues are the values the content check settings accept, in the
+// order the UI offers them.
+var contentCheckValues = []string{"off", "warn", "block"}
+
+// validateContentCheckValue checks one content check mode. Empty is accepted and
+// reads as the default, warn.
+func validateContentCheckValue(key, value string) error {
+	if value == "" {
+		return nil
+	}
+	for _, v := range contentCheckValues {
+		if value == v {
+			return nil
+		}
+	}
+	return fmt.Errorf("%s %q is not one of: %s", key, value, strings.Join(contentCheckValues, ", "))
+}
+
+// importModeValues are the values import.mode and import.audiobook.mode both
+// accept, in the order the UI offers them.
+var importModeValues = []string{"auto", "move", "copy", "hardlink", "external"}
+
+// validateImportModeValue checks one import mode value for key. Empty is
+// accepted: for import.mode it means auto, for import.audiobook.mode it means
+// "same as import.mode". A typo must fail loudly here rather than silently
+// fall through at import time, where the operator would think Move or
+// External was in effect.
+func validateImportModeValue(key, value string) error {
+	if value == "" {
+		return nil
+	}
+	for _, v := range importModeValues {
+		if value == v {
+			return nil
+		}
+	}
+	return fmt.Errorf("%s %q is not one of: %s", key, value, strings.Join(importModeValues, ", "))
+}
+
+// validateDropFolderValue checks one drop folder path for key. Empty is
+// accepted (feature off, or for the audiobook folder, use import.drop_folder);
+// a non-empty value must resolve to an existing directory so a typo fails
+// loudly here, not silently at import time.
+func validateDropFolderValue(key, value string) error {
+	if value == "" {
+		return nil
+	}
+	info, err := os.Stat(value)
+	if err != nil {
+		return fmt.Errorf("%s %q: %w (ensure the path is accessible inside the bindery container, check volume mounts)", key, value, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s %q is not a directory", key, value)
+	}
+	return nil
+}
+
 // SettingGoogleBooksAPIKey and LegacySettingGoogleBooksAPIKey are the two keys
 // the Google Books API key has been stored under. Neither matches the naming
 // convention isSecretSetting's patterns expect (camelCase in one, no dot
@@ -209,7 +370,47 @@ const (
 )
 
 type SettingsHandler struct {
-	settings *db.SettingsRepo
+	settings   *db.SettingsRepo
+	dailyQuota *hardcover.DailyQuota
+	onChange   SettingsChangeHook
+}
+
+// SettingsChangeHook runs after a setting has been stored (PUT) or removed
+// (DELETE), so a component that read the setting at boot can pick the new
+// value up without a restart. handled reports whether the hook acts on key at
+// all; err reports that it does but could not apply the change. The write has
+// already succeeded either way and is never rolled back: the hook's error
+// only reaches the log and the response's appliedLive flag.
+type SettingsChangeHook func(ctx context.Context, key string) (handled bool, err error)
+
+// WithDailyQuota shares the same pause with the API test button.
+func (h *SettingsHandler) WithDailyQuota(q *hardcover.DailyQuota) *SettingsHandler {
+	h.dailyQuota = q
+	return h
+}
+
+// WithChangeHook installs the hook every successful write runs. cmd/bindery
+// uses it to rebuild the metadata providers when the primary provider, the
+// Google Books key or the Hardcover token changes (#1771). Without one,
+// writes behave as before and the response carries no appliedLive flag.
+func (h *SettingsHandler) WithChangeHook(hook SettingsChangeHook) *SettingsHandler {
+	h.onChange = hook
+	return h
+}
+
+// runChangeHook runs the hook for key and returns the appliedLive value for
+// the response: nil when nothing acts on key, otherwise whether the change
+// took effect immediately.
+func (h *SettingsHandler) runChangeHook(ctx context.Context, key string) *bool {
+	if h.onChange == nil {
+		return nil
+	}
+	handled, err := h.onChange(ctx, key)
+	if !handled {
+		return nil
+	}
+	applied := err == nil
+	return &applied
 }
 
 func NewSettingsHandler(settings *db.SettingsRepo) *SettingsHandler {
@@ -239,7 +440,9 @@ func NewSettingsHandler(settings *db.SettingsRepo) *SettingsHandler {
 func isSecretSetting(key string) bool {
 	// 1. Explicit one-offs that don't match the patterns below.
 	switch key {
-	case SettingAuthAPIKey,
+	case "auth.hardcover_daily_holds",
+		"auth.hardcover_rejected_holds",
+		SettingAuthAPIKey,
 		SettingAuthSessionSecret,
 		SettingAuthSessionSecretPrevious,
 		SettingAuthMode,
@@ -301,16 +504,60 @@ func isWritableSecretSetting(key string) bool {
 		key == LegacySettingGoogleBooksAPIKey
 }
 
+// SettingRecommendationsEnabled is "true" to run the recommendation engine and
+// show the Discover page's suggestions; anything else (or unset) turns both
+// off. The recommender and scheduler read it as a string literal; keep those in
+// sync with this constant.
+const SettingRecommendationsEnabled = "recommendations.enabled"
+
+// nonAdminReadableSettings is the complete list of settings a non admin may
+// read through GET /api/v1/setting and GET /api/v1/setting/{key} (#2361).
+// Every other key is admin only. It is an allowlist on purpose: the denylist
+// it replaces only covered what somebody had thought to list, and a scan of
+// v1.40.0 found integration base URLs, the Grimmory username and the telemetry
+// install id still readable by any account.
+//
+// Each entry is here because a screen a non admin can open reads it, and the
+// screen copes with the key being absent (it falls back to a default), so a
+// key can be dropped from this list without breaking a page:
+//
+//   - recommendations.enabled: DiscoverPage, to decide whether to show
+//     suggestions.
+//   - metadata.primary_provider: AddToLibraryModal, for the provider notice.
+//   - library.defaultRootFolderId, library.defaultAudiobookRootFolderId,
+//     default.media_type, author.default_monitor_mode and
+//     author.default_monitor_latest_count: authorAddDefaults, which preselects
+//     the add author dialog. Root folder ids are numbers, not paths; the paths
+//     themselves live behind GET /rootfolder.
+//
+// Adding a key here hands its value to every authenticated account, so a new
+// entry needs a non admin screen that reads it and a value that says nothing
+// about the server: no path, URL, hostname, username, id or credential.
+var nonAdminReadableSettings = map[string]bool{
+	SettingRecommendationsEnabled:          true,
+	SettingMetadataPrimaryProvider:         true,
+	SettingDefaultLibraryRootFolderID:      true,
+	SettingDefaultAudiobookRootFolderID:    true,
+	SettingDefaultMediaType:                true,
+	SettingAuthorDefaultMonitorMode:        true,
+	SettingAuthorDefaultMonitorLatestCount: true,
+}
+
 // isAdminOnlySetting reports whether a settings key may only be read by an
-// admin. It is the read-side counterpart of the auth.RequireAdmin gate that
-// already guards PUT and DELETE on /api/v1/setting/{key}: after #2361 an
-// account that cannot write one of these keys cannot read it either.
+// admin. It is the read side counterpart of the auth.RequireAdmin gate that
+// already guards PUT and DELETE on /api/v1/setting/{key}.
+//
+// Since #2361 the default is admin only: a key is readable by a non admin only
+// when it is on nonAdminReadableSettings and is not a secret. That covers the
+// filesystem paths the first #2361 pass reserved by name (calibre and drop
+// folder paths, the two path remaps, the library.lastScan blob) and also
+// everything nobody had listed, such as integration base URLs and usernames,
+// indexer and provider settings, and telemetry.install_id.
 //
 // Relationship to isSecretSetting, which #2361 warns must not drift out of
 // agreement with this function: every secret is admin only by construction,
-// because the first thing here is a delegation to isSecretSetting. The two
-// cannot disagree about whether a key is sensitive, only about how far the
-// hiding goes.
+// because the first thing here is a delegation to isSecretSetting, so a
+// secret stays hidden even if somebody adds it to the allowlist by mistake.
 //
 //   - A secret is hidden from everybody, admins included. Its value has no
 //     reason to travel back to a browser at all, so List omits it and Get 404s.
@@ -318,19 +565,13 @@ func isWritableSecretSetting(key string) bool {
 //     returned intact to an admin, because the Settings screens that own these
 //     keys have to render the stored value for the operator to edit it.
 //
-// Boundary: server filesystem paths are in. GET /system/storage has been admin
-// gated since #1183 on the grounds that it "reveals server filesystem layout",
-// and these keys carry that same information class through an endpoint every
-// authenticated role could read, which is the asymmetry #2361 reports. An OPDS
-// only reader account could ask a stock install where its Calibre library
-// lives on disk.
+// API key requests are stamped admin by auth.Middleware, so a script or third
+// party client using the API key still reads every non secret key.
 //
-// Deliberately out of scope for now: indexer and provider hostnames, and the
-// Audiobookshelf and Calibre plugin base URLs. They are a real disclosure too,
-// but a narrower and less actionable one than an absolute server path, and
-// widening the classifier to cover them wants its own pass over what a non
-// admin screen legitimately needs. #2361 tracks the wider question, including
-// the allowlist inversion that would settle it properly.
+// SettingLibraryLastScan has a second door: GET /api/v1/library/scan/status
+// serves the same blob verbatim. That route is mounted behind
+// auth.RequireAdmin by registerLibraryScanStatusRoute in cmd/bindery (#2361),
+// so both ways to the value are admin only.
 func isAdminOnlySetting(key string) bool {
 	// Every secret is admin only. Stated as a delegation rather than by
 	// re-listing the keys so the two classifiers cannot drift apart: a key
@@ -338,27 +579,7 @@ func isAdminOnlySetting(key string) bool {
 	if isSecretSetting(key) {
 		return true
 	}
-	// Non secret keys whose values are absolute paths on the server, prefix
-	// maps built out of them, or a blob containing both. The issue names the
-	// first four; the two remaps and the scan summary are the same
-	// disclosure in a different shape and are included rather than left for
-	// the next audit to find.
-	//
-	// SettingLibraryLastScan has a second door: GET
-	// /api/v1/library/scan/status serves the same blob verbatim. That route is
-	// mounted behind auth.RequireAdmin by registerLibraryScanStatusRoute in
-	// cmd/bindery (#2361), so both ways to the value are admin only.
-	switch key {
-	case SettingCalibreLibraryPath,
-		SettingCalibreBinaryPath,
-		SettingImportDropFolder,
-		SettingCWAIngestPath,
-		SettingCalibrePushPathRemap,
-		SettingABSPathRemap,
-		SettingLibraryLastScan:
-		return true
-	}
-	return false
+	return !nonAdminReadableSettings[key]
 }
 
 // callerIsAdmin reports whether the request carries the admin role, read from
@@ -460,17 +681,79 @@ func (h *SettingsHandler) Set(w http.ResponseWriter, r *http.Request) {
 		writeServerError(w, r, err)
 		return
 	}
+	appliedLive := h.runChangeHook(r.Context(), key)
 	if isSecretSetting(key) {
-		writeJSON(w, http.StatusOK, map[string]string{"key": key, "value": ""})
+		resp := map[string]any{"key": key, "value": ""}
+		if appliedLive != nil {
+			resp["appliedLive"] = *appliedLive
+		}
+		writeJSON(w, http.StatusOK, resp)
 		return
 	}
-	s, err := h.settings.Get(r.Context(), key)
-	if err != nil || s == nil {
-		writeJSON(w, http.StatusOK, map[string]string{"key": key, "value": value})
-		return
+	resp := settingSetResponse{Setting: &models.Setting{Key: key, Value: value}, AppliedLive: appliedLive}
+	if s, err := h.settings.Get(r.Context(), key); err == nil && s != nil {
+		resp.Setting = s
 	}
-	writeJSON(w, http.StatusOK, s)
+	resp.Warning, resp.WarningCode = h.settingSaveWarning(r.Context(), key)
+	writeJSON(w, http.StatusOK, resp)
 }
+
+// settingSetResponse is what a setting write answers: the stored setting,
+// and a warning when the value saved but cannot work as configured.
+type settingSetResponse struct {
+	*models.Setting
+	Warning     string `json:"warning,omitempty"`
+	WarningCode string `json:"warningCode,omitempty"`
+	// AppliedLive is present only for a setting something applies at
+	// runtime (today the metadata provider settings, #1771): true when the
+	// change is already in effect, false when it saved but takes effect at
+	// the next restart.
+	AppliedLive *bool `json:"appliedLive,omitempty"`
+}
+
+// warningCalibredbMissing is the warning code for a calibredb write mode
+// with no calibredb where Bindery runs (#1940).
+const warningCalibredbMissing = "calibredb_missing"
+
+// settingSaveWarning checks a just saved setting against the environment.
+//
+// A calibredb write mode is saved even when there is no calibredb to run
+// (#1940), because refusing would leave the user unable to save the mode
+// they will make work by installing Calibre, but saying nothing is how the
+// official image, which has no Calibre at all, came to drop every import on
+// the floor with a successful looking import and a single WARN line. So the
+// save answers with the reason, and the Calibre settings tab shows it.
+func (h *SettingsHandler) settingSaveWarning(ctx context.Context, key string) (string, string) {
+	if key != SettingCalibreMode && key != SettingCalibreBinaryPath {
+		return "", ""
+	}
+	if LoadCalibreMode(ctx, h.settings) != calibre.ModeCalibredb {
+		return "", ""
+	}
+	cfg := LoadCalibreConfig(ctx, h.settings)
+	cfg.Enabled = true
+	client := calibre.New(cfg)
+	if _, err := client.Locate(); err != nil {
+		code := ""
+		if calibre.IsCalibredbUnusable(err) {
+			code = warningCalibredbMissing
+		}
+		return err.Error(), code
+	}
+	// The file is there; whether it starts is another matter on the official
+	// image, where a mounted Calibre install has no libraries to load. Ask it
+	// for its version, briefly, and warn only when it cannot run at all. Any
+	// other trouble, such as the library path, is Test connection's to report.
+	tctx, cancel := context.WithTimeout(ctx, calibredbSaveProbeTimeout)
+	defer cancel()
+	if _, err := client.Test(tctx); calibre.IsCalibredbUnusable(err) {
+		return err.Error(), warningCalibredbMissing
+	}
+	return "", ""
+}
+
+// calibredbSaveProbeTimeout bounds the version check a calibredb save runs.
+const calibredbSaveProbeTimeout = 10 * time.Second
 
 // validateSettingDependencies rejects values that are well-formed on their own
 // but invalid given the rest of the stored configuration. validateSettingValue
@@ -508,6 +791,9 @@ func normalizeSettingValue(key, value string) string {
 	if key == SettingHardcoverAPIToken {
 		return hardcover.NormalizeAPIToken(value)
 	}
+	if key == SettingMetadataEnrichersDisabled {
+		return strings.Join(ParseMetadataEnrichersDisabled(value), ",")
+	}
 	return value
 }
 
@@ -534,8 +820,12 @@ func (h *SettingsHandler) TestHardcover(w http.ResponseWriter, r *http.Request) 
 
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
+	// A user retesting after fixing the token on Hardcover's side must reach
+	// Hardcover even while a rejected token hold is live (#3101). A daily quota
+	// hold still answers without a request.
+	ctx = hardcover.WithRejectedTokenProbe(ctx)
 
-	client := hardcover.New().WithToken(token)
+	client := hardcover.New().WithDailyQuota(h.dailyQuota).WithToken(token)
 	series, err := client.SearchSeries(ctx, "Dune", 3)
 	if err != nil {
 		result.Error = err.Error()
@@ -646,19 +936,11 @@ func validateSettingValue(key, value string) error {
 		if !info.IsDir() {
 			return fmt.Errorf("cwa.ingest_path %q is not a directory", value)
 		}
-	case SettingImportDropFolder:
-		// Empty = feature off. Non-empty must resolve to an existing writable
-		// directory so a typo fails loudly here, not silently at import time.
-		if value == "" {
-			return nil
-		}
-		info, err := os.Stat(value)
-		if err != nil {
-			return fmt.Errorf("import.drop_folder %q: %w (ensure the path is accessible inside the bindery container, check volume mounts)", value, err)
-		}
-		if !info.IsDir() {
-			return fmt.Errorf("import.drop_folder %q is not a directory", value)
-		}
+	case SettingImportDropFolder, SettingImportAudiobookDropFolder:
+		// Empty = feature off (or, for audiobooks, use import.drop_folder).
+		// Both folders get the same check so neither can be saved pointing
+		// at a path the other would refuse (#1632).
+		return validateDropFolderValue(key, value)
 	case SettingImportDropLayout:
 		if value == "" {
 			return nil
@@ -669,12 +951,23 @@ func validateSettingValue(key, value string) error {
 	case SettingNamingAudiobookFileTemplate:
 		// Empty disables per-file audiobook renaming (#1126). A non-empty
 		// template MUST carry a {Part} token, otherwise every track flattens to
-		// the same filename and all but the last are dropped.
+		// the same filename and all but the last are dropped. The token may
+		// sit in a conditional group ("{Title}{ - Pt. Part:3}.{ext}"), which a
+		// single-file audiobook drops entirely (#2900), so this asks the
+		// renderer rather than looking for the substring "{Part".
 		if value == "" {
 			return nil
 		}
-		if !strings.Contains(value, "{Part") {
+		if !importer.AudiobookTemplateHasPart(value) {
 			return fmt.Errorf("naming.audiobook_file_template must include a {Part} token so each track gets a unique name")
+		}
+	case "naming_template_audiobook":
+		// Audiobook folders render {ext} empty, so a copied ebook template such
+		// as "{Author} - {Title}.{ext}" makes folders named "Author - Title."
+		// and uniquifying then splits one book across "Title.", "Title. (2)"
+		// and so on (#3217).
+		if importer.AudiobookTemplateUsesExt(value) {
+			return fmt.Errorf("naming_template_audiobook names a folder, so {ext} is always empty there and would leave a trailing dot in every folder name. Remove {ext}; it belongs in the ebook template")
 		}
 	case SettingImportDropLinkMode:
 		if value == "" {
@@ -708,19 +1001,12 @@ func validateSettingValue(key, value string) error {
 		if err != nil || n <= 0 {
 			return fmt.Errorf("import.drop_pair_gating_timeout_hours %q must be a positive integer number of hours", value)
 		}
-	case SettingImportMode:
-		// Empty = auto (same as "auto"); a typo must fail loudly here rather
-		// than silently fall through to auto at import time, where the operator
-		// would think Move/External was in effect.
-		if value == "" {
-			return nil
-		}
-		switch value {
-		case "auto", "move", "copy", "hardlink", "external":
-			return nil
-		default:
-			return fmt.Errorf("import.mode %q is not one of: auto, move, copy, hardlink, external", value)
-		}
+	case SettingImportEbookContentCheck, SettingImportAudiobookContentCheck:
+		return validateContentCheckValue(key, value)
+	case SettingImportMode, SettingImportAudiobookMode:
+		// Empty = auto for import.mode, "same as import.mode" for the
+		// audiobook override (#1632). Both accept exactly the same values.
+		return validateImportModeValue(key, value)
 	case SettingCalibreMode:
 		// Canonical values only. An empty string falls through to the
 		// default (off) handled by LoadCalibreMode; anything else must
@@ -786,7 +1072,7 @@ func validateSettingValue(key, value string) error {
 		if err != nil || n <= 0 || n > 10000 {
 			return fmt.Errorf("requests.max_pending_per_user %q must be an integer from 1 to 10000", value)
 		}
-	case SettingDefaultLibraryRootFolderID:
+	case SettingDefaultLibraryRootFolderID, SettingDefaultAudiobookRootFolderID:
 		// Empty = unset (fall back to env-var default); non-empty must be a
 		// positive integer representing an existing root_folder.id.
 		if value == "" {
@@ -794,7 +1080,7 @@ func validateSettingValue(key, value string) error {
 		}
 		id, err := strconv.ParseInt(value, 10, 64)
 		if err != nil || id <= 0 {
-			return fmt.Errorf("library.defaultRootFolderId %q must be a positive integer or empty", value)
+			return fmt.Errorf("%s %q must be a positive integer or empty", key, value)
 		}
 	case SettingMetadataPrimaryProvider:
 		// Empty falls back to "openlibrary"; non-empty must be a known provider.
@@ -802,6 +1088,14 @@ func validateSettingValue(key, value string) error {
 		// this pure validator can't see — Set() enforces that separately.
 		if !IsMetadataPrimaryProviderValid(value) {
 			return fmt.Errorf("metadata.primary_provider %q is not one of: %s", value, strings.Join(MetadataPrimaryProviders, ", "))
+		}
+	case SettingMetadataEnrichersDisabled:
+		// Unknown names are refused rather than dropped, like an unknown
+		// primary provider, so a typo does not look saved and do nothing.
+		for _, name := range ParseMetadataEnrichersDisabled(value) {
+			if !IsMetadataSourceToggleName(name) {
+				return fmt.Errorf("%s: %q is not one of: %s", key, name, strings.Join(MetadataSourceToggles(), ", "))
+			}
 		}
 	case SettingCalibrePushPathRemap:
 		if value == "" {
@@ -830,7 +1124,7 @@ func validateSettingValue(key, value string) error {
 		// Block link-local and cloud-metadata so the Calibre plugin URL can't
 		// be used as an admin-only SSRF foot-gun (mirrors ABS / Grimmory /
 		// indexer / prowlarr / downloadclient validation).
-		if err := httpsec.ValidateOutboundURL(value, httpsec.PolicyLANLoopback); err != nil {
+		if err := httpsec.ValidateOutboundURL(value, httpsec.PolicyService); err != nil {
 			return fmt.Errorf("plugin_url %q: %w", value, err)
 		}
 	case SettingABSBaseURL:
@@ -911,5 +1205,9 @@ func (h *SettingsHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		writeServerError(w, r, err)
 		return
 	}
+	// Deleting metadata.primary_provider puts the default back in force, so
+	// the providers are rebuilt here too. 204 has no body to report it in;
+	// the hook logs a failure.
+	h.runChangeHook(r.Context(), key)
 	w.WriteHeader(http.StatusNoContent)
 }

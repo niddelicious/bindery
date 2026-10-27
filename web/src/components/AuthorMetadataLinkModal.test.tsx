@@ -7,11 +7,11 @@ import type { Author } from '../api/client'
 const tMock = vi.hoisted(() => (key: string, options?: string | Record<string, unknown>) => {
   const strings: Record<string, string> = {
     'authorMetadataLink.title': 'Link metadata',
-    'authorMetadataLink.searchPlaceholder': 'Search by author name...',
+    'authorMetadataLink.searchPlaceholder': 'Search by author name…',
     'authorMetadataLink.search': 'Search',
-    'authorMetadataLink.searching': 'Searching...',
+    'authorMetadataLink.searching': 'Searching…',
     'authorMetadataLink.link': 'Link',
-    'authorMetadataLink.linking': 'Linking...',
+    'authorMetadataLink.linking': 'Linking…',
     'authorMetadataLink.noResults': 'No alternate metadata candidates found',
     'authorMetadataLink.previouslyLinked': 'previously linked',
     'common.cancel': 'Cancel',
@@ -96,7 +96,7 @@ describe('AuthorMetadataLinkModal', () => {
 
     await waitFor(() => expect(api.searchAuthorLinkCandidates).toHaveBeenCalledWith(42, 'Emilia Jae'))
 
-    const input = screen.getByPlaceholderText('Search by author name...')
+    const input = screen.getByPlaceholderText('Search by author name…')
     fireEvent.change(input, { target: { value: 'Manual Query' } })
     const form = input.closest('form')
     if (!form) throw new Error('search form not found')
@@ -172,6 +172,25 @@ describe('AuthorMetadataLinkModal', () => {
 
     await screen.findByRole('button', { name: 'Link' })
     expect(screen.queryByRole('link', { name: /View on/ })).toBeNull()
+  })
+
+  // #3144: a BnF candidate is labelled by its foreign-ID prefix, not shown as
+  // the raw provider key or "Metadata".
+  it('labels a BnF candidate', async () => {
+    vi.mocked(api.searchAuthorLinkCandidates).mockResolvedValue([
+      author({ id: 0, foreignAuthorId: 'bnf:author:11885918', authorName: 'Lewis Carroll', metadataProvider: '' }),
+    ])
+
+    render(
+      <AuthorMetadataLinkModal
+        author={author({ foreignAuthorId: 'calibre:author:9', authorName: 'Lewis Carroll' })}
+        onClose={vi.fn()}
+        onLinked={vi.fn()}
+      />,
+    )
+
+    await screen.findByRole('button', { name: 'Link' })
+    expect(screen.getByText('BnF')).toBeInTheDocument()
   })
 
   // #2688: a record the author was linked to before is offered again rather

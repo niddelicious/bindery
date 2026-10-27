@@ -64,6 +64,7 @@ func (s universalStub) AutoLinkHardcover(w http.ResponseWriter, _ *http.Request)
 func (s universalStub) PutHardcoverLink(w http.ResponseWriter, _ *http.Request)      { s.h(w) }
 func (s universalStub) DeleteHardcoverLink(w http.ResponseWriter, _ *http.Request)   { s.h(w) }
 func (s universalStub) HardcoverDiff(w http.ResponseWriter, _ *http.Request)         { s.h(w) }
+func (s universalStub) Merge(w http.ResponseWriter, _ *http.Request)                 { s.h(w) }
 func (s universalStub) Clear(w http.ResponseWriter, _ *http.Request)                 { s.h(w) }
 func (s universalStub) Retry(w http.ResponseWriter, _ *http.Request)                 { s.h(w) }
 func (s universalStub) Reset(w http.ResponseWriter, _ *http.Request)                 { s.h(w) }
@@ -77,6 +78,9 @@ func (s universalStub) Approve(w http.ResponseWriter, _ *http.Request)          
 func (s universalStub) Decline(w http.ResponseWriter, _ *http.Request)               { s.h(w) }
 func (s universalStub) Diagnose(w http.ResponseWriter, _ *http.Request)              { s.h(w) }
 func (s universalStub) Summary(w http.ResponseWriter, _ *http.Request)               { s.h(w) }
+func (s universalStub) Check(w http.ResponseWriter, _ *http.Request)                 { s.h(w) }
+func (s universalStub) Preview(w http.ResponseWriter, _ *http.Request)               { s.h(w) }
+func (s universalStub) Cleanup(w http.ResponseWriter, _ *http.Request)               { s.h(w) }
 func (s universalStub) Adopt(w http.ResponseWriter, _ *http.Request)                 { s.h(w) }
 func (s universalStub) Undo(w http.ResponseWriter, _ *http.Request)                  { s.h(w) }
 func (s universalStub) Ignore(w http.ResponseWriter, _ *http.Request)                { s.h(w) }
@@ -93,6 +97,7 @@ func registerEnumerableRoutes(r chi.Router) {
 	registerOIDCDiscoveryRoutes(r, s)
 	registerSystemLogRoutes(r, s)
 	registerStorageRoutes(r, s)
+	registerDBIntegrityRoutes(r, s)
 	registerLibraryScanStatusRoute(r, s)
 	registerSeriesRoutes(r, s)
 	registerGrimmoryRoutes(r, s)
@@ -206,6 +211,9 @@ func (f *requesterFixture) do(method, target string, cookie *http.Cookie) *httpt
 func (f *requesterFixture) doFrom(method, target string, cookie *http.Cookie, remote string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, target, nil)
 	req.RemoteAddr = remote
+	// A LAN name, not httptest's example.com, which the login free modes
+	// refuse; the host check itself is covered in host_check_routes_test.go.
+	req.Host = "bindery:8787"
 	if cookie != nil {
 		req.AddCookie(cookie)
 	}
@@ -470,6 +478,7 @@ func TestRequesterGuard_OPDSModeNeverElevatesARequester(t *testing.T) {
 		}{{f.cookie, http.StatusForbidden}, {f.userCookie, http.StatusOK}, {nil, http.StatusOK}} {
 			req := httptest.NewRequest(http.MethodGet, "/opds/", nil)
 			req.RemoteAddr = "127.0.0.1:5555"
+			req.Host = "localhost:8787" // not httptest's example.com, which the modes refuse
 			if c.cookie != nil {
 				req.AddCookie(c.cookie)
 			}
@@ -480,4 +489,9 @@ func TestRequesterGuard_OPDSModeNeverElevatesARequester(t *testing.T) {
 			}
 		}
 	}
+}
+
+// UnmonitorSplitEditionParts completes the series route surface (#3048).
+func (s universalStub) UnmonitorSplitEditionParts(w http.ResponseWriter, _ *http.Request) {
+	s.h(w)
 }

@@ -1,6 +1,6 @@
 # Multi-User
 
-Bindery v1.0 introduces per-user library scoping: authors, books, downloads, quality profiles, and metadata profiles can be owned by a specific user, and users log in with their own credentials.
+Bindery v1.0 introduces per-user library scoping: authors, books and downloads can be owned by a specific user, and users log in with their own credentials. Quality and metadata profiles are shared across the instance and managed by admins.
 
 > **Root folders are not per-user.** They are a single shared, admin-managed pool (Settings → Root Folders), and import destinations resolve per-author plus a global default — there is no per-user library directory today. Regular users don't get their own root folders. Per-user root folders are a tracked future enhancement, not current behaviour.
 
@@ -8,10 +8,11 @@ Bindery v1.0 introduces per-user library scoping: authors, books, downloads, qua
 >
 > When enforcement is on, Bindery scopes:
 > - **Tier-2 join-scoped resources** — download queue, history, pending grabs, and the OPDS catalogue — to the requesting user.
-> - **Per-user resources** — each user's own authors, books, quality and metadata profiles, and password. (Root folders are **not** per-user; see the note above. The API key and the notification webhooks are instance wide and admin only.)
+> - **Per-user resources** — each user's own authors, books, and password. (Root folders are **not** per-user; see the note above. Quality and metadata profiles are not per user either: every user and admin sees the same profiles, and only admins create, edit or delete them. The API key and the notification webhooks are instance wide and admin only.)
 > - **Background Hardcover list syncs** to the list's owner: a list decides whether to create a book by reading only the rows its owner can see, so one user's list never skips, widens or re-opens another user's book and never reuses another user's author. Rows with no owner stay shared and reusable by every list. Because a book's and an author's Hardcover id is unique across the whole instance, a work another user already holds cannot be created a second time; the sync leaves that row untouched, logs whose it is, and counts the book as skipped.
+> - **Adding books and authors** by hand, from a recommendation, or through an author's catalogue sync. For the same reason a work another user already holds cannot be added again: Add Book answers 409 "book is held by another user" before it creates or fetches anything, and the answer says nothing else about that row. Matching an added book against a title already under a shared (unowned) author only considers rows the caller owns or that have no owner, for an admin too, so an add never adopts or changes a row another user owns. A book a user who is not an admin adds by hand under a shared author belongs to them, not to everyone; an admin's stays unowned as before. For a user who is not an admin, an author alias only matches an author they can see, and a recommendation is only filed under their own or a shared author and belongs to them; an admin, who sees every library, still matches any, and a book an admin adds from a recommendation stays unowned as before. A catalogue sync only re-links a book whose owner matches the author it is syncing, so it never moves a book between a user's library and a shared author or another user's.
 >
-> **Admins see everything in list views.** With enforcement on, an `admin` is never filtered by ownership: the authors and books list endpoints (and the OPDS feed) return *all* users' libraries plus unowned/global rows, the same way an admin can already open any single item by ID. This is a **shared library across admins**, by design: it does not widen access, it makes lists consistent with per-item access. Non-admin (`user`) accounts stay isolated to their own rows plus unowned/global rows. Requests authenticated by API key, and requests the auth mode admits without a login (every request in `disabled` mode, local clients in `local-only` mode), act as the administrator: they carry the admin role and the first admin account's id, so they are likewise unscoped and anything they create is owned by that admin.
+> **Admins see everything in list views.** With enforcement on, an `admin` is never filtered by ownership: the authors and books list endpoints (and the OPDS feed) return *all* users' libraries plus unowned/global rows, the same way an admin can already open any single item by ID. This is a **shared library across admins**, by design: it does not widen access, it makes lists consistent with per-item access. Non-admin (`user`) accounts stay isolated to their own rows plus unowned/global rows. Requests authenticated by API key, and requests the auth mode admits without a login (every request in `disabled` mode, local clients in `local-only` mode), act as the administrator: they carry the admin role and the first admin account's id, so they are likewise unscoped and anything they create is owned by that admin. The one exception is a request made with `forUser` (see **Requests made for another account** under [Requester](#requester)), which is owned by the account it names.
 >
 > Role-based gating of admin-only configuration (indexers, download clients, user management, system settings) applies in **both** modes — that does not depend on `BINDERY_ENFORCE_TENANCY`. The flag only controls whether *library data* is partitioned per user.
 >
@@ -38,7 +39,10 @@ Three roles exist: `admin`, `user` and `requester`.
 | Action | `admin` | `user` | `requester` |
 |--------|:-------:|:------:|:-----------:|
 | View and manage own authors/books/downloads | Yes | Yes | No |
-| View and manage own quality/metadata profiles | Yes | Yes | No |
+| View quality/metadata profiles (shared across the instance) | Yes | Yes | No |
+| Create, edit, delete quality/metadata profiles | Yes | No | No |
+| View or remove blocklist entries | Yes | No | No |
+| Blocklist a release from own history | Yes | Yes | No |
 | Manage root folders (single shared/global pool) | Yes | No | No |
 | Change own password | Yes | Yes | Yes |
 | Read or rotate the instance API key | Yes | No | No |
@@ -46,6 +50,8 @@ Three roles exist: `admin`, `user` and `requester`.
 | View other users' library data | Yes | No | Titles only, read only (see [Requester](#requester)) |
 | Manage other users' library data | Yes | No | No |
 | Search metadata providers | Yes | Yes | Yes, rate limited |
+| Grab a release from indexer search results | Yes | Yes | No |
+| Grab a download URL no search returned (API) | Yes | No | No |
 | Ask for a book or an author | Yes | Yes | Yes |
 | Approve or decline requests | Yes | No | No |
 | Download book files, use OPDS | Yes | Yes | No |
@@ -58,6 +64,13 @@ Three roles exist: `admin`, `user` and `requester`.
 | Trigger a backup or a migration import | Yes | No | No |
 | Start a library scan | Yes | Yes | No |
 | See server filesystem paths (storage health, path settings, last library scan) | Yes | No | No |
+| Read stored settings (`GET /api/v1/setting`) | Yes, all but secrets | Only the few a user screen reads (see below) | No |
+
+### Grabbing as a user
+
+A `user` account grabs releases from the search results Bindery showed it. `POST /api/v1/queue/grab` looks the release up by its `guid` among recent search results and sends the download URL the server recorded for it, credentials included, whatever `nzbUrl` the request carries. That applies to every caller: an admin grabbing a recent search result also gets the recorded URL. A release no recent search returned, or one whose results have aged out (24 hours, or a restart), is refused for a user account with a message to run the search again. Admins, API key requests and requests the auth mode admits as the admin fall back to the `nzbUrl` they posted.
+
+With `BINDERY_ENFORCE_TENANCY` on, a grab's `bookId` must be a book the caller owns (otherwise 404, as for any other book route), and a release whose queue row belongs to another user answers 409 without describing that row. A grab claims another user's row only on the terms the scheduler's automatic grab uses: a failed row once it has been dead for six hours, or an imported row whose book was deleted. A claimed row is reset completely, owner and book included. Rows in `importBlocked` and live rows are never claimed this way.
 
 ## Requester
 
@@ -85,6 +98,8 @@ These limits are enforced on the server, not just hidden in the UI. Every API ro
 **Auto-approving one account.** An admin can skip the queue for a single requester with the checkbox in the **Auto-approve requests** column on the Users page, or `PUT /api/v1/auth/users/{id}/auto-approve` with `{"enabled": true}`. It is off by default and off for every account that has never had it set. With it on, a request from that account runs the same claim and add an admin's Approve runs, straight away and with no deciding user recorded, so the already-in-the-library check, the stored-payload revalidation and the pending cap all still apply. A book request searches on add; an author request runs the ordinary catalogue sync. If the add fails the request stays pending in the queue rather than being lost.
 
 The account gets the same `requests.max_pending_per_user` limit as a daily ceiling: once it has had that many requests auto-approved since midnight UTC, the next one is left pending for a human, and the counter resets the next day. The limit defaults to 25. An auto-approved request does not fire the Request webhook, so an admin is not pinged for an item that was added without them; a request left pending, whether the add failed or the day's quota is spent, still notifies. The switch only affects the next request: anything already waiting stays waiting for a human.
+
+**Requests made for another account.** A request front end that keeps its own users (a Seerr-style app talking to Bindery with the API key) can make each request as the person who asked, rather than as the first admin. `POST /api/v1/requests` accepts a `forUser` user id from an admin session or the API key, and from nobody else: any other caller that sends it gets 403. That includes a caller that `disabled` or `local-only` mode admits as admin without signing in, since there would be nobody to record as having asked; such an integration should send the API key. An admin who names their own id just makes their own request. The request is then that account's in every way: they own it, it counts against their `requests.max_pending_per_user`, it shows on their My requests, and an approval adds the books as theirs. Their **Auto-approve requests** setting decides what happens next, with the daily ceiling, the pending cap and the already-in-the-library check all still applying; there is no way to approve on create. `forUser` takes the id from `GET /api/v1/auth/users`, not a username, so a rename does not move requests. `GET /api/v1/system/status` reports `"features": {"requestsForUser": true}` so an integration can tell a Bindery that accepts the field from an older one. The Requests page and the queue API record who actually asked: "made for them with the API key", or "made for them by" the admin whose session sent it. That is stored on the request itself, not in History, because History entries without a book are visible to every user. No other route accepts `forUser`, and there is no general "act as this user" header.
 
 **Requester restrictions hold in every auth mode.** `disabled` and `local-only` mode serve an anonymous caller (or, in `local-only`, any client on a private network) as the admin, but a request carrying a requester's own session is never elevated that way: it acts as the requester, and so does its OPDS access. Two things still act as the admin whatever cookie rides along: the API key, and, in those two modes, a caller who simply signs out, because the mode itself admits them. So a requester account only means something when the person cannot reach Bindery without signing in, which in practice is `enabled` or `proxy` mode.
 
@@ -156,7 +171,7 @@ Everyone sees the **General** tab (appearance, and the Security section, which i
 - **Integrations** — Notifications, Calibre, Audiobookshelf, Grimmory, API Keys
 - **System** — Import / Migrate, Blocklist, Logs
 
-Non-admins who open an admin tab are redirected back to General; admin API routes return 403. Inside General itself, a non admin sees Appearance and Security; the sections that describe or configure the server (file naming, downloads, search, the default library location, storage, the library scan panel and the schedule intervals) render for admins only, and the routes behind them, including `GET /system/storage` and `GET /library/scan/status`, answer 403 to anyone else. Users are managed on the dedicated **Users** page (the people icon in the header), not inside Settings.
+Non-admins who open an admin tab are redirected back to General; admin API routes return 403. Inside General itself, a non admin sees Appearance and Security; the sections that describe or configure the server (file naming, downloads, search, the default library location, storage, the library scan panel and the schedule intervals) render for admins only, and the routes behind them, including `GET /system/storage` and `GET /library/scan/status`, answer 403 to anyone else. The settings API follows the same line: a non admin reading `GET /api/v1/setting` or `GET /api/v1/setting/{key}` gets only the handful of settings a user screen needs (whether Discover recommendations are on, the primary metadata provider, and the add author defaults: default root folder ids, default format and monitoring), and every other key is left out of the list or answers 404 as if it were unset. Filesystem paths, integration URLs and usernames, the telemetry install id and every operator knob stay with admins, as does `GET /grimmory/config`. Requests made with the API key count as admin and see every non secret setting. In the `disabled` and `local-only` auth modes every admitted request counts as admin, so this filter applies only once logins are enforced. Users are managed on the dedicated **Users** page (the people icon in the header), not inside Settings.
 
 ## CSRF tokens
 

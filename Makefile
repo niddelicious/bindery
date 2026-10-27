@@ -1,4 +1,4 @@
-.PHONY: build dev test test-race lint clean docker-build web-build web-dev help security helm-lint sbom smoke predeploy-smoke abs-contract check changelog licenses licenses-check
+.PHONY: build dev test test-race lint clean docker-build web-build web-dev help security helm-lint sbom smoke predeploy-smoke abs-contract check changelog licenses licenses-check go-version-check
 
 # Pinned so local regeneration and the CI drift check classify licenses
 # identically — a classifier bump would otherwise look like dependency drift.
@@ -9,6 +9,9 @@ GO_LICENSES_VERSION ?= v1.6.0
 # checks run, so it has to resolve the same vulnerability database tooling;
 # @latest would let a local run disagree with CI in either direction.
 GOVULNCHECK_VERSION ?= d1f380186385b4f64e00313f31743df8e4b89a77
+
+# Local `make security` only; CI runs gosec through golangci-lint.
+GOSEC_VERSION ?= v2.29.0
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
@@ -92,8 +95,8 @@ clean: ## Remove build artifacts
 	rm -rf web/dist web/node_modules
 
 security: ## Run local security scanners (gosec, govulncheck, gitleaks, npm audit)
-	@command -v gosec >/dev/null || go install github.com/securego/gosec/v2/cmd/gosec@latest
-	@command -v govulncheck >/dev/null || go install golang.org/x/vuln/cmd/govulncheck@latest
+	@command -v gosec >/dev/null || go install github.com/securego/gosec/v2/cmd/gosec@$(GOSEC_VERSION)
+	@command -v govulncheck >/dev/null || go install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION)
 	gosec -quiet ./...
 	govulncheck ./...
 	@if command -v gitleaks >/dev/null; then gitleaks detect --no-banner --redact; \
@@ -124,6 +127,28 @@ licenses: ## Regenerate THIRD_PARTY_LICENSES.md (needs web/node_modules)
 licenses-check: ## Fail if THIRD_PARTY_LICENSES.md is stale (the CI drift gate)
 	@command -v go-licenses >/dev/null || go install github.com/google/go-licenses@$(GO_LICENSES_VERSION)
 	go run ./tools/licensegen -check
+
+go-version-check: ## Fail if a Dockerfile or workflow builds with a Go other than go.mod's toolchain
+	@want=$$(sed -n 's/^toolchain go//p' go.mod); \
+	if [ -z "$$want" ]; then echo "go.mod has no toolchain directive"; exit 1; fi; \
+	bad=0; nd=0; nw=0; \
+	dockerfiles=$$(find . \( -name node_modules -o -name vendor -o -name .git -o -path ./.claude \) -prune \
+		-o -type f \( -name 'Dockerfile*' -o -name '*.Dockerfile' \) -print); \
+	for f in $$dockerfiles; do \
+		nd=$$((nd + 1)); \
+		for tag in $$(grep -o 'golang:[^@ ]*' "$$f" | sed 's/^golang://'); do \
+			got=$${tag%%-*}; \
+			if [ "$$got" != "$$want" ]; then echo "$$f: golang:$$tag, go.mod toolchain is go$$want"; bad=1; fi; \
+		done; \
+	done; \
+	for f in .github/workflows/*.yml .github/workflows/*.yaml; do \
+		[ -f "$$f" ] || continue; nw=$$((nw + 1)); \
+		for got in $$(sed -n 's/^[[:space:]]*go-version:[[:space:]]*"\{0,1\}\([^"[:space:]]*\)"\{0,1\}.*/\1/p' "$$f"); do \
+			if [ "$$got" != "$$want" ]; then echo "$$f: go-version $$got, go.mod toolchain is go$$want"; bad=1; fi; \
+		done; \
+	done; \
+	if [ "$$bad" = 1 ]; then echo "Bump go.mod, every Dockerfile golang tag and every setup-go go-version together."; exit 1; fi; \
+	echo "Go $$want everywhere: go.mod, $$nd Dockerfiles, $$nw workflows"
 
 sbom: build ## Generate an SPDX SBOM for the local binary
 	@command -v syft >/dev/null || (echo "syft not installed; see https://github.com/anchore/syft"; exit 1)

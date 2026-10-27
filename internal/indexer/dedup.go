@@ -25,11 +25,15 @@ import (
 //  2. newznab.NormalizeQueryTitle — folds smart quotes to ASCII, strips a
 //     trailing parenthesised edition qualifier ("(German Edition)" etc.),
 //     and collapses internal whitespace.
-//  3. foldPunctuation — deletes apostrophes and turns every other
+//  3. textutil.RestoreFilingForm — moves a filing-form article back to the
+//     front ("Trace of Death, A" becomes "A Trace of Death") so the two
+//     spellings of one title key identically (#3122). It runs before
+//     foldPunctuation, which turns the comma it keys on into a space.
+//  4. foldPunctuation — deletes apostrophes and turns every other
 //     non-alphanumeric into a space (see foldPunctuation for why the two
 //     classes must be treated differently).
-//  4. strings.ToLower — case-insensitive match.
-//  5. TransliterateUmlauts — maps ä→ae, ö→oe, ü→ue, ß→ss so that
+//  5. strings.ToLower — case-insensitive match.
+//  6. TransliterateUmlauts — maps ä→ae, ö→oe, ü→ue, ß→ss so that
 //     "Geraeusch" from a release title compares equal to "Geräusch" from
 //     the metadata provider.
 //
@@ -45,6 +49,7 @@ import (
 func NormalizeTitleForDedup(title string) string {
 	title = norm.NFC.String(title)
 	title = newznab.NormalizeQueryTitle(title)
+	title = textutil.RestoreFilingForm(title)
 	title = foldPunctuation(title)
 	title = strings.ToLower(title)
 	title = textutil.TransliterateUmlauts(title)
@@ -151,7 +156,9 @@ func CanonicalDedupKey(title string) string {
 // Revision 2 expanded the ampersand to " and " in foldPunctuation, which
 // changes the key for every title containing one. Stored books.dedup_key
 // values hold revision 1, so the bump is what makes the next boot repair them.
-const CanonicalDedupKeyRev = 2
+// Revision 3 folds the filing form onto natural order (#3122): every stored key
+// for a title ending in ", <article>" is stale until the next boot rewrites it.
+const CanonicalDedupKeyRev = 3
 
 // MainTitleKey is the canonical key of the title with any ": subtitle" tail
 // removed. It is the BLOCKING key: two rows for the same work always share it,

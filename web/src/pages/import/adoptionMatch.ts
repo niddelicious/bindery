@@ -12,6 +12,18 @@ export const STRONG_MATCH_SCORE = 0.92
 
 export type MatchStrength = 'strong' | 'possible'
 
+// WEAK_MATCH_SCORE is the title similarity below which a suggestion is not
+// offered as a match at all. "Staat van Orde" against "Star Wars Battlefront
+// II" scored above zero and sat in the row as a Possible match at the same
+// weight as a near miss. Below this the row says there is no good match, and
+// the editor still lists the suggestion, collapsed under its own heading:
+// never hidden, only not offered.
+export const WEAK_MATCH_SCORE = 0.6
+
+export function isWeakCandidate(candidate: AdoptionCandidate | undefined): boolean {
+  return candidate !== undefined && candidate.score < WEAK_MATCH_SCORE
+}
+
 function nameTokens(name: string): string[] {
   return name
     .normalize('NFKD')
@@ -31,15 +43,58 @@ export function authorsMatch(parsedAuthor: string, bookAuthor: string): boolean 
   return parsed.every(w => book.has(w))
 }
 
+// alreadySettled reports whether a suggested book is one the scan would not
+// have claimed by itself: it already has its files, or it was skipped.
+// Suggestions include such books (#2879), so an untracked copy of a book
+// already imported can be pointed at it, but adopting there adds a second copy
+// or gives files to a book the user skipped. Both deserve a look in the
+// editor, where the book's status is shown, so neither is a one click Confirm.
+export function alreadySettled(status: string): boolean {
+  return status === 'imported' || status === 'skipped'
+}
+
+// inOtherFormatRoot reports whether a row sits in the other format's library
+// folder, such as an ebook under a separate audiobooks root (#2944). With one
+// combined root the server sends no rootFormat and nothing is out of place.
+export function inOtherFormatRoot(item: AdoptionItem): boolean {
+  return item.rootFormat !== undefined && item.rootFormat !== item.format
+}
+
+// preselectable is the suggestion the editor may choose for the reader: the
+// first one, unless the files name another author than their folder, when it
+// is the first by the files' author. A look alike from the folder's author is
+// never picked for them (#2942).
+export function preselectable(item: AdoptionItem): AdoptionCandidate | undefined {
+  return item.candidates.find(c => !c.folderAuthorOnly)
+}
+
 export function matchStrength(item: AdoptionItem, candidate: AdoptionCandidate | undefined = item.candidates[0]): MatchStrength | null {
   if (!candidate) return null
   const author = item.parsedAuthor || item.authorFolder
-  return candidate.score >= STRONG_MATCH_SCORE && authorsMatch(author, candidate.book.authorName) ? 'strong' : 'possible'
+  // A file in the other format's folder is a look first decision, never a
+  // one click Confirm: the scan itself would not have claimed it there.
+  return !candidate.folderAuthorOnly && candidate.score >= STRONG_MATCH_SCORE &&
+    authorsMatch(author, candidate.book.authorName) && !alreadySettled(candidate.book.status) &&
+    !inOtherFormatRoot(item)
+    ? 'strong'
+    : 'possible'
+}
+
+// conflictLine names the two authors when a row's files and folder disagree,
+// and is empty when they do not.
+export function conflictLine(item: AdoptionItem, t: TFunction): string {
+  const c = item.authorConflict
+  if (!c) return ''
+  return t('adoption.short.authorConflict', { files: c.files, folder: c.folder, defaultValue: 'Files say {{files}}, folder says {{folder}}' })
 }
 
 // shortHint is the row's one line: the fact, without the advice, which lives
 // in the tooltip and the editor.
 export function shortHint(item: AdoptionItem, t: TFunction): string {
+  // Too small to be a book says the one thing that matters about the row,
+  // whatever its files and folder say about the author (#2944).
+  if (item.reason === 'too_small') return t('adoption.short.tooSmall', 'Too small to be a book')
+  if (item.authorConflict) return conflictLine(item, t)
   const author = item.parsedAuthor || item.authorFolder
   switch (item.reason) {
     case 'author_not_in_library':

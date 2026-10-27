@@ -75,9 +75,18 @@ func New(host string, port int, password, urlBase string, useSSL bool) *Client {
 	}
 	jar, _ := cookiejar.New(nil)
 	return &Client{
-		baseURL:        fmt.Sprintf("%s://%s%s", scheme, clienthost.Authority(host, port), urlbase.Normalize(urlBase)),
-		password:       password,
-		http:           &http.Client{Timeout: 15 * time.Second, Jar: jar},
+		baseURL:  fmt.Sprintf("%s://%s%s", scheme, clienthost.Authority(host, port), urlbase.Normalize(urlBase)),
+		password: password,
+		// Control client: dialled directly (never via BINDERY_OUTBOUND_PROXY),
+		// with the dial and every redirect hop checked so a redirect or a
+		// rebound hostname cannot reach a link-local or metadata address. The
+		// cookie jar keeps the web UI session.
+		http: &http.Client{
+			Timeout:       15 * time.Second,
+			Jar:           jar,
+			Transport:     httpsec.DirectGuardedTransport(httpsec.PolicyService),
+			CheckRedirect: httpsec.RedirectGuard(httpsec.PolicyService),
+		},
 		fetchTransport: httpsec.GuardedTransport(httpsec.DownloadFetchPolicy()),
 	}
 }
@@ -276,8 +285,14 @@ func (c *Client) AddTorrent(ctx context.Context, magnetOrURL, label string, seed
 	}
 
 	if label != "" {
-		// Label plugin is optional; ignore errors if it is not loaded.
-		_ = c.setLabel(ctx, hash, label)
+		// The torrent is already added, so a label that does not apply must
+		// not fail the grab, but it does change where a label move path puts
+		// the files, so it is logged rather than discarded (#2665). The usual
+		// causes are the Label plugin being off or the label not existing.
+		if err := c.setLabel(ctx, hash, label); err != nil {
+			slog.Warn("deluge: torrent added but its label was not applied; check the Label plugin is on and the label exists in Deluge",
+				"hash", hash, "label", LabelID(label), "error", err)
+		}
 	}
 
 	// Apply the per-indexer seed-ratio override. Skipped for nil (no override)
@@ -397,7 +412,7 @@ func (c *Client) hasTorrent(ctx context.Context, hash string) (bool, error) {
 func (c *Client) addTorrentFile(ctx context.Context, torrentURL string) (hash string, magnetURL string, err error) {
 	fetched, err := c.fetchTorrentContent(ctx, torrentURL)
 	if err != nil {
-		return "", "", fmt.Errorf("fetch torrent: %w", err)
+		return "", "", fmt.Errorf("fetch torrent: %w", httpsec.RedactURLError(err))
 	}
 	if fetched.magnetURL != "" {
 		return "", fetched.magnetURL, nil
@@ -451,11 +466,11 @@ func (c *Client) fetchTorrentContent(ctx context.Context, rawURL string) (*fetch
 
 	for redirects := 0; redirects <= 5; redirects++ {
 		if err := c.validateTorrentFetchURL(current); err != nil {
-			return nil, err
+			return nil, httpsec.RedactURLError(err)
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, current, nil)
 		if err != nil {
-			return nil, fmt.Errorf("build torrent fetch request: %w", err)
+			return nil, fmt.Errorf("build torrent fetch request: %w", httpsec.RedactURLError(err))
 		}
 		req.Header.Set("Accept", "application/x-bittorrent")
 		req.Header.Set("User-Agent", useragent.Get())
@@ -481,7 +496,7 @@ func (c *Client) fetchTorrentContent(ctx context.Context, rawURL string) (*fetch
 			}
 			next, err := req.URL.Parse(location)
 			if err != nil {
-				return nil, fmt.Errorf("invalid redirect location: %w", err)
+				return nil, fmt.Errorf("invalid redirect location: %w", httpsec.RedactURLError(err))
 			}
 			if next.Scheme != "http" && next.Scheme != "https" {
 				return nil, fmt.Errorf("unsupported redirect scheme %q", next.Scheme)
@@ -525,11 +540,11 @@ func readLimited(r io.Reader, maxBytes int64) ([]byte, error) {
 	return data, nil
 }
 
-// setLabel applies a label to a torrent via the Deluge label plugin.
-// Errors are intentionally swallowed by the caller — the plugin is optional.
+// setLabel applies a label to a torrent via the Deluge label plugin, sending
+// it as LabelID so a category typed with capitals still matches.
 func (c *Client) setLabel(ctx context.Context, hash, label string) error {
 	var result any
-	return c.call(ctx, true, "label.set_torrent", []any{hash, label}, &result)
+	return c.call(ctx, true, "label.set_torrent", []any{hash, LabelID(label)}, &result)
 }
 
 // GetTorrents returns status for all torrents, keyed by lower-cased hash.

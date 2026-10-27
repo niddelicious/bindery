@@ -34,6 +34,12 @@ const (
 	// candidateThreshold is the lowest title similarity offered as a
 	// suggestion. The reconcile itself needs 0.85; below that a person decides.
 	candidateThreshold = 0.60
+	// differentWorkSuggestionFloor is the score from which a suggestion that
+	// names a different work is dropped. It is the reconcile's own 0.85 gate:
+	// a title this close is one the scan would have claimed but for the
+	// different-work check, and the UI treats the top of this range as a one
+	// click match.
+	differentWorkSuggestionFloor = 0.85
 	// maxCandidates is how many suggestions a unit keeps.
 	maxCandidates = 3
 )
@@ -55,6 +61,28 @@ func (s *Scanner) WithUnmatchedUnits(store UnmatchedUnitStore) *Scanner {
 // page's scan status.
 func (s *Scanner) ScanRunning() bool {
 	return s.scanRunning.Load()
+}
+
+// RootFormat names the format the scanned root holds, so the adoption list
+// can say when a row sits in the other format's folder (#2944): an ebook
+// under the audiobooks root is not where Bindery keeps ebooks. It names the
+// root the row was recorded under (the longest scanned root containing it),
+// which is a label only; it makes no claim about what the reconcile would
+// accept, since an audiobook root nested inside the library is also under
+// the ebook root. With one combined root
+// (BINDERY_AUDIOBOOK_DIR unset, or the same folder as the library) either
+// format belongs anywhere and the answer is "". An unknown root is "" too.
+func (s *Scanner) RootFormat(root string) string {
+	if root == "" || s.audiobookDir == "" || filepath.Clean(s.audiobookDir) == filepath.Clean(s.libraryDir) {
+		return ""
+	}
+	switch filepath.Clean(root) {
+	case filepath.Clean(s.audiobookDir):
+		return models.MediaTypeAudiobook
+	case filepath.Clean(s.libraryDir):
+		return models.MediaTypeEbook
+	}
+	return ""
 }
 
 // walkedFile is what the library walk already knew about a file (P2): its
@@ -79,6 +107,9 @@ type unmatchedScanFile struct {
 	// layoutTitle is the cleaned book folder name, "" when the file has
 	// none. Candidate ranking reads the volume number from it (#2860).
 	layoutTitle string
+	// tags are the file's audio tags as read, zero for a file without them.
+	// Evidence for evidenceFor (#2942).
+	tags AudioTags
 }
 
 // unmatchedCollector gathers unmatched files up to maxUnmatchedFiles.
@@ -96,10 +127,12 @@ func (c *unmatchedCollector) add(f unmatchedScanFile) {
 }
 
 // unmatchedGroup is one unit before candidates are ranked: the stored shape
-// plus the member whose parse speaks for the unit.
+// plus the member whose parse speaks for the unit, and what its files say
+// against its author folder.
 type unmatchedGroup struct {
-	unit db.UnmatchedUnitScan
-	rep  unmatchedScanFile
+	unit     db.UnmatchedUnitScan
+	rep      unmatchedScanFile
+	evidence unitEvidence
 }
 
 // scanRootFor returns the longest root that contains path, or "".
@@ -151,7 +184,12 @@ func discSetChecker(roots []string) func(folder string) bool {
 				isRoot = true
 			}
 		}
-		if !isRoot && scanRootFor(folder, roots) != "" {
+		if root := scanRootFor(folder, roots); !isRoot && root != "" {
+			// A disc named after its book counts only in a book folder,
+			// <root>/<Author>/<Book>: one level down the folder is the
+			// author's, shared with every other book (#3327).
+			rel, _ := filepath.Rel(root, folder)
+			titledOK := strings.Contains(rel, string(filepath.Separator))
 			if entries, err := os.ReadDir(folder); err == nil {
 				var discs []string
 				names := true
@@ -164,9 +202,9 @@ func discSetChecker(roots []string) func(folder string) bool {
 						continue
 					}
 					discs = append(discs, dir)
-					names = names && discSetNameRe.MatchString(e.Name())
+					names = names && (discSetNameRe.MatchString(e.Name()) || titledOK && isTitledDisc(e.Name(), filepath.Base(folder)))
 				}
-				result = names && AllDiscFolders(discs)
+				result = names && AllDiscFolders(discs, titledOK)
 			}
 		}
 		cache[folder] = result
@@ -183,16 +221,21 @@ func discSetChecker(roots []string) func(folder string) bool {
 //   - loose audio directly in a library root has no book folder, so each file
 //     stands alone, as in the folder import scan;
 //   - ebooks group by folder and file stem, so Title.epub and Title.mobi are
-//     one book in two formats.
+//     one book in two formats;
+//   - a file too small to be a book stands alone, so a 1 KB Title.txt does
+//     not ride along in Title.epub's row and get adopted with it (#2944).
 //
 // It returns the grouping key, and for a folder unit the folder path.
 func unitKeyFor(f unmatchedScanFile, root string, isDiscSet func(string) bool) (key, folder string) {
+	if f.reason == unmatchedReasonTooSmall {
+		return "file\x00" + f.path, ""
+	}
 	parent := filepath.Dir(f.path)
 	if f.format == models.MediaTypeAudiobook {
 		if parent == root {
 			return "file\x00" + f.path, ""
 		}
-		if discSetNameRe.MatchString(filepath.Base(parent)) && isDiscSet(filepath.Dir(parent)) {
+		if isDiscSetName(filepath.Base(parent), filepath.Base(filepath.Dir(parent))) && isDiscSet(filepath.Dir(parent)) {
 			parent = filepath.Dir(parent)
 		}
 		return "folder\x00" + parent, parent
@@ -263,7 +306,16 @@ func groupUnmatched(files []unmatchedScanFile, roots []string) (groups []unmatch
 			rep.layoutTitle = rep.title
 		}
 		u.ParsedTitle, u.ParsedAuthor, u.Reason = rep.title, rep.author, rep.reason
-		groups = append(groups, unmatchedGroup{unit: u, rep: rep})
+		// Files that name another author than their folder are recorded as
+		// what they name, and FilesAuthor tells the adoption page (#2942).
+		ev := evidenceFor(a.members, u.AuthorFolder, rep.layoutTitle)
+		if ev.conflict() {
+			u.ParsedAuthor, u.FilesAuthor = ev.author, ev.author
+			if ev.title != "" {
+				u.ParsedTitle = ev.title
+			}
+		}
+		groups = append(groups, unmatchedGroup{unit: u, rep: rep, evidence: ev})
 	}
 	sort.Slice(groups, func(i, j int) bool { return groups[i].unit.UnitPath < groups[j].unit.UnitPath })
 	if len(groups) > maxUnmatchedUnits {
@@ -332,24 +384,55 @@ func eligibleUnmatched(files []unmatchedScanFile, roots []string) []unmatchedSca
 	return out
 }
 
+// suggestionCatalogue indexes every book the scan loaded by author, for
+// suggestions only. The reconcile's own candidates (wanted) are marked so a
+// tie goes to the book still waiting for a file; they are taken from the set
+// the scan already built rather than asking isReconcileCandidate again, which
+// stats files on disk.
+func suggestionCatalogue(books []models.Book, wanted []scanBook) ([]scanBook, map[int64][]int) {
+	reconcilable := make(map[int64]bool, len(wanted))
+	for i := range wanted {
+		reconcilable[wanted[i].book.ID] = true
+	}
+	out := make([]scanBook, 0, len(books))
+	byAuthor := make(map[int64][]int)
+	for i := range books {
+		b := &books[i]
+		byAuthor[b.AuthorID] = append(byAuthor[b.AuthorID], len(out))
+		out = append(out, newScanBook(b, reconcilable[b.ID]))
+	}
+	return out, byAuthor
+}
+
 // rankCandidates returns up to maxCandidates catalogue books whose title
 // scores at least candidateThreshold against normParsed, best first. It uses
-// the reconcile's own measure (Jaro-Winkler over normalizeTitle) and its own
-// candidate set: the books of the authors the file's author resolved to, or
-// every reconcile candidate when the file named no author. In that last case
-// titles of wildly different length are skipped, the same cheap gate the
-// reconcile uses. No provider is asked anything.
+// the reconcile's own measure (Jaro-Winkler over normalizeTitle). When the
+// file's author resolved, the candidates are every catalogue book of those
+// authors, whatever its status (#2879): the reconcile only claims books still
+// waiting for a file, but a person confirming a suggestion may well be
+// pointing an untracked copy at a book that is Skipped or already has one.
+// When the file named no author they are the reconcile's own candidates
+// (wanted), and titles of wildly different length are skipped, the same
+// cheap gate the reconcile uses; the whole library is too wide a net without
+// an author. No provider is asked anything.
+//
+// An exact title scores 1, so it ranks first; between equal scores a book the
+// reconcile could claim goes ahead of one that already has its files.
 //
 // A book that is provably another volume of the same series is never
 // suggested, by the same rule the reconcile applies (libraryVolumeConflict):
 // volume 1's folder scores 0.983 against a wanted volume 17, and offering it
 // as the top suggestion would invite the user to adopt it there (#2860).
-func rankCandidates(title, layoutTitle string, wanted []scanBook, byAuthor map[int64][]int, authorSet map[int64]bool) []db.UnmatchedCandidate {
+func rankCandidates(title, layoutTitle string, wanted, catalogue []scanBook, catalogueByAuthor map[int64][]int, authorSet map[int64]bool) []db.UnmatchedCandidate {
 	normParsed := normalizeTitle(title)
 	if normParsed == "" {
 		return nil
 	}
-	var out []db.UnmatchedCandidate
+	type scored struct {
+		db.UnmatchedCandidate
+		reconcilable bool
+	}
+	var out []scored
 	consider := func(sb *scanBook) {
 		score := textutil.JaroWinkler(sb.normTitle, normParsed)
 		if score < candidateThreshold {
@@ -358,7 +441,19 @@ func rankCandidates(title, layoutTitle string, wanted []scanBook, byAuthor map[i
 		if libraryVolumeConflict(title, layoutTitle, sb.book.Title) {
 			return
 		}
-		out = append(out, db.UnmatchedCandidate{BookID: sb.book.ID, Score: score})
+		// A title that scores as high as the scan's own gate yet has words of
+		// its own that the file lacks, and the reverse, is another work:
+		// Order of the Phoenix at 0.929 for the Deathly Hallows folder cleared
+		// the one click Confirm threshold in the UI (#3388). Below the gate a
+		// suggestion is a loose guess that a person judges ("A Martyrs Tale"
+		// beside "The Martian"), and different words are what it looks like,
+		// so only the high scorers are dropped. The book folder's title may
+		// name the candidate where the file's does not, so both are asked.
+		if score >= differentWorkSuggestionFloor && titlesNameDifferentWorks(title, sb.book.Title) &&
+			(layoutTitle == "" || titlesNameDifferentWorks(layoutTitle, sb.book.Title)) {
+			return
+		}
+		out = append(out, scored{db.UnmatchedCandidate{BookID: sb.book.ID, Score: score}, sb.reconcilable})
 	}
 	if authorSet == nil {
 		for i := range wanted {
@@ -378,16 +473,20 @@ func rankCandidates(title, layoutTitle string, wanted []scanBook, byAuthor map[i
 		}
 		slices.Sort(ids)
 		for _, id := range ids {
-			for _, idx := range byAuthor[id] {
-				consider(&wanted[idx])
+			for _, idx := range catalogueByAuthor[id] {
+				consider(&catalogue[idx])
 			}
 		}
 	}
-	slices.SortStableFunc(out, func(a, b db.UnmatchedCandidate) int {
+	slices.SortStableFunc(out, func(a, b scored) int {
 		switch {
 		case a.Score > b.Score:
 			return -1
 		case a.Score < b.Score:
+			return 1
+		case a.reconcilable && !b.reconcilable:
+			return -1
+		case b.reconcilable && !a.reconcilable:
 			return 1
 		}
 		return 0
@@ -395,7 +494,14 @@ func rankCandidates(title, layoutTitle string, wanted []scanBook, byAuthor map[i
 	if len(out) > maxCandidates {
 		out = out[:maxCandidates]
 	}
-	return out
+	if len(out) == 0 {
+		return nil
+	}
+	res := make([]db.UnmatchedCandidate, len(out))
+	for i := range out {
+		res[i] = out[i].UnmatchedCandidate
+	}
+	return res
 }
 
 // unitCounts is what the scan result blob reports about stored units.
@@ -406,9 +512,11 @@ type unitCounts struct {
 }
 
 // recordUnmatchedUnits groups a finished scan's unmatched files and stores
-// them. candidatesFor ranks suggestions for one unit's representative parse.
+// them. candidatesFor ranks suggestions for one unit's representative parse
+// and its files' evidence, and returns the unit's reason when the evidence
+// changes it ("" keeps the representative's).
 func (s *Scanner) recordUnmatchedUnits(ctx context.Context, c *unmatchedCollector, roots, rootsWithFiles []string, startedAt time.Time,
-	candidatesFor func(title, layoutTitle, author, layoutAuthor string) []db.UnmatchedCandidate) unitCounts {
+	candidatesFor func(rep unmatchedScanFile, ev unitEvidence) ([]db.UnmatchedCandidate, string)) unitCounts {
 	if s.unmatchedUnits == nil {
 		return unitCounts{}
 	}
@@ -416,7 +524,16 @@ func (s *Scanner) recordUnmatchedUnits(ctx context.Context, c *unmatchedCollecto
 	units := make([]db.UnmatchedUnitScan, len(groups))
 	for i, g := range groups {
 		units[i] = g.unit
-		units[i].Candidates = candidatesFor(g.rep.title, g.rep.layoutTitle, g.rep.author, g.rep.layoutAuthor)
+		// Nothing is suggested for a file too small to be a book: a
+		// suggestion is an invitation to adopt it, and its reason stays
+		// too_small whatever the evidence says (#2944).
+		if g.rep.reason != unmatchedReasonTooSmall {
+			var reason string
+			units[i].Candidates, reason = candidatesFor(g.rep, g.evidence)
+			if reason != "" {
+				units[i].Reason = reason
+			}
+		}
 	}
 	truncated := c.truncated || unitsTruncated
 	// A truncated scan did not see every unit, so it removes and purges

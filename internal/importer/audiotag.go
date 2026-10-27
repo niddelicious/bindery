@@ -1,17 +1,23 @@
 package importer
 
 import (
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/dhowden/tag"
 )
 
 // audioTagExtensions lists audio formats whose embedded tags we try to read
-// during library scans. Extensions outside this set are skipped — the scan
+// during library scans. It is a subset of models.IsAudioPath on purpose: the
+// tag library cannot read .aac, so listing it would only pay the open cost for
+// nothing. Extensions outside this set are skipped — the scan
 // falls back to filename parsing without paying the open/seek cost.
 var audioTagExtensions = map[string]bool{
 	".mp3": true, ".m4a": true, ".m4b": true,
@@ -24,6 +30,24 @@ type AudioTags struct {
 	Title  string
 	Author string
 	ASIN   string
+	// Album is the album tag, which audiobook rips set to the book's title
+	// while the title tag names the track. Library adoption reads it as
+	// evidence of the book when the folder names someone else's (#2942).
+	Album string
+	// Artist, AlbumArtist and Composer are the three author tags as read,
+	// before pickAudioAuthor chooses one. A narrator often sits in Artist
+	// with the author in AlbumArtist, so whether the files name another
+	// author than their folder is decided on all three (#2942).
+	Artist      string
+	AlbumArtist string
+	Composer    string
+	// Language holds the language values the file's tags declare, as written
+	// ("eng", "es-MX", "Spanish"), joined with "/" (a string, not a slice, so
+	// AudioTags stays comparable): an ID3 TLAN frame, a TXXX LANGUAGE frame, an
+	// MP4 freeform LANGUAGE atom or a Vorbis/FLAC/Opus LANGUAGE comment. Empty
+	// for the many files that declare none. The post-download language check
+	// reads it (language_enforcement_audio.go).
+	Language string
 }
 
 // IsAudioTagFile reports whether path has an extension we attempt to read
@@ -44,16 +68,75 @@ func ReadAudioTags(path string) (AudioTags, error) {
 	return readAudioTagsFrom(f)
 }
 
+// errAudioTagReaderPanicked reports a file the tag library panicked on.
+var errAudioTagReaderPanicked = errors.New("audio tags: tag reader failed on malformed data")
+
 func readAudioTagsFrom(r io.ReadSeeker) (AudioTags, error) {
-	m, err := tag.ReadFrom(r)
+	if err := checkAudioTagClaims(r); err != nil {
+		return AudioTags{}, err
+	}
+	m, err := readLibraryTags(r)
 	if err != nil {
 		return AudioTags{}, err
 	}
 	return AudioTags{
-		Title:  strings.TrimSpace(m.Title()),
+		Title:  strings.TrimSpace(m.title),
 		Author: pickAudioAuthor(m),
-		ASIN:   pickAudioASIN(m.Raw()),
+		ASIN:   pickAudioASIN(m.raw),
+		Album:  strings.TrimSpace(m.album),
+
+		Artist:      strings.TrimSpace(m.artist),
+		AlbumArtist: strings.TrimSpace(m.albumArtist),
+		Composer:    strings.TrimSpace(m.composer),
+		Language:    strings.Join(pickAudioLanguages(m.raw), "/"),
 	}, nil
+}
+
+// libraryTags is what readAudioTagsFrom needs from the tag library, copied
+// out while the library's panics are contained.
+type libraryTags struct {
+	title, album, artist, albumArtist, composer string
+	raw                                         map[string]any
+}
+
+func (t libraryTags) Artist() string      { return t.artist }
+func (t libraryTags) AlbumArtist() string { return t.albumArtist }
+func (t libraryTags) Composer() string    { return t.composer }
+
+// readLibraryTags runs github.com/dhowden/tag and its accessors and nothing
+// else. The library can panic on hostile data after parsing it: it stores an
+// MP4 atom by the data class the file declares, and accessors such as
+// Artist() and Title() then assert a string, so an artist atom typed as a
+// number panics. A panic here becomes errAudioTagReaderPanicked, which the
+// scan logs at WARN with the path before falling back to the filename, rather
+// than ending the whole scan. The stack is dropped, since it only points into
+// the library; Bindery's own code runs outside this recover, so a bug there
+// still surfaces with its stack.
+func readLibraryTags(r io.ReadSeeker) (t libraryTags, err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			t, err = libraryTags{}, fmt.Errorf("%w: %v", errAudioTagReaderPanicked, rec)
+		}
+	}()
+	m, err := tag.ReadFrom(r)
+	if err != nil {
+		return libraryTags{}, err
+	}
+	return libraryTags{
+		title:       m.Title(),
+		album:       m.Album(),
+		artist:      m.Artist(),
+		albumArtist: m.AlbumArtist(),
+		composer:    m.Composer(),
+		raw:         m.Raw(),
+	}, nil
+}
+
+// audioAuthorFields is the part of tag.Metadata that pickAudioAuthor reads.
+type audioAuthorFields interface {
+	Artist() string
+	AlbumArtist() string
+	Composer() string
 }
 
 // narratorCreditRe matches the leading "Read by" / "Narrated by" credit that
@@ -133,7 +216,7 @@ func contributorCandidates(s string) []string {
 // ("Read by …") are skipped rather than returned as the author (#1239); when
 // every candidate is empty or a narrator credit, the caller keeps whatever the
 // folder hierarchy resolved instead.
-func pickAudioAuthor(m tag.Metadata) string {
+func pickAudioAuthor(m audioAuthorFields) string {
 	for _, candidate := range []string{m.Artist(), m.AlbumArtist(), m.Composer()} {
 		s := strings.TrimSpace(candidate)
 		if s == "" || isNarratorCredit(s) {
@@ -192,4 +275,52 @@ func isASIN(s string) bool {
 		}
 	}
 	return true
+}
+
+// pickAudioLanguages returns the language values declared in a raw tag map.
+//
+// The keys the tag library produces: ID3v2 text frames keep their frame id
+// ("TLAN", or "TLA" in v2.2, with a "_0" style suffix for duplicates); a TXXX
+// user text frame is a *tag.Comm whose Description names it; an MP4 freeform
+// atom surfaces under its sub-atom name (iTunes writes "LANGUAGE"); a Vorbis
+// comment key is lower cased ("language"). The MP4 "\xa9lan" atom is not read
+// by the library, so a file that carries only that has no language here. A
+// value may list several languages, separated by "/", ",", ";", "|" or NUL.
+func pickAudioLanguages(raw map[string]any) []string {
+	if raw == nil {
+		return nil
+	}
+	keys := make([]string, 0, len(raw))
+	for k := range raw {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var out []string
+	for _, k := range keys {
+		base := k
+		if i := strings.LastIndex(base, "_"); i > 0 {
+			if _, err := strconv.Atoi(base[i+1:]); err == nil {
+				base = base[:i]
+			}
+		}
+		var val string
+		switch {
+		case strings.EqualFold(base, "TLAN"), strings.EqualFold(base, "TLA"), strings.EqualFold(base, "LANGUAGE"):
+			if s, ok := raw[k].(string); ok {
+				val = s
+			}
+		case strings.EqualFold(base, "TXXX"), strings.EqualFold(base, "TXX"):
+			if c, ok := raw[k].(*tag.Comm); ok && strings.EqualFold(strings.TrimSpace(c.Description), "LANGUAGE") {
+				val = c.Text
+			}
+		}
+		for _, part := range strings.FieldsFunc(val, func(r rune) bool {
+			return r == '/' || r == ',' || r == ';' || r == '|' || r == 0
+		}) {
+			if part = strings.TrimSpace(part); part != "" {
+				out = append(out, part)
+			}
+		}
+	}
+	return out
 }

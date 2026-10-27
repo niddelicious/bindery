@@ -102,11 +102,15 @@ func BuildProfile(
 	}
 	totalUniqueGenres := len(genreDocCount)
 
-	// Compute TF-IDF genre weights.
+	// Compute TF-IDF genre weights, with the books as the documents. The IDF
+	// divided by the number of distinct genres, so any genre on more books
+	// than there are genres, the library's main genre most of all, weighed
+	// negatively and dropped out of the top genres (#3172). Over the books it
+	// is never negative, and still discounts a genre on nearly every book.
 	if p.TotalBooks > 0 && totalUniqueGenres > 0 {
 		for genre, docCount := range genreDocCount {
 			tf := float64(docCount) / float64(p.TotalBooks)
-			idf := math.Log(float64(totalUniqueGenres) / float64(docCount))
+			idf := math.Log(float64(p.TotalBooks) / float64(docCount))
 			p.GenreWeights[genre] = tf * idf
 		}
 	}

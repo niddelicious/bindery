@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -27,7 +28,14 @@ import (
 var (
 	errBulkAuthorNotOwned = fmt.Errorf("author not found")
 	errBulkBookNotOwned   = fmt.Errorf("book not found")
+	// errBulkBookHasFiles is a skipped "exclude" with expectNoFiles: the
+	// book gained a file after the caller decided it was an empty row (#2999).
+	errBulkBookHasFiles = fmt.Errorf("book has files; not excluded")
 )
+
+// bookHasFilesCode is the bulkItemResult code for errBulkBookHasFiles, so the
+// duplicate review can say which rows it skipped.
+const bookHasFilesCode = "has_files"
 
 // bulkSearchConcurrency caps how many indexer searches a single bulk
 // action can fan out at once. Sized to a small fixed number rather than
@@ -172,6 +180,55 @@ type bulkItemResult struct {
 	// setting to change. Omitted for ordinary per-ID failures, whose text is
 	// already the whole story.
 	Code string `json:"code,omitempty"`
+	// Queued is true when this ID handed at least one book to the search
+	// pool AND that search will run: a searcher is wired, automatic grabbing
+	// is on, and the book still needs a format. The pool runs after the
+	// response is written, so ok:true on a search only ever meant
+	// "accepted"; queued says a search is on its way. The outcome of each
+	// search is in the "book search finished" log line, in History when
+	// something was grabbed, and in GET /search/last-debug (#2154).
+	//
+	// The scheduler's other skip, an unmonitored author (#2742), applies only
+	// to automatic origins, and the bulk fan out is tagged OriginBulk, which
+	// is not one, so it cannot suppress a search queued here.
+	Queued bool `json:"queued,omitempty"`
+	// SearchSkipped is set on an ok entry whose action would have searched
+	// but will not, naming why: one of the searchSkip* constants. Absent when
+	// the action never searches (unmonitor, delete and so on).
+	SearchSkipped string `json:"searchSkipped,omitempty"`
+}
+
+// Reasons a bulk action that searches did not queue a search for an ID
+// (bulkItemResult.SearchSkipped).
+const (
+	// searchSkipNoFormatNeeded: every format the book wants is on disk, so
+	// SearchAndGrabBook would return before asking any indexer.
+	searchSkipNoFormatNeeded = "no_format_needed"
+	// searchSkipNothingWanted: an author search found no monitored wanted
+	// book that still needs a format.
+	searchSkipNothingWanted = "nothing_wanted"
+	// searchSkipAutoGrabDisabled: a monitor that made a book searchable while
+	// automatic grabbing is off. The monitor itself succeeded, so this is a
+	// skip on an ok entry, not the refusal a "search" action gets (#2669).
+	searchSkipAutoGrabDisabled = "auto_grab_disabled"
+	// searchSkipNoSearcher: no searcher is wired, so nothing can search.
+	searchSkipNoSearcher = "no_searcher"
+)
+
+// bookSearchSkip reports why a search of book would not run, or "" when it
+// will. It mirrors what scheduler.SearchAndGrabBook checks before asking an
+// indexer: a needed format (neededFormats) and the auto grab switch.
+// autoGrabOn is passed in because it is read once per request.
+func (h *BulkHandler) bookSearchSkip(book *models.Book, autoGrabOn bool) string {
+	switch {
+	case h.searcher == nil:
+		return searchSkipNoSearcher
+	case !autoGrabOn:
+		return searchSkipAutoGrabDisabled
+	case !book.NeedsEbook() && !book.NeedsAudiobook():
+		return searchSkipNoFormatNeeded
+	}
+	return ""
 }
 
 // bulkResponse is the envelope returned by all three bulk endpoints.
@@ -300,6 +357,8 @@ func (h *BulkHandler) AuthorsBulk(w http.ResponseWriter, r *http.Request) {
 
 	for _, id := range req.IDs {
 		key := fmt.Sprintf("%d", id)
+		queued := false
+		skipped := ""
 		switch req.Action {
 		case "monitor":
 			if err := h.setAuthorMonitored(r.Context(), id, true, req.ApplyMonitorModeToExisting); err != nil {
@@ -353,11 +412,18 @@ func (h *BulkHandler) AuthorsBulk(w http.ResponseWriter, r *http.Request) {
 				resp.Results[key] = bulkItemResult{Error: err.Error()}
 				continue
 			}
-			if h.searcher != nil {
-				for _, b := range books {
-					if b.Status == models.BookStatusWanted && b.Monitored {
-						searchTargets = append(searchTargets, b)
-					}
+			// searchRefused already returned above, so the switch is on.
+			for i := range books {
+				b := books[i]
+				if b.Status == models.BookStatusWanted && b.Monitored && h.bookSearchSkip(&b, true) == "" {
+					searchTargets = append(searchTargets, b)
+					queued = true
+				}
+			}
+			if !queued {
+				skipped = searchSkipNothingWanted
+				if h.searcher == nil {
+					skipped = searchSkipNoSearcher
 				}
 			}
 		case "refresh":
@@ -384,7 +450,7 @@ func (h *BulkHandler) AuthorsBulk(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 		}
-		resp.Results[key] = bulkItemResult{OK: true}
+		resp.Results[key] = bulkItemResult{OK: true, Queued: queued, SearchSkipped: skipped}
 	}
 
 	if len(searchTargets) > 0 && h.searcher != nil {
@@ -443,19 +509,26 @@ func (h *BulkHandler) fanOutSearches(books []models.Book) {
 
 // BooksBulk handles POST /api/v1/book/bulk.
 //
-// Supported actions: "monitor", "unmonitor", "delete", "search", "set_media_type", "exclude".
+// Supported actions: "monitor", "unmonitor", "delete", "search", "set_media_type", "exclude", "unexclude".
 // For "set_media_type" the body must also include "mediaType":
 // "ebook"|"audiobook"|"both".
 // "exclude" sets the book's excluded flag to true so it disappears from author
 // lists and is blocked from re-import on the next OL sync — mirrors the
 // single-book PUT /book/:id/exclude path but skips the toggle semantics
-// (bulk callers always want exclude=true; un-excluding remains a per-book
-// affordance).
+// (bulk callers say which way they want it). "unexclude" clears the flag, so
+// a selection from the Excluded view can be put back in one request (#3454).
+//
+// "expectNoFiles": true makes "exclude" conditional (#2999): a book that has
+// any file by the time the request runs is skipped with code "has_files"
+// instead of excluded. The duplicate review sends it with the empty rows it
+// showed, so a row imported after the page loaded is never excluded on the
+// strength of a stale "no files". The check and the write are one statement.
 func (h *BulkHandler) BooksBulk(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		IDs       []int64 `json:"ids"`
-		Action    string  `json:"action"`
-		MediaType string  `json:"mediaType"`
+		IDs           []int64 `json:"ids"`
+		Action        string  `json:"action"`
+		MediaType     string  `json:"mediaType"`
+		ExpectNoFiles bool    `json:"expectNoFiles"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
@@ -467,7 +540,7 @@ func (h *BulkHandler) BooksBulk(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch req.Action {
-	case "monitor", "unmonitor", "delete", "search", "set_media_type", "exclude":
+	case "monitor", "unmonitor", "delete", "search", "set_media_type", "exclude", "unexclude":
 	default:
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unknown action: " + req.Action})
 		return
@@ -497,6 +570,8 @@ func (h *BulkHandler) BooksBulk(w http.ResponseWriter, r *http.Request) {
 
 	for _, id := range req.IDs {
 		key := fmt.Sprintf("%d", id)
+		queued := false
+		skipped := ""
 		var opErr error
 		switch req.Action {
 		case "monitor":
@@ -507,7 +582,10 @@ func (h *BulkHandler) BooksBulk(w http.ResponseWriter, r *http.Request) {
 			var becameSearchable bool
 			book, becameSearchable, opErr = h.setBookMonitored(r.Context(), id, true)
 			if opErr == nil && becameSearchable && book != nil {
-				searchTargets = append(searchTargets, *book)
+				if skipped = h.bookSearchSkip(book, autoGrabEnabled(r.Context(), h.settings)); skipped == "" {
+					searchTargets = append(searchTargets, *book)
+					queued = true
+				}
 			}
 		case "unmonitor":
 			_, _, opErr = h.setBookMonitored(r.Context(), id, false)
@@ -524,19 +602,31 @@ func (h *BulkHandler) BooksBulk(w http.ResponseWriter, r *http.Request) {
 				searchesRefused++
 				continue
 			}
-			if h.searcher != nil {
+			// searchRefused already returned above, so the switch is on.
+			if skipped = h.bookSearchSkip(book, true); skipped == "" {
 				searchTargets = append(searchTargets, *book)
+				queued = true
 			}
 		case "set_media_type":
 			opErr = h.setBookMediaType(r.Context(), id, req.MediaType)
 		case "exclude":
-			opErr = h.setBookExcluded(r.Context(), id, true)
+			if req.ExpectNoFiles {
+				opErr = h.excludeBookIfNoFiles(r.Context(), id)
+			} else {
+				opErr = h.setBookExcluded(r.Context(), id, true)
+			}
+		case "unexclude":
+			opErr = h.setBookExcluded(r.Context(), id, false)
+		}
+		if errors.Is(opErr, errBulkBookHasFiles) {
+			resp.Results[key] = bulkItemResult{Error: opErr.Error(), Code: bookHasFilesCode}
+			continue
 		}
 		if opErr != nil {
 			resp.Results[key] = bulkItemResult{Error: opErr.Error()}
 			continue
 		}
-		resp.Results[key] = bulkItemResult{OK: true}
+		resp.Results[key] = bulkItemResult{OK: true, Queued: queued, SearchSkipped: skipped}
 	}
 
 	if len(searchTargets) > 0 && h.searcher != nil {
@@ -594,6 +684,8 @@ func (h *BulkHandler) WantedBulk(w http.ResponseWriter, r *http.Request) {
 
 	for _, id := range req.IDs {
 		key := fmt.Sprintf("%d", id)
+		queued := false
+		skipped := ""
 		var opErr error
 		switch req.Action {
 		case "search":
@@ -607,8 +699,10 @@ func (h *BulkHandler) WantedBulk(w http.ResponseWriter, r *http.Request) {
 				searchesRefused++
 				continue
 			}
-			if h.searcher != nil {
+			// searchRefused already returned above, so the switch is on.
+			if skipped = h.bookSearchSkip(book, true); skipped == "" {
 				searchTargets = append(searchTargets, *book)
+				queued = true
 			}
 		case "unmonitor":
 			_, _, opErr = h.setBookMonitored(r.Context(), id, false)
@@ -619,7 +713,7 @@ func (h *BulkHandler) WantedBulk(w http.ResponseWriter, r *http.Request) {
 			resp.Results[key] = bulkItemResult{Error: opErr.Error()}
 			continue
 		}
-		resp.Results[key] = bulkItemResult{OK: true}
+		resp.Results[key] = bulkItemResult{OK: true, Queued: queued, SearchSkipped: skipped}
 	}
 
 	if len(searchTargets) > 0 && h.searcher != nil {
@@ -741,8 +835,8 @@ func (h *BulkHandler) setBookMonitored(ctx context.Context, id int64, monitored 
 
 // setBookExcluded flags a book as excluded so it is hidden from author/book
 // lists and skipped on subsequent OL refreshes. Unlike the toggle endpoint
-// at PUT /book/:id/exclude, this is a one-way set used by bulk callers; the
-// repo handles the timestamp update.
+// at PUT /book/:id/exclude, this sets the flag to the value asked for, so a
+// bulk call is the same when repeated; the repo handles the timestamp update.
 func (h *BulkHandler) setBookExcluded(ctx context.Context, id int64, excluded bool) error {
 	book, err := h.books.GetByID(ctx, id)
 	if err != nil {
@@ -752,6 +846,27 @@ func (h *BulkHandler) setBookExcluded(ctx context.Context, id int64, excluded bo
 		return errBulkBookNotOwned
 	}
 	return h.books.SetExcluded(ctx, id, excluded)
+}
+
+// excludeBookIfNoFiles is the expectNoFiles form of setBookExcluded: the
+// same ownership check, then an exclusion that only lands while the book has
+// no file (db.BookRepo.ExcludeIfNoFiles).
+func (h *BulkHandler) excludeBookIfNoFiles(ctx context.Context, id int64) error {
+	book, err := h.books.GetByID(ctx, id)
+	if err != nil {
+		return err
+	}
+	if book == nil || !auth.CheckOwnership(ctx, book.OwnerUserID) {
+		return errBulkBookNotOwned
+	}
+	excluded, err := h.books.ExcludeIfNoFiles(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !excluded {
+		return errBulkBookHasFiles
+	}
+	return nil
 }
 
 func (h *BulkHandler) setBookMediaType(ctx context.Context, id int64, mediaType string) error {

@@ -75,6 +75,16 @@ beforeEach(() => {
   vi.mocked(api.testDownloadClientConfig).mockResolvedValue({ message: 'Connection verified' })
 })
 
+// #3240: the edit form's labels name their fields.
+describe('download client edit form labels', () => {
+  it('names the fields by their labels', () => {
+    renderTab([makeClient()])
+    openEditForm()
+    expect(screen.getByLabelText('Name').tagName).toBe('INPUT')
+    expect(screen.getByLabelText('Client Type').tagName).toBe('SELECT')
+  })
+})
+
 describe('download client edit form credentials', () => {
   it('never seeds the credential field from the client', () => {
     renderTab([makeClient({ apiKeyConfigured: true })])
@@ -257,5 +267,84 @@ describe('download client diagnose', () => {
     renderTab([makeClient()])
     fireEvent.click(screen.getByRole('button', { name: 'settings.clients.diagnose.button' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('settings.clients.diagnose.failed')
+  })
+})
+
+describe('download client remove-on-import toggle', () => {
+  it('is hidden for a usenet client, which always clears its own history', () => {
+    renderTab([makeClient({ type: 'sabnzbd' })])
+    openEditForm()
+
+    expect(screen.queryByLabelText('settings.clients.removeOnImportLabel')).not.toBeInTheDocument()
+  })
+
+  it.each(['deluge', 'rtorrent'])('is hidden for %s, whose import path does not remove torrents', type => {
+    renderTab([makeClient({ type })])
+    openEditForm()
+
+    expect(screen.queryByLabelText('settings.clients.removeOnImportLabel')).not.toBeInTheDocument()
+  })
+
+  it('is shown for a torrent client and reflects the stored value', () => {
+    renderTab([makeClient({ type: 'transmission', removeOnImport: true })])
+    openEditForm()
+
+    const toggle = screen.getByLabelText('settings.clients.removeOnImportLabel') as HTMLInputElement
+    expect(toggle.checked).toBe(true)
+  })
+
+  it('defaults to off and sends the change on save', async () => {
+    renderTab([makeClient({ type: 'transmission' })])
+    openEditForm()
+
+    const toggle = screen.getByLabelText('settings.clients.removeOnImportLabel') as HTMLInputElement
+    expect(toggle.checked).toBe(false)
+    fireEvent.click(toggle)
+    save()
+
+    await waitFor(() => expect(api.updateDownloadClient).toHaveBeenCalled())
+    const [, payload] = vi.mocked(api.updateDownloadClient).mock.calls[0]
+    expect(payload.removeOnImport).toBe(true)
+  })
+
+  it('never sends it enabled for a usenet client', async () => {
+    renderTab([makeClient({ type: 'sabnzbd', removeOnImport: true })])
+    openEditForm()
+    save()
+
+    await waitFor(() => expect(api.updateDownloadClient).toHaveBeenCalled())
+    const [, payload] = vi.mocked(api.updateDownloadClient).mock.calls[0]
+    expect(payload.removeOnImport).toBe(false)
+  })
+})
+
+// Phones capitalised hosts and usernames, offered a QWERTY keyboard for the
+// port, and autofilled the saved Bindery login into the client credential.
+describe('download client form mobile keyboards', () => {
+  it('treats host and username as literal text, the port as digits and the credential as a key', () => {
+    renderTab([makeClient({ type: 'qbittorrent', apiKeyConfigured: false })])
+    openEditForm()
+
+    const host = screen.getByPlaceholderText('Host')
+    expect(host).toHaveAttribute('inputmode', 'url')
+    expect(host).toHaveAttribute('autocapitalize', 'none')
+    expect(host).toHaveAttribute('autocorrect', 'off')
+    expect(host).toHaveAttribute('spellcheck', 'false')
+    expect(host).not.toHaveAttribute('type', 'url')
+
+    const port = screen.getByPlaceholderText('Port')
+    expect(port).toHaveAttribute('inputmode', 'numeric')
+    expect(port).toHaveAttribute('pattern', '[0-9]*')
+
+    const username = screen.getByPlaceholderText('Username')
+    expect(username).toHaveAttribute('autocapitalize', 'none')
+    expect(username).toHaveAttribute('autocorrect', 'off')
+    expect(username).toHaveAttribute('spellcheck', 'false')
+
+    const credential = screen.getByPlaceholderText('Password')
+    expect(credential).toHaveAttribute('type', 'password')
+    expect(credential).toHaveAttribute('autocomplete', 'new-password')
+    expect(credential).toHaveAttribute('data-1p-ignore', 'true')
+    expect(credential).toHaveAttribute('data-lpignore', 'true')
   })
 })

@@ -49,7 +49,7 @@ func ImportReadarr(
 	if dbPath == "" {
 		return nil, errors.New("readarr db path is required")
 	}
-	src, err := sql.Open("sqlite", "file:"+dbPath+"?mode=ro&immutable=1")
+	src, err := sql.Open("sqlite", db.SQLiteFileURI(dbPath, "mode=ro&immutable=1"))
 	if err != nil {
 		return nil, fmt.Errorf("open readarr db: %w", err)
 	}
@@ -98,9 +98,15 @@ func importReadarrAuthors(ctx context.Context, src *sql.DB, repo *db.AuthorRepo,
 	defer rows.Close()
 
 	var newlyAdded []*models.Author
+	defer func() { dispatchCatalogueFetch(ctx, newlyAdded, onSearchOnAdd) }()
 	outage := &primaryOutage{}
+	known := newLibraryAuthors(repo)
 
 	for rows.Next() {
+		if err := agg.CheckQuota(ctx); err != nil {
+			res.fail("Hardcover", err.Error())
+			return err
+		}
 		var name string
 		var monitored bool
 		if err := rows.Scan(&name, &monitored); err != nil {
@@ -112,7 +118,11 @@ func importReadarrAuthors(ctx context.Context, src *sql.DB, repo *db.AuthorRepo,
 		}
 		res.Requested++
 
-		full := resolveAndCreateAuthor(ctx, "readarr", name, monitored, repo, settings, agg, outage, res)
+		full := resolveAndCreateAuthor(ctx, "readarr", name, monitored, repo, settings, agg, outage, known, res)
+		if err := agg.CheckQuota(ctx); err != nil {
+			res.fail(name, err.Error())
+			return err
+		}
 		if full == nil {
 			continue
 		}
@@ -133,7 +143,6 @@ func importReadarrAuthors(ctx context.Context, src *sql.DB, repo *db.AuthorRepo,
 	// authors already added before it — returning early here on rowsErr
 	// without dispatching first would silently leave those authors with
 	// empty catalogues.
-	dispatchCatalogueFetch(ctx, newlyAdded, onSearchOnAdd)
 	return rowsErr
 }
 

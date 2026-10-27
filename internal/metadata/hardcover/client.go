@@ -58,7 +58,8 @@ type Client struct {
 	// (aggregator, list syncer, import-list browse, the settings test
 	// button) all spending the same budget. Every copy below carries the
 	// pointer forward; TestThrottleSharedAcrossClientCopies guards that.
-	throttle *throttle
+	throttle   *throttle
+	dailyQuota *DailyQuota
 }
 
 // NormalizeAPIToken accepts either the raw token copied from Hardcover or an
@@ -91,7 +92,7 @@ func NormalizeAPIToken(value string) string {
 // New creates a new Hardcover client.
 func New() *Client {
 	return &Client{
-		http:     &http.Client{Timeout: 15 * time.Second, Transport: httpsec.DefaultProxyTransport()},
+		http:     &http.Client{Timeout: 15 * time.Second, Transport: httpsec.MetadataTransport()},
 		throttle: defaultThrottle,
 	}
 }
@@ -99,14 +100,14 @@ func New() *Client {
 // WithToken returns a copy of the client configured to use the given API token.
 // Required for authenticated queries such as GetUserWishlist.
 func (c *Client) WithToken(token string) *Client {
-	return &Client{http: c.http, token: token, throttle: c.pacer()}
+	return &Client{http: c.http, token: token, throttle: c.pacer(), dailyQuota: c.dailyQuota}
 }
 
 // WithTokenSource returns a copy of the client that resolves an API token
 // for each request. It is used for UI-managed credentials that can change
 // while the process is running.
 func (c *Client) WithTokenSource(source func(context.Context) string) *Client {
-	return &Client{http: c.http, token: c.token, tokenSource: source, throttle: c.pacer()}
+	return &Client{http: c.http, token: c.token, tokenSource: source, throttle: c.pacer(), dailyQuota: c.dailyQuota}
 }
 
 // NewAuthenticated creates a new client that sends Authorization: Bearer <token>
@@ -117,7 +118,7 @@ func NewAuthenticated(token string) *Client {
 		// the Hardcover list syncer and import-list browse (the callers of
 		// NewAuthenticated) dial hardcover.app directly while every other
 		// Hardcover call is proxied (#proxy-bypass).
-		http:     &http.Client{Timeout: 15 * time.Second, Transport: httpsec.DefaultProxyTransport()},
+		http:     &http.Client{Timeout: 15 * time.Second, Transport: httpsec.MetadataTransport()},
 		token:    token,
 		throttle: defaultThrottle,
 	}
@@ -348,7 +349,8 @@ func (c *Client) GetAuthorWorks(ctx context.Context, authorForeignID string) ([]
 }
 
 // GetAuthorWorkLanguageEvidence resolves language-filter evidence in one
-// bounded GraphQL query for the whole author catalogue. It asks only whether
+// bounded GraphQL query for the whole author catalogue, two when some works
+// are named by numeric id (see fetchWorkEditions). It asks only whether
 // each Hardcover work has an edition in one of the profile's allowed
 // languages and uses distinct_on(book_id), so the response contains at most
 // one small row per work. The explicit limit equals the unique requested work
@@ -395,40 +397,16 @@ func (c *Client) GetAuthorWorkLanguageEvidence(ctx context.Context, books []mode
 		return nil, metadata.ErrProviderNotConfigured
 	}
 
-	const gql = `query GetAuthorWorkLanguageEvidence($slugs: [String!]!, $bookIds: [Int!]!, $languageCodes: [String!]!, $limit: Int!) {
-		editions(
-			where: {
-				_and: [
-					{_or: [{book: {slug: {_in: $slugs}}}, {book_id: {_in: $bookIds}}]},
-					{language: {_or: [{code2: {_in: $languageCodes}}, {code3: {_in: $languageCodes}}]}}
-				]
-			},
-			distinct_on: [book_id],
-			order_by: [{book_id: asc}, {id: asc}],
-			limit: $limit
-		) {
-			book { id slug }
-			language { code2 code3 language }
-		}
-	}`
-	var resp struct {
-		Data struct {
-			Editions []struct {
-				Book     hcBookRef   `json:"book"`
-				Language *hcLanguage `json:"language"`
-			} `json:"editions"`
-		} `json:"data"`
-	}
-	if err := c.query(ctx, gql, map[string]any{
-		"slugs":         slugs,
-		"bookIds":       bookIDs,
-		"languageCodes": models.LanguageCodeVariants(allowed),
-		"limit":         len(evidence),
-	}, &resp); err != nil {
+	editions, err := c.fetchWorkEditions(ctx, "GetAuthorWorkLanguageEvidence",
+		"$languageCodes: [String!]!",
+		"{language: {_or: [{code2: {_in: $languageCodes}}, {code3: {_in: $languageCodes}}]}}",
+		map[string]any{"languageCodes": models.LanguageCodeVariants(allowed)},
+		slugs, bookIDs)
+	if err != nil {
 		return nil, fmt.Errorf("hardcover get author work language evidence: %w", err)
 	}
 
-	// A successful, explicitly bounded distinct query proves absence of an allowed
+	// Successful, explicitly bounded distinct queries prove absence of an allowed
 	// edition. Preserve the default edition only as known non-allowed evidence;
 	// it never gets to overrule a matching edition returned below.
 	for _, book := range books {
@@ -446,7 +424,7 @@ func (c *Client) GetAuthorWorkLanguageEvidence(ctx context.Context, books []mode
 			evidence[key] = metadata.AuthorWorkLanguageEvidence{State: metadata.AuthorWorkLanguageNotAllowed, Language: language}
 		}
 	}
-	for _, edition := range resp.Data.Editions {
+	for _, edition := range editions {
 		key := edition.Book.foreignID()
 		if _, ok := evidence[key]; !ok {
 			continue
@@ -457,7 +435,157 @@ func (c *Client) GetAuthorWorkLanguageEvidence(ctx context.Context, books []mode
 		}
 		evidence[key] = metadata.AuthorWorkLanguageEvidence{State: metadata.AuthorWorkLanguageAllowed, Language: language}
 	}
+	c.resolveBlankWorkLanguages(ctx, books, allowed, evidence)
 	return evidence, nil
+}
+
+// hcWorkEdition is one row of fetchWorkEditions: a work and the language of
+// the one edition kept for it.
+type hcWorkEdition struct {
+	Book     hcBookRef   `json:"book"`
+	Language *hcLanguage `json:"language"`
+}
+
+// fetchWorkEditions returns, for the works named by slugs and by numeric book
+// ids, the editions that pass editionFilter, at most one per work:
+// distinct_on(book_id) keeps the first by edition id. filterVarDecls declares
+// the variables editionFilter uses, and filterVars carries their values.
+//
+// The slugs and the book ids go out as separate queries and their rows are
+// merged, never joined in one _or. Hardcover cannot serve an _or between the
+// book.slug relationship and the book_id column from an index, so that query
+// ran until Hardcover cancelled it with HTTP 408 after about 15 s, for every
+// author, while either predicate alone answers in under a second (#3333).
+// Book ids are filled only for numeric slugs, so this is normally the slug
+// query alone. Each query declares only the variables it uses, because
+// Hasura refuses any other with validation-failed.
+//
+// Each query is bounded by the number of works it names. Any failure returns
+// an error and no rows: callers read a successful result as proof that a work
+// it leaves out has no such edition, which holds only if every query
+// succeeded.
+func (c *Client) fetchWorkEditions(ctx context.Context, name, filterVarDecls, editionFilter string, filterVars map[string]any, slugs []string, bookIDs []int) ([]hcWorkEdition, error) {
+	lookups := []struct {
+		predicate, varDecl, varName string
+		values                      any
+		count                       int
+	}{
+		{"{book: {slug: {_in: $slugs}}}", "$slugs: [String!]!", "slugs", slugs, len(slugs)},
+		{"{book_id: {_in: $bookIds}}", "$bookIds: [Int!]!", "bookIds", bookIDs, len(bookIDs)},
+	}
+	var editions []hcWorkEdition
+	seen := make(map[int]bool)
+	for _, lookup := range lookups {
+		if lookup.count == 0 {
+			continue
+		}
+		varDecls := lookup.varDecl
+		if filterVarDecls != "" {
+			varDecls += ", " + filterVarDecls
+		}
+		gql := `query ` + name + `(` + varDecls + `, $limit: Int!) {
+		editions(
+			where: {
+				_and: [
+					` + lookup.predicate + `,
+					` + editionFilter + `
+				]
+			},
+			distinct_on: [book_id],
+			order_by: [{book_id: asc}, {id: asc}],
+			limit: $limit
+		) {
+			book { id slug }
+			language { code2 code3 language }
+		}
+	}`
+		vars := make(map[string]any, len(filterVars)+2)
+		for k, v := range filterVars {
+			vars[k] = v
+		}
+		vars[lookup.varName] = lookup.values
+		vars["limit"] = lookup.count
+		var resp struct {
+			Data struct {
+				Editions []hcWorkEdition `json:"editions"`
+			} `json:"data"`
+		}
+		if err := c.query(ctx, gql, vars, &resp); err != nil {
+			return nil, err
+		}
+		for _, edition := range resp.Data.Editions {
+			// Both queries keep one edition per work under the same order,
+			// so a work they both name comes back as the same row twice.
+			if seen[edition.Book.ID] {
+				continue
+			}
+			seen[edition.Book.ID] = true
+			editions = append(editions, edition)
+		}
+	}
+	return editions, nil
+}
+
+// resolveBlankWorkLanguages settles the works the allowed-language query left
+// indeterminate only because they carry no language of their own. Hardcover
+// sets a work's language from its default ebook or audio edition, which is
+// usually blank, so a translation such as "O Ponto Azul-Claro" arrived with no
+// language, stayed indeterminate, and the unknown-language default let it in
+// (#3091). The query above found none of its editions by an allowed language
+// code, so an edition that records a language here is checked against the
+// profile: a non-allowed language rejects the work, and an allowed one (a
+// language Hardcover records by name only, which the code match misses) keeps
+// it. A work with no language recorded on any edition stays indeterminate.
+//
+// The same bounded distinct_on lookup as above. It is best effort: a
+// failure leaves the works indeterminate, which is what they were before it
+// ran, rather than discarding the evidence already established.
+func (c *Client) resolveBlankWorkLanguages(ctx context.Context, books []models.Book, allowed []string, evidence map[string]metadata.AuthorWorkLanguageEvidence) {
+	var slugs []string
+	bookIDs := make([]int, 0)
+	asked := make(map[string]bool)
+	for _, book := range books {
+		key := strings.TrimSpace(book.ForeignID)
+		current, ok := evidence[key]
+		if !ok || asked[key] || current.State != metadata.AuthorWorkLanguageIndeterminate ||
+			models.NormalizeLanguageCode(book.Language) != "" {
+			continue
+		}
+		asked[key] = true
+		id := strings.TrimSpace(strings.TrimPrefix(key, idPrefix))
+		slugs = append(slugs, id)
+		if numericID, ok := hardcoverNumericID(id); ok {
+			bookIDs = append(bookIDs, numericID)
+		}
+	}
+	if len(slugs) == 0 {
+		return
+	}
+
+	editions, err := c.fetchWorkEditions(ctx, "GetAuthorWorkKnownLanguages",
+		"", "{language: {id: {_is_null: false}}}", nil, slugs, bookIDs)
+	if err != nil {
+		slog.Debug("hardcover: known edition language lookup failed; blank-language works stay indeterminate", "works", len(slugs), "error", err)
+		return
+	}
+	for _, edition := range editions {
+		key := edition.Book.foreignID()
+		if !asked[key] {
+			continue
+		}
+		language := hardcoverLanguageName(edition.Language)
+		if language == "" {
+			continue
+		}
+		state := metadata.AuthorWorkLanguageNotAllowed
+		if models.IsLanguageAllowed(language, allowed, true) {
+			// The allowed query matches code2 and code3 only, while this
+			// normalises the language name too, so an edition recorded as
+			// "English" with no codes lands here. It is an allowed edition.
+			state = metadata.AuthorWorkLanguageAllowed
+		}
+		evidence[key] = metadata.AuthorWorkLanguageEvidence{State: state, Language: language}
+	}
 }
 
 func (c *Client) GetAuthor(ctx context.Context, foreignID string) (*models.Author, error) {
@@ -576,6 +704,9 @@ func (c *Client) GetBook(ctx context.Context, foreignID string) (*models.Book, e
 			return nil, nil
 		}
 		b := c.toBook(resp.Data.Books[0])
+		// This query does not ask for genres or the language, so an empty
+		// value here says nothing about the book (#3104).
+		b.UnknownFields = append(b.UnknownFields, models.BookFieldGenres, models.BookFieldLanguage)
 		return &b, nil
 	}
 
@@ -775,7 +906,14 @@ func (c *Client) query(ctx context.Context, q string, vars map[string]any, out i
 	}
 
 	var lastErr error
+	// Pin credentials for the whole operation: response headers must update
+	// the same token's hold that admitted the request, even during rotation.
+	bound := c.WithToken(c.authorizationToken(ctx))
+	c = bound
 	for attempt := 0; attempt <= hardcoverMaxRetries; attempt++ {
+		if err := c.CheckQuota(ctx); err != nil {
+			return err
+		}
 		if err := c.pacer().wait(ctx); err != nil {
 			if errors.Is(err, errThrottled) {
 				if lastErr != nil {
@@ -786,7 +924,18 @@ func (c *Client) query(ctx context.Context, q string, vars map[string]any, out i
 			return err
 		}
 
+		if err := c.CheckQuota(ctx); err != nil {
+			return err
+		}
 		status, header, raw, doErr := c.roundTrip(ctx, body)
+		if err := c.dailyQuota.observe(ctx, c.token, header); err != nil {
+			return err
+		}
+		if status == http.StatusTooManyRequests {
+			if err := c.CheckQuota(ctx); err != nil {
+				return err
+			}
+		}
 		if doErr != nil {
 			// A cancelled or expired context is never worth retrying, and
 			// neither is the last attempt.
@@ -797,6 +946,18 @@ func (c *Client) query(ctx context.Context, q string, vars map[string]any, out i
 			continue
 		}
 
+		if rejected := tokenRejectionError(status, raw); rejected != nil {
+			// Every later call with this token would get the same answer, so
+			// record it and let every caller stop instead of asking per row.
+			return c.dailyQuota.rejectToken(ctx, c.token, rejected)
+		}
+		if status == http.StatusOK {
+			// Hardcover accepted the token (whatever the GraphQL layer says
+			// next), so a hold left by an earlier rejection is stale.
+			if err := c.dailyQuota.clearRejected(ctx, c.token); err != nil {
+				slog.Warn("clear Hardcover rejected token hold", "error", err)
+			}
+		}
 		if status != http.StatusOK {
 			statusErr := classifyHTTPError(status, raw)
 			if status >= http.StatusInternalServerError {
@@ -822,13 +983,34 @@ func (c *Client) query(ctx context.Context, q string, vars map[string]any, out i
 			continue
 		}
 
-		c.pacer().succeed()
+		// Classify the envelope before telling the pacer anything. GraphQL
+		// reports application failures as a 200 with an errors array, and
+		// succeed is the input to the rate control loop, not a transport
+		// counter: feeding it a refusal decays pacing that earlier refusals
+		// set up (#2791).
 		var envelope struct {
 			Errors []gqlError `json:"errors"`
 		}
 		if err := json.Unmarshal(raw, &envelope); err == nil && len(envelope.Errors) > 0 {
-			return fmt.Errorf("GraphQL: %s", httpsec.RedactSecrets(formatGraphQLErrors(envelope.Errors)))
+			gqlErr := fmt.Errorf("GraphQL: %s", httpsec.RedactSecrets(formatGraphQLErrors(envelope.Errors)))
+			if !isRateLimitGraphQL(envelope.Errors) {
+				// Answered, but not healthy: neither a success nor a refusal.
+				return gqlErr
+			}
+			// A refusal delivered as a 200 is still a refusal: penalise and
+			// retry it exactly as a 429.
+			hint, _ := parseRetryHint(gqlErr.Error())
+			c.pacer().penalize(hint)
+			gqlErr = rateLimited(gqlErr)
+			if attempt == hardcoverMaxRetries {
+				return gqlErr
+			}
+			slog.Debug("hardcover rate limited, retrying",
+				"status", status, "attempt", attempt+1, "hint", hint, "error", gqlErr)
+			lastErr = gqlErr
+			continue
 		}
+		c.pacer().succeed()
 		return json.Unmarshal(raw, out)
 	}
 	// Unreachable: the final iteration always returns. Kept so the compiler
@@ -947,6 +1129,36 @@ func classifyHTTPError(status int, raw []byte) error {
 	default:
 		return fmt.Errorf("HTTP %d (upstream returned a non-JSON response, likely an error page, so this is a Hardcover-side failure rather than a token problem)", status)
 	}
+}
+
+// tokenRejectionError returns the classified "token rejected" error when the
+// response means Hardcover refused the credential itself, else nil. It is narrower than
+// isTokenRejection on purpose: that classifier words an error for the user, this
+// one starts a pause for every call, so it only takes the answers that no
+// change to the query could fix. 401 counts. A 403 counts only when its body
+// is an authentication failure (invalid_token, unauthorized, invalid_grant, or
+// the "Unable to verify token" text), not insufficient_scope, access_denied or
+// invalid_request, which can describe the one query. 5xx never counts.
+func tokenRejectionError(status int, raw []byte) error {
+	envelope, parsed := parseHardcoverError(raw)
+	if !isTokenRejection(status, envelope, parsed) {
+		return nil
+	}
+	if status == http.StatusUnauthorized && !parsed && len(bytes.TrimSpace(raw)) > 0 {
+		// Hardcover answers a bad token with a JSON body (invalid_token). A 401
+		// carrying an HTML or plain text page came from something in front of
+		// it, a proxy or a CDN, which says nothing about the token. Pausing on
+		// it would lock a valid token out for an hour, so it stays an ordinary
+		// failed call.
+		return nil
+	}
+	if status == http.StatusForbidden {
+		switch strings.ToLower(strings.TrimSpace(envelope.Error)) {
+		case "invalid_request", "access_denied", "insufficient_scope":
+			return nil
+		}
+	}
+	return classifyHTTPError(status, raw)
 }
 
 // parseHardcoverError decodes the error envelope, reporting whether the body
@@ -1079,6 +1291,9 @@ type hcAuthor struct {
 	Slug  string   `json:"slug"`
 	Bio   string   `json:"bio"`
 	Image *hcImage `json:"image"`
+	// BooksCount is only set from a search document; the GraphQL author
+	// selections do not ask for it. 0 means unknown.
+	BooksCount int `json:"books_count"`
 }
 
 type hcContribution struct {
@@ -1241,6 +1456,7 @@ type hcAuthorSearchDocument struct {
 	Image       any    `json:"image"`
 	ImageURL    string `json:"image_url"`
 	CachedImage any    `json:"cached_image"`
+	BooksCount  any    `json:"books_count"`
 }
 
 type hcBookSearchEnvelope struct {
@@ -1374,12 +1590,14 @@ func authorSearchDocumentToAuthor(doc hcAuthorSearchDocument) (hcAuthor, bool) {
 	if bio == "" {
 		bio = strings.TrimSpace(doc.Description)
 	}
+	booksCount, _ := searchInt(doc.BooksCount)
 	return hcAuthor{
-		ID:    id,
-		Name:  name,
-		Slug:  slug,
-		Bio:   bio,
-		Image: searchImage(doc.Image, doc.ImageURL, doc.CachedImage),
+		ID:         id,
+		Name:       name,
+		Slug:       slug,
+		Bio:        bio,
+		Image:      searchImage(doc.Image, doc.ImageURL, doc.CachedImage),
+		BooksCount: booksCount,
 	}, true
 }
 
@@ -1715,6 +1933,9 @@ func (c *Client) toAuthor(a hcAuthor) models.Author {
 	}
 	if a.Image != nil {
 		au.ImageURL = a.Image.URL
+	}
+	if a.BooksCount > 0 {
+		au.Statistics = &models.AuthorStats{BookCount: a.BooksCount}
 	}
 	return au
 }

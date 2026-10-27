@@ -8,6 +8,7 @@ import (
 	"github.com/robfig/cron/v3"
 
 	"github.com/vavallee/bindery/internal/db"
+	"github.com/vavallee/bindery/internal/downloader"
 	"github.com/vavallee/bindery/internal/metadata"
 	"github.com/vavallee/bindery/internal/models"
 )
@@ -33,49 +34,71 @@ func (s *stubHCSyncer) Sync(_ context.Context) error {
 	return nil
 }
 
-// TestWithHistory verifies the optional history repo is assigned.
+// TestWithHistory checks the repo WithHistory wires is the one the scheduler
+// records into (#1846): a stalled download it gives up on leaves a history
+// event there. Pinning the stored pointer instead would pass with the
+// recording removed and fail on a harmless wrapper.
 func TestWithHistory(t *testing.T) {
 	database, err := db.OpenMemory()
 	if err != nil {
 		t.Fatalf("OpenMemory: %v", err)
 	}
 	defer database.Close()
+	ctx := context.Background()
+	downloads := db.NewDownloadRepo(database)
+	dl := &models.Download{GUID: "history-guid", Title: "Stalled Release", Status: models.DownloadStatusDownloading, Protocol: "torrent"}
+	if err := downloads.Create(ctx, dl); err != nil {
+		t.Fatalf("create: %v", err)
+	}
 
-	s := &Scheduler{}
+	s := &Scheduler{downloads: downloads, blocklist: db.NewBlocklistRepo(database)}
 	h := db.NewHistoryRepo(database)
 	s.WithHistory(h)
-	if s.history != h {
-		t.Fatal("WithHistory did not assign history repo")
+	s.handleStalledDownload(ctx, dl, nil, downloader.StallClientReported)
+
+	events, err := h.List(ctx)
+	if err != nil {
+		t.Fatalf("list history: %v", err)
+	}
+	if len(events) == 0 {
+		t.Fatal("no history recorded through the repo WithHistory wired")
 	}
 }
 
-// TestWithCalibreSyncer verifies the calibre syncer is stored.
-func TestWithCalibreSyncer(t *testing.T) {
-	s := &Scheduler{}
-	cs := &stubCalibreSyncer{}
+// TestOptionalSyncerJobsRunTheWiredSyncers checks each optional syncer wired
+// through its setter is the one its scheduled job calls (#1846): the Calibre
+// sync, the recommender and the Hardcover list sync each run once when their
+// job fires. Pinning the stored instance instead would still pass if the
+// scheduler stopped invoking them.
+func TestOptionalSyncerJobsRunTheWiredSyncers(t *testing.T) {
+	// The base jobs Start always registers come first, so the optional ones
+	// are the entries after them. Counting them from a bare scheduler keeps
+	// this test from hardcoding the number.
+	bare := &Scheduler{cron: cron.New(cron.WithSeconds())}
+	bare.Start()
+	base := len(bare.cron.Entries())
+	bare.Stop()
+
+	cs, rec, hc := &stubCalibreSyncer{}, &stubRecommender{}, &stubHCSyncer{}
+	s := &Scheduler{cron: cron.New(cron.WithSeconds())}
 	s.WithCalibreSyncer(cs)
-	if s.calibreSyncer != cs {
-		t.Fatal("WithCalibreSyncer did not assign")
-	}
-}
-
-// TestWithRecommender verifies the recommender engine is stored.
-func TestWithRecommender(t *testing.T) {
-	s := &Scheduler{}
-	r := &stubRecommender{}
-	s.WithRecommender(r)
-	if s.recommender != r {
-		t.Fatal("WithRecommender did not assign")
-	}
-}
-
-// TestWithHardcoverSyncer verifies the hardcover syncer is stored.
-func TestWithHardcoverSyncer(t *testing.T) {
-	s := &Scheduler{}
-	hc := &stubHCSyncer{}
+	s.WithRecommender(rec)
 	s.WithHardcoverSyncer(hc)
-	if s.hcSyncer != hc {
-		t.Fatal("WithHardcoverSyncer did not assign")
+	s.Start()
+	defer s.Stop()
+
+	ran := 0
+	for _, e := range s.cron.Entries() {
+		if int(e.ID) > base {
+			e.Job.Run()
+			ran++
+		}
+	}
+	if ran != 3 {
+		t.Fatalf("ran %d optional jobs, want 3 (one per wired syncer)", ran)
+	}
+	if cs.called != 1 || rec.called != 1 || hc.called != 1 {
+		t.Errorf("calls: calibre %d, recommender %d, hardcover %d; want 1 each", cs.called, rec.called, hc.called)
 	}
 }
 
@@ -272,7 +295,7 @@ func TestCheckStalledDownloads_OldEnough_ReachesClientLookup(t *testing.T) {
 	clients := db.NewDownloadClientRepo(database)
 
 	// Create a disabled client so GetByID returns, but the !client.Enabled
-	// guard skips the network call to GetStalledIDs.
+	// guard skips the network call to GetStalledTorrents.
 	client := &models.DownloadClient{
 		Name: "test-qb", Type: "qbittorrent", Host: "localhost", Port: 8080,
 		Enabled: false,
@@ -340,7 +363,7 @@ func TestHandleStalledDownload_NoBookID(t *testing.T) {
 		history:   db.NewHistoryRepo(database),
 	}
 	// BookID is nil → handler sets error, records history, skips re-search.
-	s.handleStalledDownload(ctx, dl, nil)
+	s.handleStalledDownload(ctx, dl, nil, downloader.StallClientReported)
 
 	// Confirm the download was marked failed.
 	got, err := downloads.GetByGUID(ctx, "orphan-guid")
@@ -400,7 +423,7 @@ func TestHandleStalledDownload_AutoGrabDisabled(t *testing.T) {
 		books:     books,
 		settings:  settings,
 	}
-	s.handleStalledDownload(ctx, dl, nil)
+	s.handleStalledDownload(ctx, dl, nil, downloader.StallClientReported)
 
 	// Download should be marked with an error and book lookup path executed,
 	// then the autoGrab=false early-return should have prevented the re-search.
@@ -438,7 +461,7 @@ func TestHandleStalledDownload_NilHistoryAndBlocklist(t *testing.T) {
 		downloads: downloads,
 		// history nil, blocklist nil, books nil, settings nil.
 	}
-	s.handleStalledDownload(ctx, dl, nil) // must not panic; BookID nil → returns after SetError
+	s.handleStalledDownload(ctx, dl, nil, downloader.StallClientReported) // must not panic; BookID nil → returns after SetError
 }
 
 // TestRefreshMetadata_CalibreAggregatorNotCalled is a sanity check that the

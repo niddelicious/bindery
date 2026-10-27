@@ -1,12 +1,20 @@
 import { useEffect, useState, useRef } from 'react'
-import { Link } from 'react-router'
+import { Link, useSearchParams } from 'react-router'
 import { useTranslation } from 'react-i18next'
 import { api, isNoDownloadClientError, isNoEligibleClientError, SearchResult } from '../api/client'
 import { formatBytes } from '../util/format'
+import { useConfirmDialog } from '../components/useConfirmDialog'
+import { grabWithForceConfirm } from '../util/forceGrab'
+import { primaryFill } from '../components/buttons'
+import { errorText } from '../util/errorText'
 
 export default function SearchPage() {
   const { t } = useTranslation()
-  const [query, setQuery] = useState('')
+  const { confirm, confirmDialog } = useConfirmDialog()
+  // The header search's "Search indexers for …" row lands here with ?q=.
+  const [searchParams, setSearchParams] = useSearchParams()
+  const initialQuery = searchParams.get('q') ?? ''
+  const [query, setQuery] = useState(initialQuery)
   const [results, setResults] = useState<SearchResult[] | null>(null)
   const [searching, setSearching] = useState(false)
   const [grabbing, setGrabbing] = useState<string | null>(null)
@@ -22,29 +30,54 @@ export default function SearchPage() {
   // eligibility checkboxes) rather than none being enabled at all.
   const [needsEligibleClient, setNeedsEligibleClient] = useState<'ebook' | 'audiobook' | null>(null)
   const inputRef = useRef<HTMLInputElement>(null)
+  const lastRun = useRef('')
+  // Two quick header searches: only the latest one's answer is shown, even
+  // when the earlier, slower one comes back last.
+  const searchSeq = useRef(0)
 
   useEffect(() => {
-    document.title = 'Search · Bindery'
+    document.title = `${t('search.pageTitle', 'Search')} · Bindery`
     return () => { document.title = 'Bindery' }
-  }, [])
+  }, [t])
 
-  const search = async () => {
-    const q = query.trim()
+  const search = async (raw: string = query) => {
+    const q = raw.trim()
     if (!q) return
+    // The URL follows the query, so a reload or Back keeps it, and the effect
+    // below knows this one already ran.
+    lastRun.current = q
+    if (searchParams.get('q') !== q) setSearchParams({ q }, { replace: true })
     setSearching(true)
     setError(null)
     setNeedsClient(false)
     setNeedsEligibleClient(null)
     setResults(null)
+    const seq = ++searchSeq.current
     try {
       const r = await api.searchIndexers(q)
-      setResults(r)
+      if (seq === searchSeq.current) setResults(r)
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Search failed')
+      if (seq === searchSeq.current) setError(errorText(e, t('search.searchFailed', 'Search failed')))
     } finally {
-      setSearching(false)
+      if (seq === searchSeq.current) setSearching(false)
     }
   }
+
+  // Arriving from the header with a query runs it, so the row reads as
+  // "search for this" rather than "go to a page and type it again". That
+  // includes a header search for a new query made while already on /search:
+  // the page stays mounted and only ?q= changes, so the effect keys on the
+  // query, not on mount. lastRun stops a search typed here from running
+  // twice; it also means a header search for the query already shown does
+  // not run again (the URL does not change), and Search on the page does.
+  useEffect(() => {
+    const q = initialQuery.trim()
+    if (!q || q === lastRun.current) return
+    setQuery(initialQuery)
+    void search(initialQuery)
+    // search is recreated each render; the query is the only trigger.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialQuery])
 
   const grab = async (r: SearchResult) => {
     setGrabbing(r.guid)
@@ -52,7 +85,7 @@ export default function SearchPage() {
     setNeedsClient(false)
     setNeedsEligibleClient(null)
     try {
-      await api.grab({
+      const dl = await grabWithForceConfirm({
         guid: r.guid,
         title: r.title,
         nzbUrl: r.nzbUrl,
@@ -60,7 +93,8 @@ export default function SearchPage() {
         indexerId: r.indexerId,
         protocol: r.protocol,
         mediaType: r.mediaType,
-      })
+      }, confirm, t)
+      if (!dl) return
       setGrabbed(prev => new Set(prev).add(r.guid))
     } catch (e) {
       if (isNoEligibleClientError(e)) {
@@ -68,7 +102,7 @@ export default function SearchPage() {
       } else if (isNoDownloadClientError(e)) {
         setNeedsClient(true)
       } else {
-        setError(e instanceof Error ? e.message : 'Grab failed')
+        setError(errorText(e, t('search.grabFailed', 'Grab failed')))
       }
     } finally {
       setGrabbing(null)
@@ -76,7 +110,8 @@ export default function SearchPage() {
   }
 
   return (
-    <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+    <div className="max-w-4xl mx-auto sm:px-6 lg:px-8 py-8">
+      {confirmDialog}
       <h2 className="text-xl font-bold mb-6">{t('search.heading')}</h2>
 
       <form
@@ -84,6 +119,7 @@ export default function SearchPage() {
         className="flex gap-2 mb-6"
       >
         <input
+          enterKeyHint="search"
           ref={inputRef}
           value={query}
           onChange={e => setQuery(e.target.value)}
@@ -91,13 +127,13 @@ export default function SearchPage() {
           // min-w-0 matters: a flex item's automatic minimum size is its
           // min-content width, and an input's is its default 20-character
           // size, which pushed this row past a phone viewport.
-          className="flex-1 min-w-0 bg-slate-100 dark:bg-zinc-900 border border-slate-300 dark:border-zinc-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-slate-400 dark:focus:border-zinc-500"
+          className="flex-1 min-w-0 bg-slate-100 dark:bg-zinc-900 border border-slate-300 dark:border-zinc-700 rounded px-3 py-2 text-sm"
           autoFocus
         />
         <button
           type="submit"
           disabled={searching || !query.trim()}
-          className="shrink-0 whitespace-nowrap px-4 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded text-sm font-medium"
+          className={`shrink-0 whitespace-nowrap px-4 py-2 ${primaryFill} disabled:opacity-50 rounded text-sm font-medium`}
         >
           {searching ? t('search.searching') : t('search.submit')}
         </button>
@@ -114,7 +150,7 @@ export default function SearchPage() {
           <p className="mb-2">{t('search.noClient.body')}</p>
           <Link
             to="/settings?tab=clients"
-            className="inline-block px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-md text-sm font-medium transition-colors"
+            className={`inline-block px-3 py-1.5 ${primaryFill} rounded-md text-sm font-medium transition-colors`}
           >
             {t('search.noClient.action')}
           </Link>
@@ -126,7 +162,7 @@ export default function SearchPage() {
           <p className="mb-2">{t(needsEligibleClient === 'audiobook' ? 'search.noEligibleClient.bodyAudiobooks' : 'search.noEligibleClient.bodyBooks')}</p>
           <Link
             to="/settings?tab=clients"
-            className="inline-block px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-md text-sm font-medium transition-colors"
+            className={`inline-block px-3 py-1.5 ${primaryFill} rounded-md text-sm font-medium transition-colors`}
           >
             {t('search.noEligibleClient.action')}
           </Link>
@@ -134,14 +170,14 @@ export default function SearchPage() {
       )}
 
       {results !== null && results.length === 0 && (
-        <div className="text-center py-10 text-sm text-slate-500 dark:text-zinc-500 border border-slate-200 dark:border-zinc-800 rounded-lg bg-slate-100 dark:bg-zinc-900">
+        <div className="text-center py-10 text-sm text-fg-muted border border-slate-200 dark:border-zinc-800 rounded-lg bg-slate-100 dark:bg-zinc-900">
           {t('search.noResults')}
         </div>
       )}
 
       {results !== null && results.length > 0 && (
         <div>
-          <p className="text-xs text-slate-500 dark:text-zinc-500 mb-2">{t('search.resultCount', { count: results.length })}</p>
+          <p className="text-xs text-fg-muted mb-2">{t('search.resultCount', { count: results.length })}</p>
           <div className="space-y-1">
             {results.map(r => (
               <div
@@ -150,20 +186,20 @@ export default function SearchPage() {
               >
                 <div className="min-w-0 mr-3">
                   <span className="truncate block text-slate-800 dark:text-zinc-200">{r.title}</span>
-                  <span className="text-slate-500 dark:text-zinc-500 truncate block">
+                  <span className="text-fg-muted truncate block">
                     {r.indexerName}{r.size ? ` · ${formatBytes(r.size)}` : ''}{r.grabs ? ` · ${r.grabs} grabs` : ''}
                     {r.language && <span className="ml-2 uppercase">{r.language}</span>}
                   </span>
                 </div>
                 {grabbed.has(r.guid) ? (
-                  <span className="px-3 py-2 text-emerald-600 dark:text-emerald-400 text-[11px] font-medium flex-shrink-0">
+                  <span className="px-3 py-2 text-accent-text text-[11px] font-medium flex-shrink-0">
                     {t('search.grabbed')}
                   </span>
                 ) : (
                   <button
                     onClick={() => grab(r)}
                     disabled={grabbing !== null}
-                    className="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded text-[11px] font-medium flex-shrink-0"
+                    className={`px-3 py-2 ${primaryFill} disabled:opacity-50 rounded text-[11px] font-medium flex-shrink-0`}
                   >
                     {grabbing === r.guid ? t('search.grabbing') : t('search.grab')}
                   </button>

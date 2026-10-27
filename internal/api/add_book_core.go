@@ -94,6 +94,9 @@ var addBookErrorResponses = []struct {
 // (#1227). Book is the existing row, which the handler returns in the 409.
 type bookInLibraryError struct {
 	Book *models.Book
+	// FormatWidened is set when this request widened Book to both formats
+	// while deduplicating onto it (#3482).
+	FormatWidened bool
 }
 
 func (e *bookInLibraryError) Error() string { return "add book: book already in library" }
@@ -110,7 +113,8 @@ func (e *primaryProviderUnavailableError) Error() string {
 
 // addBookLookupError wraps a failed book metadata lookup while resolving the
 // author for a result that carried no author id. The handler answers 502
-// with the wrapped error's text.
+// through writeUpstreamError; the wrapped error's text, which can embed the
+// provider's request URL, is logged and never sent.
 type addBookLookupError struct {
 	Err error
 }
@@ -123,7 +127,7 @@ func (e *addBookLookupError) Unwrap() error { return e.Err }
 func (h *AuthorHandler) writeAddBookError(w http.ResponseWriter, r *http.Request, err error) {
 	var inLibrary *bookInLibraryError
 	if errors.As(err, &inLibrary) {
-		h.writeExistingBookConflict(w, inLibrary.Book)
+		h.writeExistingBookConflict(w, inLibrary.Book, inLibrary.FormatWidened)
 		return
 	}
 	var unavailable *primaryProviderUnavailableError
@@ -133,7 +137,7 @@ func (h *AuthorHandler) writeAddBookError(w http.ResponseWriter, r *http.Request
 	}
 	var lookup *addBookLookupError
 	if errors.As(err, &lookup) {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": lookup.Err.Error()})
+		writeUpstreamError(w, lookup.Err)
 		return
 	}
 	for _, resp := range addBookErrorResponses {
@@ -143,6 +147,31 @@ func (h *AuthorHandler) writeAddBookError(w http.ResponseWriter, r *http.Request
 		}
 	}
 	writeServerError(w, r, err)
+}
+
+// refuseBookHeldByAnotherUser returns errAddBookHeldByAnotherUser when the
+// foreign id already has a row the caller cannot see. books.foreign_id is
+// UNIQUE across users, so such a row can never become the caller's: the
+// direct insert would collide with it and the poll would find it. Refusing
+// here, before the author is resolved, means the request creates no author
+// row, makes no provider call, and never holds the other user's row at all.
+// The refusal carries no row data.
+//
+// scopeID is the library scope the conflict gate used (auth.ListScopeUserID).
+// Zero means the caller sees every row, so the gate already answered for any
+// existing row and there is nothing left to refuse.
+func (h *AuthorHandler) refuseBookHeldByAnotherUser(ctx context.Context, foreignID string, scopeID int64) error {
+	if scopeID == 0 {
+		return nil
+	}
+	held, err := h.books.GetByForeignID(ctx, foreignID)
+	if err != nil {
+		return err
+	}
+	if held != nil && held.OwnerUserID != 0 && held.OwnerUserID != scopeID {
+		return errAddBookHeldByAnotherUser
+	}
+	return nil
 }
 
 // addBookCore adds one book to the library: it resolves or creates the
@@ -186,14 +215,18 @@ func (h *AuthorHandler) addBookCore(ctx context.Context, req addBookParams) (add
 	// side effects. Scoped like the library list the user is looking at
 	// (ListScopeUserID plus NULL owners): a NULL owned row is in that list,
 	// and an admin under tenancy sees every row, so both are conflicts. A
-	// non admin's request never sees another user's copy here; the guard
-	// after the poll covers that case.
+	// non admin's request never sees another user's copy here; the check
+	// right after refuses that case before anything is fetched or written,
+	// and the guard after the poll covers a row that appears mid request.
 	userID := auth.UserIDFromContext(ctx)
 	scopeID := auth.ListScopeUserID(ctx)
 	if existing, err := h.books.GetByForeignIDVisibleTo(ctx, req.ForeignBookID, scopeID); err != nil {
 		return addBookResult{}, err
 	} else if existing != nil {
 		return addBookResult{}, &bookInLibraryError{Book: existing}
+	}
+	if err := h.refuseBookHeldByAnotherUser(ctx, req.ForeignBookID, scopeID); err != nil {
+		return addBookResult{}, err
 	}
 
 	if req.ForeignAuthorID == "" {
@@ -228,6 +261,9 @@ func (h *AuthorHandler) addBookCore(ctx context.Context, req addBookParams) (add
 				return addBookResult{}, err
 			} else if existing != nil {
 				return addBookResult{}, &bookInLibraryError{Book: existing}
+			}
+			if err := h.refuseBookHeldByAnotherUser(ctx, req.ForeignBookID, scopeID); err != nil {
+				return addBookResult{}, err
 			}
 		} else if req.AuthorName != "" {
 			// ISBN-based resolution failed (e.g. Google Books: author name, no
@@ -271,7 +307,7 @@ func (h *AuthorHandler) addBookCore(ctx context.Context, req addBookParams) (add
 				ForeignID:        req.ForeignAuthorID,
 				Name:             name,
 				SortName:         sortName(name),
-				MetadataProvider: "openlibrary",
+				MetadataProvider: models.AuthorProviderFromForeignID(req.ForeignAuthorID),
 			}
 		}
 		fetched.Monitored = false
@@ -345,6 +381,21 @@ func (h *AuthorHandler) addBookCore(ctx context.Context, req addBookParams) (add
 		return addBookResult{}, errAddBookAuthorUnresolved
 	}
 
+	// Under tenancy a shared (unowned) author does not make the book shared:
+	// a user who is not an admin asked for it, so it is theirs. With no owner
+	// it would appear in every user's library as a book they never added.
+	// Same rule the Hardcover list syncer applies for the list owner. Both the
+	// direct insert and the single work fallback use it. ListScopeUserID is 0
+	// for an admin and with tenancy off, which keep the book unowned as before.
+	ownerForUnownedAuthor := scopeID
+
+	// dedupedOnto is the existing row the direct insert below merged the
+	// request into without that row taking the requested foreign id (#3466).
+	var dedupedOnto *models.Book
+	// dedupedWidened is true when that merge also widened the row to both
+	// formats, so the 409 can say the book is now tracked as both (#3482).
+	dedupedWidened := false
+
 	// 1b. Direct insert for the requested book.
 	//
 	// Originally added (#667) for DNB synthetic IDs, whose async sync returns
@@ -385,6 +436,9 @@ func (h *AuthorHandler) addBookCore(ctx context.Context, req addBookParams) (add
 			// this request (#1612) — the scoped lookup above is what makes it
 			// the correct owner either way.
 			primary.OwnerUserID = author.OwnerUserID
+			if primary.OwnerUserID == 0 {
+				primary.OwnerUserID = ownerForUnownedAuthor
+			}
 			primary.Monitored = author.Monitored
 			if primary.Status == "" {
 				primary.Status = models.BookStatusWanted
@@ -408,7 +462,20 @@ func (h *AuthorHandler) addBookCore(ctx context.Context, req addBookParams) (add
 			// merges into one media_type=both row — in both cases the
 			// requested foreign id has no row of its own, which is exactly the
 			// state that brings a user here.
-			match, ferr := h.books.FindByAuthorAndDedupKey(ctx, author.ID, primary.Title)
+			//
+			// Only a row the caller may own is a candidate. The author can be
+			// shared (NULL owner) while the books under it are not, and the
+			// adopt below rewrites the match's foreign id and format, so under
+			// tenancy another user's title match must never reach it: the guard
+			// after the poll would refuse the request, but only once that
+			// user's row had already been changed. The scope is the caller's
+			// own id even for an admin, because the guard refuses an admin
+			// another user's row too. Tenancy off keeps the shared library.
+			adoptScope := int64(0)
+			if auth.EnforceTenancy() {
+				adoptScope = userID
+			}
+			match, ferr := h.books.FindByAuthorAndDedupKeyVisibleTo(ctx, author.ID, primary.Title, adoptScope)
 			// A subtitle-collapsed dedup key (indexer.CanonicalDedupKey strips a
 			// ": subtitle" tail) merges every "Series: Volume" sibling onto one
 			// key. Adopting such a match would rebind the requested foreign id
@@ -418,7 +485,11 @@ func (h *AuthorHandler) addBookCore(ctx context.Context, req addBookParams) (add
 			// distinct volume of the matched row's series (same series, different
 			// sequence), skip the adopt and create a distinct row instead.
 			if ferr == nil && match != nil && !h.directInsertSeriesConflict(ctx, match.ID, primary.SeriesRefs) {
-				h.adoptDirectInsertMatch(ctx, match, primary, req.ForeignBookID)
+				widened := h.adoptDirectInsertMatch(ctx, match, primary, req.ForeignBookID)
+				if match.ForeignID != req.ForeignBookID {
+					dedupedOnto = match
+					dedupedWidened = widened
+				}
 			} else if err := h.books.Create(ctx, primary); err != nil {
 				if !strings.Contains(err.Error(), "UNIQUE constraint failed") {
 					slog.Warn("AddBook: direct insert failed",
@@ -441,6 +512,17 @@ func (h *AuthorHandler) addBookCore(ctx context.Context, req addBookParams) (add
 		}
 	}
 
+	// 1b-2. The request was deduplicated onto a row that keeps its own work id
+	// ("Ready Player One" onto "Ready Player One (Movie Tie-In)"). Nothing will
+	// ever create a row for the requested id, so polling for one only ends in a
+	// 404 "try again shortly" that no retry fixes (#3466). Answer with the row
+	// the request was merged into, the same as re-adding a known id (#1227).
+	if dedupedOnto != nil {
+		if existing, _ := h.books.GetByForeignID(ctx, req.ForeignBookID); existing == nil {
+			return addBookResult{}, &bookInLibraryError{Book: dedupedOnto, FormatWidened: dedupedWidened}
+		}
+	}
+
 	// 1c. Single-work fallback. The direct insert above covers the request in
 	// all but a couple of cases: the provider's book endpoint failed (#1612's
 	// OpenLibrary 502) or returned a record the title guard rejected, and the
@@ -457,8 +539,9 @@ func (h *AuthorHandler) addBookCore(ctx context.Context, req addBookParams) (add
 		// exempt from the strict media-type clamp (#1612).
 		fallbackSynced = true
 		h.fetchAuthorBooksAsync(author, catalogueSyncOptions{
-			mediaType:     h.resolveDefaultMediaType(ctx),
-			onlyForeignID: req.ForeignBookID,
+			mediaType:             h.resolveDefaultMediaType(ctx),
+			onlyForeignID:         req.ForeignBookID,
+			ownerForUnownedAuthor: ownerForUnownedAuthor,
 		})
 	}
 

@@ -3,6 +3,16 @@ import type { Book } from './books'
 import type { Series } from './series'
 import type { Page } from './common'
 
+// Credit for an author photo or bio that an author enricher filled in from a
+// source other than the author's provider (#3287), as that source's licence asks.
+export interface ProfileSource {
+  provider: string
+  url: string
+  credit?: string
+  license?: string
+  licenseUrl?: string
+}
+
 export interface Author {
   id: number
   foreignAuthorId: string
@@ -13,11 +23,19 @@ export interface Author {
   sortName: string
   description: string
   imageUrl: string
+  // Set when the bio or photo came from an author enricher (#3287); absent
+  // when it is the provider's own.
+  descriptionSource?: ProfileSource
+  imageSource?: ProfileSource
   disambiguation: string
   ratingsCount: number
   averageRating: number
   monitored: boolean
   metadataProvider?: string
+  createdAt?: string
+  // When this author's metadata was last refreshed from its provider; null
+  // until the first refresh. Shown with the BnF credit (#3144).
+  lastMetadataRefreshAt?: string | null
   monitorMode?: AuthorMonitorMode
   monitorLatestCount?: number
   // Policy for works discovered after the initial sync (#1348): 'all' follows
@@ -165,6 +183,20 @@ export interface CatalogueReconciliationCandidate {
   reason: CatalogueReconciliationReason
 }
 
+export type CatalogueReconciliationIndeterminateReason =
+  | 'language_unknown'
+  | 'language_evidence_lookup_failed'
+  | 'edition_evidence_unavailable'
+  | 'partial_catalogue'
+  | 'unmatched_cross_provider'
+
+export interface CatalogueReconciliationIndeterminateRow {
+  bookId: number
+  title: string
+  metadataProvider: string
+  reason: CatalogueReconciliationIndeterminateReason
+}
+
 export interface CatalogueReconciliationSummary {
   total: number
   candidates: number
@@ -186,6 +218,7 @@ export interface CatalogueReconciliation {
   profileName: string
   warning?: string
   candidates: CatalogueReconciliationCandidate[]
+  indeterminateRows: CatalogueReconciliationIndeterminateRow[]
   summary: CatalogueReconciliationSummary
   applied?: { requested: number; deleted: number; skipped: number }
 }
@@ -199,14 +232,57 @@ export type DuplicateRule =
   | 'edition-suffix'
   | 'substring'
 
+// Review evidence for one row (#2999), built from data Bindery already
+// stores. `format` is the file extension ('epub', 'm4b'); it is empty for an
+// audiobook kept as a folder. `isbns` is capped for display; `isbnCount` is
+// the full number the comparison used.
+export interface DuplicateEvidence {
+  files: { kind: 'ebook' | 'audiobook' | string; format: string }[]
+  isbns: string[]
+  isbnCount: number
+  asins: string[]
+  series: { seriesId: number; title: string; position: string }[]
+  year?: number
+}
+
+// Agreement and conflict markers between the rows of a group (#2999).
+export type DuplicateSignalKind =
+  | 'shared-isbn'
+  | 'shared-asin'
+  | 'same-series-position'
+  | 'series-position-conflict'
+  | 'year-conflict'
+  | 'language-conflict'
+
+export interface DuplicateSignal {
+  kind: DuplicateSignalKind
+  conflict: boolean
+  bookIds: number[]
+  values: string[]
+}
+
 export interface DuplicateCandidateMember extends Book {
   rules: DuplicateRule[]
+  // Optional so an older server's payload still renders.
+  evidence?: DuplicateEvidence
+  hasFiles?: boolean
 }
 
 export interface DuplicateCandidateGroup {
   key: string
   rules: DuplicateRule[]
   books: DuplicateCandidateMember[]
+  authorId?: number
+  authorName?: string
+  signals?: DuplicateSignal[]
+  conflict?: boolean
+  // The one non-excluded row with files; absent when none or several have files.
+  keeperId?: number
+  // The empty rows the server suggests excluding together. Non-empty only
+  // with a keeper and no conflict; never contains a row with files.
+  suggestedExcludeIds?: number[]
+  // Why there is no suggestion, when there is none.
+  suggestionWithheld?: 'no-files' | 'several-with-files' | 'conflict' | 'no-evidence'
 }
 
 export interface DuplicateCandidates {
@@ -230,6 +306,7 @@ export interface AddAuthorRequest {
   metadataProfileId?: number | null
   qualityProfileId?: number | null
   rootFolderId?: number | null
+  audiobookRootFolderId?: number | null
   mediaType?: MediaType
 }
 
@@ -252,6 +329,9 @@ export interface UpdateAuthorRequest {
   // when monitorMode === 'series'. Backend rejects ids that don't belong to
   // this author.
   monitoredSeriesIds?: number[]
+  // A bio set by hand (#3287). It is kept as the user's own, so no refresh
+  // replaces it; an empty string clears it for the provider to fill again.
+  description?: string
 }
 
 export const authorsApi = {
@@ -284,6 +364,13 @@ export const authorsApi = {
   getAuthor: (id: number) => request<Author>(`/author/${id}`),
   addAuthor: (data: AddAuthorRequest) => request<Author>('/author', { method: 'POST', body: JSON.stringify(data) }),
   updateAuthor: (id: number, data: UpdateAuthorRequest) => request<Author>(`/author/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  // The author counterpart of uploadBookCover (#3287): the photo is stored by
+  // Bindery and kept as the user's own.
+  uploadAuthorPhoto: (id: number, image: Blob) =>
+    request<Author>(`/author/${id}/photo`, { method: 'POST', body: image, headers: { 'Content-Type': image.type || 'application/octet-stream' } }),
+  // Clears an uploaded photo; the answer carries the provider's or an
+  // enricher's photo when one is found straight away.
+  clearAuthorPhoto: (id: number) => request<Author>(`/author/${id}/photo`, { method: 'DELETE' }),
   // Genre override (#1446): set + lock the genre list on every book of the
   // author so metadata refresh keeps the user's taxonomy.
   applyAuthorGenres: (id: number, genres: string[]) =>

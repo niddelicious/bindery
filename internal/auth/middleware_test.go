@@ -2,11 +2,35 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
+
+// The CSRF header rejection writes a JSON body, so it has to say so. It used
+// http.Error, which replaces the Content-Type set just before it with
+// text/plain, leaving a JSON body labelled as text.
+func TestRequireXRequestedWith_RejectionIsLabelledJSON(t *testing.T) {
+	h := RequireXRequestedWith(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("handler must not run")
+	}))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/queue/grab", nil))
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	var body map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body["error"] != "forbidden" {
+		t.Errorf("body = %q (err %v), want {\"error\":\"forbidden\"}", rec.Body.String(), err)
+	}
+}
 
 // Regression tests for #560: /api/v1/auth/status was in the AllowUnauthPath
 // list and the middleware short-circuited there before proxy identity
@@ -359,6 +383,8 @@ func TestMiddlewareAdminGrantPerMode(t *testing.T) {
 				})))))
 
 			req := httptest.NewRequest(tc.method, "/api/v1/system/storage", nil)
+			// Not httptest's example.com, which the login free modes refuse.
+			req.Host = "bindery:8787"
 			if tc.remote != "" {
 				req.RemoteAddr = tc.remote
 			}
@@ -394,8 +420,13 @@ func TestMiddlewareAdminGrantPerMode(t *testing.T) {
 func TestModeGrantsAdmin(t *testing.T) {
 	local := httptest.NewRequest(http.MethodGet, "/", nil)
 	local.RemoteAddr = "127.0.0.1:5555"
+	local.Host = "bindery:8787"
 	remote := httptest.NewRequest(http.MethodGet, "/", nil)
 	remote.RemoteAddr = "203.0.113.9:5555"
+	remote.Host = "192.168.1.10:8787"
+	foreign := httptest.NewRequest(http.MethodGet, "/", nil)
+	foreign.RemoteAddr = "127.0.0.1:5555"
+	foreign.Host = "attacker.example"
 	for _, tc := range []struct {
 		mode Mode
 		r    *http.Request
@@ -407,6 +438,9 @@ func TestModeGrantsAdmin(t *testing.T) {
 		{ModeLocalOnly, remote, false},
 		{ModeEnabled, local, false},
 		{ModeProxy, local, false},
+		// The Host must be one a public site cannot have (DNS rebinding).
+		{ModeDisabled, foreign, false},
+		{ModeLocalOnly, foreign, false},
 	} {
 		if got := ModeGrantsAdmin(tc.mode, tc.r, nil); got != tc.want {
 			t.Errorf("ModeGrantsAdmin(%s, %s) = %v, want %v", tc.mode, tc.r.RemoteAddr, got, tc.want)

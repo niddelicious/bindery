@@ -24,6 +24,7 @@ import (
 	"golang.org/x/text/unicode/norm"
 
 	"github.com/vavallee/bindery/internal/httpsec"
+	"github.com/vavallee/bindery/internal/textutil"
 	"github.com/vavallee/bindery/internal/useragent"
 )
 
@@ -88,9 +89,9 @@ func (c *Client) SetHTTPClient(h *http.Client) {
 // indexer hostname can flip its DNS record to 169.254.169.254 (cloud
 // metadata) or an RFC1918 address after the initial check passes. The
 // per-connection re-validation catches a post-TTL rebind before connect(2).
-// PolicyLAN is used because indexers legitimately run on LAN addresses;
-// loopback, link-local, and cloud-metadata remain blocked under all
-// policies.
+// PolicyService is used because indexers legitimately run on LAN and loopback
+// addresses. Link-local is refused unless the operator sets
+// BINDERY_ALLOW_LINK_LOCAL_SERVICES (#2036); cloud metadata never is.
 var (
 	sharedTransportOnce sync.Once
 	sharedTransport     *http.Transport
@@ -112,7 +113,7 @@ func sharedTransportInstance() *http.Transport {
 		transportBuildCount.Add(1)
 		sharedTransport = &http.Transport{
 			Proxy:                 httpsec.ProxyFunc(),
-			DialContext:           httpsec.NewDialContext(httpsec.PolicyLANLoopback),
+			DialContext:           httpsec.NewDialContext(httpsec.PolicyService),
 			MaxIdleConns:          100,
 			MaxIdleConnsPerHost:   8,
 			IdleConnTimeout:       90 * time.Second,
@@ -139,6 +140,9 @@ func newHTTPClient() *http.Client {
 	return &http.Client{
 		Timeout:   30 * time.Second,
 		Transport: sharedTransportInstance(),
+		// An indexer is a remote party: its redirects never get the link-local
+		// allowance and never reach cloud metadata (#2036).
+		CheckRedirect: httpsec.RedirectGuard(httpsec.PolicyService),
 	}
 }
 
@@ -192,6 +196,39 @@ func SignDownloadURLFor(rawURL, indexerURL, apiKey string) string {
 	return signDownloadURL(rawURL, baseHost, apiKey)
 }
 
+// DownloadHostMatchesIndexer reports whether a download URL is on the host the
+// indexer is configured at, using the same normalisation SignDownloadURLFor
+// uses. Unlike signing it needs no stored key and ignores whether the URL is
+// already signed, so it answers "could this release have come from that
+// indexer" for the cases signing cannot (#3080).
+//
+// The comparison is on the host name only: case is ignored, one trailing dot is
+// dropped, and the port is ignored in every combination (explicit against none,
+// the scheme's default against none, two different explicit ports). Ignoring a
+// differing port is deliberate and errs the safe way for a pin: Prowlarr builds
+// download links from its own application URL, which need not carry the port
+// the indexer was recorded with, and a spurious match only refuses a grab the
+// user can retry with an indexer id, whereas a spurious miss would put a
+// private tracker's release on the public client. Signing keeps its own, exact
+// comparison (signDownloadURL); this function does not change it. A host that
+// differs by a "www." or any other subdomain is a different host, and punycode
+// is not folded to Unicode, so those remain misses.
+func DownloadHostMatchesIndexer(rawURL, indexerURL string) bool {
+	base := pinHostName(normalizeEndpointURL(indexerURL))
+	rel := pinHostName(rawURL)
+	return base != "" && base == rel
+}
+
+// pinHostName returns the lower case host name of raw without its port or a
+// single trailing dot, or "" when raw has none.
+func pinHostName(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+}
+
 // HasAPIKey reports whether a download URL already carries an apikey.
 //
 // It exists so callers can tell "this URL is already signed" apart from "this
@@ -209,25 +246,18 @@ func HasAPIKey(raw string) bool {
 	return u.Query().Get("apikey") != ""
 }
 
-// RedactDownloadURL removes the apikey query parameter from a download URL so it
-// can be returned to API clients without leaking the indexer credential. The
-// grab handler restores it server-side via SignDownloadURLFor before dialing the
-// indexer. A URL with no apikey is returned unchanged.
+// RedactDownloadURL removes every credential from a download URL so it can be
+// returned to API clients, which include non-admin users, without leaking it.
+//
+// Every parameter on httpsec's secret list is dropped (the indexer apikey, a
+// Jackett key, a tracker passkey, a getnzb link's r=), and everything else is
+// left byte for byte as it was. A grab of a search result takes the real URL
+// from the server's own record (api.SearchResultRegistry); an admin grab of an
+// unrecorded URL gets only the indexer apikey back, via SignDownloadURLFor. A
+// URL with no credential is returned unchanged. The same applies to a GUID or
+// detail link, which torznab feeds often build from the download URL.
 func RedactDownloadURL(raw string) string {
-	if raw == "" {
-		return raw
-	}
-	u, err := url.Parse(raw)
-	if err != nil {
-		return raw
-	}
-	q := u.Query()
-	if q.Get("apikey") == "" {
-		return raw
-	}
-	q.Del("apikey")
-	u.RawQuery = q.Encode()
-	return u.String()
+	return httpsec.StripURLSecrets(raw)
 }
 
 // detailURL extracts the indexer's human-readable detail/release page URL for a
@@ -242,14 +272,21 @@ func RedactDownloadURL(raw string) string {
 func detailURL(item rssItem) string {
 	download := item.Enclosure.URL
 
-	candidates := []string{item.Comments}
-	if strings.EqualFold(strings.TrimSpace(item.GUID.IsPermaLink), "true") {
-		candidates = append(candidates, item.GUID.Value)
+	// link marks the <link> fallback, which torznab feeds also use as a
+	// download link: with no enclosure it is the download URL, and next to a
+	// proxy enclosure it can be the tracker's direct passkey link.
+	type candidate struct {
+		raw  string
+		link bool
 	}
-	candidates = append(candidates, item.Link)
+	candidates := []candidate{{raw: item.Comments}}
+	if strings.EqualFold(strings.TrimSpace(item.GUID.IsPermaLink), "true") {
+		candidates = append(candidates, candidate{raw: item.GUID.Value})
+	}
+	candidates = append(candidates, candidate{raw: item.Link, link: true})
 
-	for _, raw := range candidates {
-		raw = strings.TrimSpace(raw)
+	for _, c := range candidates {
+		raw := strings.TrimSpace(c.raw)
 		if raw == "" || raw == download {
 			continue
 		}
@@ -263,9 +300,28 @@ func detailURL(item rssItem) string {
 		if u.Host == "" {
 			continue
 		}
-		return raw
+		// <link> may be a download link (see candidate), and a torznab
+		// permalink is often a details page carrying the passkey. This is shown
+		// to every user, so it never carries a credential. A real detail page
+		// (<comments>) keeps its path, which people click and which is often a
+		// hex id; the <link> fallback, and a permalink that is also the GUID
+		// (shown redacted with the path rule), get the download URL treatment,
+		// path included.
+		if c.link || raw == strings.TrimSpace(item.GUID.Value) {
+			return RedactDownloadURL(raw)
+		}
+		return RedactInfoURL(raw)
 	}
 	return ""
+}
+
+// RedactInfoURL removes credentials from a detail page link before it is
+// shown: secret parameters and user:pass@ come off, the path stays, since it
+// is the indexer's id for the release and people click the link (see
+// httpsec.StripDetailURLSecrets). Use RedactDownloadURL for an info link that
+// is the download link itself.
+func RedactInfoURL(raw string) string {
+	return httpsec.StripDetailURLSecrets(raw)
 }
 
 // Caps fetches the indexer capabilities.
@@ -333,7 +389,88 @@ func (c *Client) Search(ctx context.Context, query string, categories []int) ([]
 // gated on inequality, so titles without umlauts (the common case, and every
 // non-Latin script) never issue a second pass — the cost is one extra cascade
 // only for German titles that the ASCII form failed to find.
+//
+// Some trackers store a release title decomposed (NFD: "a" + U+030A instead of
+// "å") and match query bytes literally, so every composed query misses it while
+// the author alone finds it. When nothing has been found yet and the
+// decomposed spelling differs, the cascade runs once more with it. A title
+// with no decomposable letter (ASCII, "ø", "æ", Chinese, most Cyrillic) never
+// pays for that pass. Hangul, kana with dakuten or handakuten, and Cyrillic
+// "й" all decompose, so titles in those scripts do pay for it when the first
+// passes find nothing.
 func (c *Client) BookSearch(ctx context.Context, title, author string, categories []int) ([]SearchResult, error) {
+	results, _, err := c.BookSearchTraced(ctx, title, author, categories)
+	return results, err
+}
+
+// SearchTrace says what BookSearchTraced did beyond the ordinary tier cascade,
+// so SearchDebug can show it and the cost of the extra query stays measurable
+// (#3455).
+type SearchTrace struct {
+	// NumberWordQuery is the digit form of the title ("... Book 1") when the
+	// number word variant was sent, and empty when it was not. At most one
+	// extra query is ever sent for it.
+	NumberWordQuery string
+	// NumberWordResults is how many results that one query returned.
+	NumberWordResults int
+	// NumberWordError is why that one query failed (a 429, a timeout, the daily
+	// cap), empty when it succeeded or was not sent. Without it a failed
+	// variant looks like an indexer with nothing to offer.
+	NumberWordError string
+	// BudgetExhausted is true when the variant was refused by the daily query
+	// cap. The caller treats it as it treats the same refusal on any other
+	// query (flush the count, no health strike).
+	BudgetExhausted bool
+}
+
+// BookSearchTraced is BookSearch plus a SearchTrace.
+//
+// Number word variant (#3476). A title that spells a position out ("Book
+// One", "Part Two") is often named with the digit by the release ("Book 1"),
+// and indexers that require every query word to appear in the release name
+// return nothing for the spelled form on every tier. When the whole cascade
+// ends without a relevant result, ONE more query is sent: the title with those
+// words as digits (FoldNumberWords), as a title only t=search like tier 4. It
+// is sent only when the title contains such a number word, and only after the
+// cascade has already failed, so a search that was finding its book pays
+// nothing and a failing one pays a single query per indexer. Its results
+// replace the failed ones only when they pass the same relevance gate.
+func (c *Client) BookSearchTraced(ctx context.Context, title, author string, categories []int) ([]SearchResult, SearchTrace, error) {
+	var trace SearchTrace
+	results, err := c.bookSearchSpellings(ctx, title, author, categories)
+	if err != nil {
+		return nil, trace, err
+	}
+	origTitle := primaryTitleForQuery(title)
+	digitTitle := FoldNumberWords(origTitle)
+	if digitTitle == origTitle || !hasSearchableText(digitTitle) {
+		return results, trace, nil
+	}
+	if len(results) > 0 && titleHasRelevantResult(TransliterateQuery(origTitle), results) {
+		return results, trace, nil
+	}
+	digitQuery := TransliterateQuery(digitTitle)
+	slog.Debug("indexer query number word variant", "title", digitQuery)
+	trace.NumberWordQuery = digitQuery
+	extra, err := c.Search(ctx, digitQuery, categories)
+	if err != nil {
+		// The variant is an extra chance, not the search. A failure of it must
+		// not turn a "no results" into an indexer error or a health strike.
+		slog.Debug("indexer query number word variant failed", "error", err)
+		trace.NumberWordError = err.Error()
+		trace.BudgetExhausted = errors.Is(err, ErrQueryBudgetExhausted)
+		return results, trace, nil
+	}
+	trace.NumberWordResults = len(extra)
+	if len(extra) > 0 && titleHasRelevantResult(digitQuery, extra) {
+		return extra, trace, nil
+	}
+	return results, trace, nil
+}
+
+// bookSearchSpellings is the tier cascade over the transliterated, original and
+// decomposed spellings of the title; BookSearch's body before #3476.
+func (c *Client) bookSearchSpellings(ctx context.Context, title, author string, categories []int) ([]SearchResult, error) {
 	origTitle := primaryTitleForQuery(title)
 	origAuthor := norm.NFC.String(author)
 
@@ -355,7 +492,15 @@ func (c *Client) BookSearch(ctx context.Context, title, author string, categorie
 	if len(results) == 0 && (queryTitle != origTitle || queryAuthor != origAuthor) {
 		slog.Debug("indexer book search retry with original umlaut spelling",
 			"title", origTitle, "author", origAuthor)
-		return c.bookSearchTiers(ctx, origTitle, origAuthor, categories)
+		if results, err = c.bookSearchTiers(ctx, origTitle, origAuthor, categories); err != nil {
+			return nil, err
+		}
+	}
+	nfdTitle, nfdAuthor := norm.NFD.String(origTitle), norm.NFD.String(origAuthor)
+	if len(results) == 0 && (nfdTitle != origTitle || nfdAuthor != origAuthor) {
+		slog.Debug("indexer book search retry with decomposed (NFD) spelling",
+			"title", origTitle, "author", origAuthor)
+		return c.bookSearchTiers(ctx, nfdTitle, nfdAuthor, categories)
 	}
 	return results, nil
 }
@@ -540,19 +685,11 @@ func (c *Client) bookSearchTiers(ctx context.Context, queryTitle, author string,
 	return results, nil
 }
 
-// redactAPIKey replaces the apikey query parameter value with *** so URLs
-// can be logged without leaking credentials.
+// redactAPIKey replaces the value of every secret query parameter (the apikey
+// and the rest of httpsec's list) with REDACTED so URLs can be logged, and used
+// as a query-cache key, without carrying credentials.
 func redactAPIKey(rawURL string) string {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return rawURL
-	}
-	q := u.Query()
-	if q.Get("apikey") != "" {
-		q.Set("apikey", "***")
-		u.RawQuery = q.Encode()
-	}
-	return u.String()
+	return httpsec.RedactSecrets(rawURL)
 }
 
 // primaryTitleForQuery returns the portion of a book title before a colon,
@@ -569,7 +706,45 @@ func primaryTitleForQuery(title string) string {
 	if i := strings.Index(title, ":"); i > 0 {
 		title = title[:i]
 	}
-	return NormalizeQueryTitle(title)
+	return strings.Join(strings.Fields(wildcardToSpace(StripFormatQualifiers(NormalizeQueryTitle(title)))), " ")
+}
+
+// wildcardToSpace turns the asterisk into a word break in an outgoing query.
+// Titles that censor a word ("The Subtle Art of Not Giving a F*ck") keep the
+// asterisk in the catalogue, but Prowlarr's shared term sanitiser deletes it,
+// so the indexer was asked for "Fck" and found nothing (#1637). Sent as two
+// words the same indexer finds the release. The relevance gates already read
+// the asterisk as a separator, so only the query changes.
+func wildcardToSpace(s string) string {
+	return strings.ReplaceAll(s, "*", " ")
+}
+
+// formatQualifierRe matches a parenthesised FORMAT qualifier anywhere in a
+// title: "(Light Novel)", "(Novel)", "(Manga)", "(Graphic Novel)", "(Comic)".
+// Metadata providers put these mid title for series volumes ("The Rising of
+// the Shield Hero (Light Novel) Vol. 17"), where parenSuffixRe, being anchored
+// at the end, never reaches them. Release names do not carry them, so they
+// zeroed the query and became relevance keywords no release could satisfy.
+//
+// The list is closed on purpose. Arbitrary parentheses mid title are often
+// real title content ("The (Mis)Adventures of ..."), so only these known
+// qualifiers, filling the whole parenthesis, are removed.
+var formatQualifierRe = regexp.MustCompile(`(?i)\(\s*(?:light\s+novels?|graphic\s+novels?|novels?|manga|comics?)\s*\)`)
+
+// StripFormatQualifiers removes the known format qualifiers in parentheses
+// (see formatQualifierRe) from anywhere in title and collapses the whitespace
+// left behind. It is applied to the outgoing query (primaryTitleForQuery) and
+// to the title both indexer relevance filters tokenise, so the three agree.
+//
+// It is NOT part of NormalizeQueryTitle on purpose: that function feeds
+// indexer.CanonicalDedupKey, which is persisted as books.dedup_key, and
+// changing it would need a key revision bump and a backfill for a change that
+// is only about searching.
+func StripFormatQualifiers(title string) string {
+	if !strings.Contains(title, "(") {
+		return title
+	}
+	return strings.Join(strings.Fields(formatQualifierRe.ReplaceAllString(title, " ")), " ")
 }
 
 // parenSuffixRe matches a trailing parenthesised qualifier used by metadata
@@ -662,9 +837,15 @@ func titleHasRelevantResult(queryTitle string, results []SearchResult) bool {
 	//
 	// Gated on a non-empty word list: SigWordsElided returns nil for a title
 	// with no apostrophe, and an empty list means "nothing checkable" (true)
-	// upstream — letting it through here would accept junk for every title.
-	if elided := SigWordsElided(queryTitle); len(elided) > 0 {
-		return wordsPresentInAll(elided, combined)
+	// upstream; letting it through here would accept junk for every title.
+	if elided := SigWordsElided(queryTitle); len(elided) > 0 && wordsPresentInAll(elided, combined) {
+		return true
+	}
+	// A "Series N: Title" name is judged on the book's own title as well,
+	// since release names carry the title without the series position. Same
+	// two word floor as the relevance filter's fallback reading.
+	if series := SigWords(SeriesPositionTitle(queryTitle)); len(series) >= 2 && wordsPresentInAll(series, combined) {
+		return true
 	}
 	return false
 }
@@ -677,6 +858,17 @@ func wordsPresentInAll(words, combined []string) bool {
 		return true
 	}
 	for _, w := range words {
+		// A volume marker is satisfied by any of its spellings. Every
+		// spelling contains "vol", and this is a substring test, so that is
+		// the whole check (see IsVolumeMarker).
+		if IsVolumeMarker(w) {
+			w = "vol"
+		}
+		// The haystacks are in the release alphabet, where an umlaut is
+		// already its digraph. SigWords keeps the umlaut on the keyword (see
+		// SigWords), so expand it here or "müller" is never found in
+		// "mueller". Plain Contains, so no compact-spelling flex, as before.
+		w = textutil.TransliterateUmlauts(w)
 		found := false
 		for _, c := range combined {
 			if strings.Contains(c, w) {
@@ -884,9 +1076,10 @@ func (c *Client) getXMLCached(ctx context.Context, rawURL string, target interfa
 // error. The caller unmarshals.
 func (c *Client) fetchXML(ctx context.Context, rawURL string) ([]byte, error) {
 	// The daily query cap is enforced here rather than at the top of the
-	// searcher's fan-out because one BookSearch can issue up to eight requests
-	// as it falls through the tier cascade and the transliteration retry. A
-	// check made once per search could therefore overshoot the cap by seven;
+	// searcher's fan-out because one BookSearch can issue up to twelve requests
+	// as it falls through the tier cascade, the transliteration retry and the
+	// decomposed (NFD) retry. A check made once per search could therefore
+	// overshoot the cap by eleven;
 	// checked here it cannot overshoot at all. Requests served from the query
 	// cache never reach this function and correctly cost nothing (#2312).
 	if b := budgetFrom(ctx); b != nil && !b.Take() {

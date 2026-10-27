@@ -153,10 +153,21 @@ func (m *mockAuthorWorksByNameProvider) GetAuthorWorksByName(_ context.Context, 
 	return m.authorWorksByName, m.authorWorksByNameErr
 }
 
-func newTestAggregator(primary Provider, enrichers ...Provider) *Aggregator {
-	return &Aggregator{
+func newTestAggregator(primary Provider, enrichers ...Provider) *aggregatorCore {
+	return &aggregatorCore{requests: &requestCache{},
 		primary:   primary,
 		enrichers: enrichers,
 		cache:     newTTLCache(time.Minute),
 	}
 }
+
+// WithAudnexClient on a bare core is the test-only twin of the Aggregator
+// method, for fixtures built with newTestAggregator before anything reads them.
+func (a *aggregatorCore) WithAudnexClient(client AudnexBookClient) *aggregatorCore {
+	a.audnex = client
+	return a
+}
+
+// core returns the provider set an Aggregator is serving right now, so a test
+// can reach the unexported lookup helpers that run on it.
+func (a *Aggregator) core() *aggregatorCore { return a.load() }

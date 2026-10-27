@@ -242,23 +242,12 @@ func New(repo *db.NotificationRepo) *Notifier {
 	}
 }
 
-// guardedTransport mirrors the image-proxy transport. On the direct path it
-// installs a per-dial SSRF-revalidating DialContext, closing the DNS-rebind
-// TOCTOU between the up-front validate and the actual connect. When an outbound
-// proxy is configured the dial targets the operator-trusted proxy (not the
-// webhook host), so the strict per-dial recheck is skipped and the up-front
-// validate + CheckRedirect carry the guard.
+// guardedTransport installs a per-dial SSRF-revalidating DialContext, closing
+// the DNS-rebind TOCTOU between the up-front validate and the actual connect.
+// Under an outbound proxy the dial to the proxy itself is exempt and a
+// bypass-listed (direct) destination is checked.
 func guardedTransport(policy httpsec.Policy) http.RoundTripper {
-	base := httpsec.DefaultProxyTransport()
-	if httpsec.ProxyFunc() != nil {
-		return base
-	}
-	if t, ok := base.(*http.Transport); ok {
-		c := t.Clone()
-		c.DialContext = httpsec.NewDialContext(policy)
-		return c
-	}
-	return &http.Transport{DialContext: httpsec.NewDialContext(policy)}
+	return httpsec.GuardedTransport(policy)
 }
 
 // SetValidator overrides the SSRF validator. Intended for tests that need to
@@ -332,7 +321,7 @@ func (n *Notifier) send(ctx context.Context, notif *models.Notification, payload
 	// the validator, and DNS can shift after a row was saved.
 	if n.validate != nil {
 		if err := n.validate(notif.URL); err != nil {
-			return fmt.Errorf("url not allowed: %w", err)
+			return fmt.Errorf("url not allowed: %w", redactWebhookValidation(err, notif.URL))
 		}
 	}
 
@@ -396,7 +385,7 @@ func (n *Notifier) send(ctx context.Context, notif *models.Notification, payload
 
 	req, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("build request: %w", err)
+		return fmt.Errorf("build request: %w", redactWebhookError(err))
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", useragent.Get())
@@ -413,7 +402,10 @@ func (n *Notifier) send(ctx context.Context, notif *models.Notification, payload
 
 	resp, err := n.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("send webhook: %w", err)
+		// The *url.Error prints the full target URL, and a Discord, Slack or
+		// Telegram webhook URL is itself the credential. Send logs this error
+		// and the test endpoint returns it, so scrub it here.
+		return fmt.Errorf("send webhook: %w", redactWebhookError(err))
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)

@@ -638,9 +638,9 @@ func TestExistingBookSeriesLinker_ResolvesPrimaryAtWriteTime(t *testing.T) {
 
 // Review item 4. The cross provider title skip normalises through the shared
 // book title normaliser, so a doubled space, a case difference, an apostrophe
-// and a parenthetical suffix all count as the same series. An inverted article
-// is the documented gap, pinned here so the claim in the PR body and the wiki
-// stays honest.
+// and a parenthetical suffix all count as the same series, and so does an
+// inverted article ("Expanse, The"), which was a known gap until the shared
+// normaliser learned the filing form (#3122).
 func TestExistingBookSeriesLinker_TitleSkipNormalisation(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
@@ -652,7 +652,7 @@ func TestExistingBookSeriesLinker_TitleSkipNormalisation(t *testing.T) {
 		{"doubled space", "The Expanse", "The  Expanse", true},
 		{"apostrophe", "Dragon's Egg", "Dragons Egg", true},
 		{"parenthetical suffix", "The Expanse", "The Expanse (Publication Order)", true},
-		{"inverted article, known gap", "The Expanse", "Expanse, The", false},
+		{"inverted article", "The Expanse", "Expanse, The", true},
 		{"genuinely different", "The Expanse", "Imperial Radch", false},
 		{"sub-series is not the parent", "Discworld", "Discworld: Witches", false},
 	} {

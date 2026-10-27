@@ -4,6 +4,7 @@ import { api } from '../../api/client'
 import type { LibraryRequest, RequestStatus } from '../../api/client'
 import ApproveRequestForm from './ApproveRequestForm'
 import { mediaTypeLabel, REQUESTS_CHANGED_EVENT, requestStatusClass, requestStatusLabel } from './requestLabels'
+import { primaryFill } from '../../components/buttons'
 
 type Filter = RequestStatus | 'all'
 const FILTERS: Filter[] = ['pending', 'approved', 'declined', 'all']
@@ -40,9 +41,9 @@ export default function RequestsPage() {
   useEffect(() => { void load(0) }, [load])
 
   useEffect(() => {
-    document.title = 'Requests · Bindery'
+    document.title = `${t('requests.admin.title', 'Requests')} · Bindery`
     return () => { document.title = 'Bindery' }
-  }, [])
+  }, [t])
 
   const decided = (updated: LibraryRequest) => {
     setApproving(null)
@@ -89,7 +90,7 @@ export default function RequestsPage() {
       {/* Centered, with a hint line, so this reads like the Queue, Discover and
           Import empty states instead of a stray left aligned sentence. */}
       {!loading && !error && items.length === 0 && (
-        <div className="text-center py-16 text-slate-600 dark:text-zinc-500">
+        <div className="text-center py-16 text-fg-muted">
           <p>{filter === 'pending' ? t('requests.admin.emptyPending') : t('requests.admin.empty')}</p>
           <p className="mt-1 text-sm">
             {filter === 'pending' ? t('requests.admin.emptyPendingHint') : t('requests.admin.emptyHint')}
@@ -103,13 +104,15 @@ export default function RequestsPage() {
             <li key={r.id} className="p-4">
               <div className="flex items-start justify-between gap-4 flex-wrap">
                 <div className="min-w-0">
-                  <div className="font-medium break-words">{r.title}</div>
+                  <div className="font-medium [overflow-wrap:anywhere]">{r.title}</div>
                   <div className="text-xs text-fg-muted mt-0.5">
                     {r.kind === 'author' ? t('requests.kindAuthor') : r.authorName || t('requests.kindBook')}
                     {' · '}
                     {mediaTypeLabel(t, r.mediaType)}
                     {' · '}
                     {t('requests.admin.requestedBy', { username: r.username ?? '', date: new Date(r.createdAt).toLocaleDateString() })}
+                    {r.createdVia === 'api_key' && <>{' · '}{t('requests.admin.createdByAPIKey')}</>}
+                    {r.createdVia === 'admin' && <>{' · '}{t('requests.admin.createdByAdmin', { username: r.createdBy || t('requests.admin.deletedAdmin') })}</>}
                   </div>
                   {r.status === 'declined' && r.declineReason && (
                     <p className="text-xs mt-1">{t('requests.mine.reason', { reason: r.declineReason })}</p>
@@ -119,7 +122,7 @@ export default function RequestsPage() {
                   <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${requestStatusClass(r)}`}>{requestStatusLabel(t, r)}</span>
                   {r.status === 'pending' && approving !== r.id && declining !== r.id && (
                     <>
-                      <button type="button" onClick={() => { setApproving(r.id); setDeclining(null) }} aria-label={t('requests.admin.approveLabel', { title: r.title })} className="px-3 py-1 bg-emerald-600 hover:bg-emerald-500 rounded text-xs font-medium text-white">
+                      <button type="button" onClick={() => { setApproving(r.id); setDeclining(null) }} aria-label={t('requests.admin.approveLabel', { title: r.title })} className={`px-3 py-1 ${primaryFill} rounded text-xs font-medium`}>
                         {t('requests.admin.approve')}
                       </button>
                       <button type="button" onClick={() => { setDeclining(r.id); setApproving(null); setReason('') }} aria-label={t('requests.admin.declineLabel', { title: r.title })} className="px-3 py-1 rounded text-xs font-medium border border-slate-300 dark:border-zinc-700">

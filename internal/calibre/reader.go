@@ -12,7 +12,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/vavallee/bindery/internal/models"
 	_ "modernc.org/sqlite"
+
+	"github.com/vavallee/bindery/internal/db"
 )
 
 // metadataDB is the filename Calibre uses for its library database. The
@@ -144,7 +147,7 @@ func openReadOnlyWith(dbPath string, probe probeFunc) (*sql.DB, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	conn, err := sql.Open("sqlite", "file:"+dbPath+"?mode=ro&_pragma=busy_timeout(5000)")
+	conn, err := sql.Open("sqlite", db.SQLiteFileURI(dbPath, "mode=ro&_pragma=busy_timeout(5000)"))
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", dbPath, err)
 	}
@@ -156,7 +159,7 @@ func openReadOnlyWith(dbPath string, probe probeFunc) (*sql.DB, error) {
 	}
 	_ = conn.Close()
 
-	conn, err = sql.Open("sqlite", "file:"+dbPath+"?mode=ro&immutable=1")
+	conn, err = sql.Open("sqlite", db.SQLiteFileURI(dbPath, "mode=ro&immutable=1"))
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", dbPath, err)
 	}
@@ -370,10 +373,11 @@ func (r *Reader) loadISBN(ctx context.Context, bookID int64) (string, error) {
 	return isbn, nil
 }
 
-// loadLanguage returns the primary ISO 639-2 language code for the book from
-// Calibre's languages table, or empty string if none is set. Calibre stores
-// codes as three-letter ISO 639-2 strings (e.g. "eng", "deu", "fra") which
-// are the same format Bindery uses, so no translation is needed.
+// loadLanguage returns the primary language code for the book from Calibre's
+// languages table, or empty string if none is set. Calibre stores three-letter
+// codes in the ISO 639-2/T spelling ("deu", "fra", "nld") where Bindery stores
+// 639-2/B ("ger", "fre", "dut"), so the code is normalized here; English is
+// "eng" in both, which is why the difference went unnoticed (#3086).
 func (r *Reader) loadLanguage(ctx context.Context, bookID int64) (string, error) {
 	var lang string
 	row := r.db.QueryRowContext(ctx, `
@@ -394,7 +398,7 @@ func (r *Reader) loadLanguage(ctx context.Context, bookID int64) (string, error)
 		}
 		return "", fmt.Errorf("load language for book %d: %w", bookID, err)
 	}
-	return lang, nil
+	return models.NormalizeLanguageCode(lang), nil
 }
 
 // parseSeriesIndex reads Calibre's series_index column. The column is declared

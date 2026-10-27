@@ -304,3 +304,72 @@ func TestAmpersandPhraseAsymmetry(t *testing.T) {
 		t.Error(`a release named "Foundation and Empire" does not match its own book (#2465)`)
 	}
 }
+
+// TestCanonicalDedupKey_FilingForm pins #3122: a title filed with its article
+// behind a comma ("Trace of Death, A", Calibre's sort-title convention) is the
+// same work as the natural-order spelling, so both must key identically. The
+// key stays lossless and keeps the article, in leading position.
+func TestCanonicalDedupKey_FilingForm(t *testing.T) {
+	same := [][2]string{
+		{"A Trace of Death", "Trace of Death, A"},
+		{"The Hobbit", "Hobbit, The"},
+		{"An Ember in the Ashes", "Ember in the Ashes, An"},
+		{"Der Prozess", "Prozess, Der"},
+		{"Die Hoehle", "Höhle, Die"},
+		{"Das Boot", "Boot, Das"},
+		{"Les Miserables", "Miserables, Les"},
+		{"El Aleph", "Aleph, El"},
+		{"Het Achterhuis", "Achterhuis, Het"},
+		{"Een Zaak", "Zaak, Een"},
+		// Case and trailing qualifiers do not defeat the fold.
+		{"The Hobbit", "hobbit, the"},
+		{"The Hobbit", "Hobbit, The [Unabridged]"},
+		{"The Hobbit", "Hobbit, The (German Edition)"},
+		{"The Hobbit", "  Hobbit, The  "},
+	}
+	for _, c := range same {
+		if a, b := CanonicalDedupKey(c[0]), CanonicalDedupKey(c[1]); a == "" || a != b {
+			t.Errorf("CanonicalDedupKey(%q)=%q vs (%q)=%q, want equal and non-empty", c[0], a, c[1], b)
+		}
+	}
+	if got := CanonicalDedupKey("Trace of Death, A"); got != "a trace of death" {
+		t.Errorf("filing form key = %q, want %q", got, "a trace of death")
+	}
+
+	// A comma that is not a filing form is left alone, and a lone article after
+	// the last comma is the only shape that counts.
+	unchanged := map[string]string{
+		"Love, Actually":           "love actually",
+		"Me, Myself and I":         "me myself and i",
+		"Hello, A World":           "hello a world",
+		"Dust, Ash, and Bone":      "dust ash and bone",
+		"The Hobbit":               "the hobbit",
+		"A":                        "a",
+		", A":                      "a",
+		"Die, Die":                 "die die",
+		"Rock, Paper, Scissors, A": "a rock paper scissors",
+	}
+	for in, want := range unchanged {
+		if got := CanonicalDedupKey(in); got != want {
+			t.Errorf("CanonicalDedupKey(%q) = %q, want %q", in, got, want)
+		}
+	}
+
+	// Different works stay different.
+	if CanonicalDedupKey("A Trace of Death") == CanonicalDedupKey("Trace of Death") {
+		t.Error("dropping the article must not make two keys equal: the key is lossless")
+	}
+}
+
+// TestCompareTitles_FilingForm: the verdict inherits the fold, so the in-memory
+// TitleIndex that a catalogue refresh builds meets the other spelling.
+func TestCompareTitles_FilingForm(t *testing.T) {
+	if got := CompareTitles("A Trace of Death", "Trace of Death, A"); got != TitlesSame {
+		t.Errorf("CompareTitles = %v, want same", got)
+	}
+	ix := NewTitleIndex[int]()
+	ix.Add("Trace of Death, A", 7)
+	if v, ok := ix.Lookup("A Trace of Death"); !ok || v != 7 {
+		t.Errorf("TitleIndex lookup of the natural-order form = %d, %v; want 7, true", v, ok)
+	}
+}

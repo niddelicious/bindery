@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/json"
 	"net/http"
 	"strconv"
 
@@ -51,8 +50,7 @@ func (h *CustomFormatHandler) Get(w http.ResponseWriter, r *http.Request) {
 
 func (h *CustomFormatHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var cf models.CustomFormat
-	if err := json.NewDecoder(r.Body).Decode(&cf); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	if !decodeJSON(w, r, &cf) {
 		return
 	}
 	if cf.Name == "" {
@@ -76,13 +74,16 @@ func (h *CustomFormatHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	existing, err := h.repo.GetByID(r.Context(), id)
-	if err != nil || existing == nil {
+	if err != nil {
+		writeServerError(w, r, err)
+		return
+	}
+	if existing == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "custom format not found"})
 		return
 	}
 	var cf models.CustomFormat
-	if err := json.NewDecoder(r.Body).Decode(&cf); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	if !decodeJSON(w, r, &cf) {
 		return
 	}
 	cf.ID = id

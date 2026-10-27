@@ -60,7 +60,11 @@ point Bindery at a Prowlarr instance.
 - **API Key** — from the indexer.
 - **Categories** — comma-separated Newznab category IDs. Default `7020`
   (eBooks); `3030` is Audiobooks. Add custom IDs for indexers with
-  non-standard categories.
+  non-standard categories. A tracker that files its books under the Newznab
+  Other bucket can be set to `8000`: when an indexer lists nothing in the Books
+  (`7xxx`) or Audio (`3xxx`) range, Bindery searches the `8xxx` IDs it does
+  list as typed. If it lists no `8xxx` ID either, Bindery falls back to `7020`
+  for ebooks and `3030` for audiobooks.
 - **Include broad parent categories** — disabled by default. Enable it for an
   indexer that files releases loosely under Books (`7000`) or Audio (`3000`)
   rather than a specific child. Bindery then adds that parent to searches
@@ -167,8 +171,9 @@ explicit-address spellings, which ignore them. Put anything valid there
 
 Two rTorrent-specific limits, both from the protocol rather than Bindery:
 
-- **Per-indexer seed ratios are ignored.** rTorrent has no per-torrent ratio
-  limit over XML-RPC; configure a ratio group in `.rtorrent.rc` instead.
+- **Per-indexer seed ratios and seed times are ignored.** rTorrent has no
+  per-torrent ratio or seeding time limit over XML-RPC; configure a ratio group
+  in `.rtorrent.rc` instead.
 - **Removing a download with its data** deletes the files from *Bindery's*
   side, because rTorrent's `d.erase` deliberately leaves the payload on disk.
   That needs a path remap that resolves — either the client's own, or the

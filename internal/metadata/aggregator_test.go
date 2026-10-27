@@ -514,7 +514,7 @@ func TestAggregator_GetBook_LongDescription(t *testing.T) {
 	// We'll detect if enricher was called by overriding its SearchBooks
 	_ = enricherCalled
 	primary := &mockProvider{name: "ol", getBook: book}
-	agg := &Aggregator{
+	agg := &aggregatorCore{requests: &requestCache{},
 		primary:   primary,
 		enrichers: []Provider{enricher},
 		cache:     newTTLCache(time.Minute),
@@ -541,7 +541,7 @@ func TestAggregator_GetBook_ShortDescription_Enriched(t *testing.T) {
 		name:        "gb",
 		searchBooks: []models.Book{{Title: "Foundation", Description: richerDesc}},
 	}
-	agg := &Aggregator{
+	agg := &aggregatorCore{requests: &requestCache{},
 		primary:   primary,
 		enrichers: []Provider{enricher},
 		cache:     newTTLCache(time.Minute),
@@ -565,7 +565,7 @@ func TestAggregator_GetBook_Enrichment_RatingFilled(t *testing.T) {
 		name:        "hc",
 		searchBooks: []models.Book{{Title: "Short", Description: "Some desc", AverageRating: 4.5, RatingsCount: 100}},
 	}
-	agg := &Aggregator{
+	agg := &aggregatorCore{requests: &requestCache{},
 		primary:   primary,
 		enrichers: []Provider{enricher},
 		cache:     newTTLCache(time.Minute),
@@ -593,7 +593,7 @@ func TestAggregator_GetBook_Enrichment_GenresFromHardcover(t *testing.T) {
 		name:        "hardcover",
 		searchBooks: []models.Book{{Title: "Mistborn", Description: "Some desc", Genres: []string{"Fantasy", "Epic Fantasy"}}},
 	}
-	agg := &Aggregator{primary: primary, enrichers: []Provider{hc}, cache: newTTLCache(time.Minute)}
+	agg := &aggregatorCore{requests: &requestCache{}, primary: primary, enrichers: []Provider{hc}, cache: newTTLCache(time.Minute)}
 
 	got, err := agg.GetBook(context.Background(), "OL100W")
 	if err != nil {
@@ -616,7 +616,7 @@ func TestAggregator_GetBook_Enrichment_NonHardcoverGenresIgnored(t *testing.T) {
 		name:        "googlebooks",
 		searchBooks: []models.Book{{Title: "Dune", Description: "Some desc", Genres: []string{"Fiction / Science Fiction / General"}}},
 	}
-	agg := &Aggregator{primary: primary, enrichers: []Provider{gb}, cache: newTTLCache(time.Minute)}
+	agg := &aggregatorCore{requests: &requestCache{}, primary: primary, enrichers: []Provider{gb}, cache: newTTLCache(time.Minute)}
 
 	got, err := agg.GetBook(context.Background(), "OL200W")
 	if err != nil {
@@ -637,7 +637,7 @@ func TestAggregator_GetBook_Enrichment_EmptyHardcoverGenresDoNotBlank(t *testing
 		name:        "hardcover",
 		searchBooks: []models.Book{{Title: "Dune", Description: "Some desc"}}, // no genres
 	}
-	agg := &Aggregator{primary: primary, enrichers: []Provider{hc}, cache: newTTLCache(time.Minute)}
+	agg := &aggregatorCore{requests: &requestCache{}, primary: primary, enrichers: []Provider{hc}, cache: newTTLCache(time.Minute)}
 
 	got, err := agg.GetBook(context.Background(), "OL300W")
 	if err != nil {
@@ -815,5 +815,75 @@ func TestAggregator_ResolveBookByISBN_StillSkipsResultsWithoutAuthorID(t *testin
 	}
 	if got != nil {
 		t.Errorf("expected nil when no provider has an author ForeignID, got %+v", got)
+	}
+}
+
+// The primary provider's record wins the collapse for its identity, but a
+// count only a duplicate reported is still the best available answer to "how
+// many books does this author have", so it rides along on the winner.
+func TestAggregator_SearchAuthors_KeepsBookCountFromCollapsedDuplicate(t *testing.T) {
+	stats := func(n int) *models.AuthorStats { return &models.AuthorStats{BookCount: n} }
+	hc := &mockProvider{name: "hardcover", searchAuthors: []models.Author{
+		{Name: "Patrick Rothfuss", ForeignID: "hc:patrick-rothfuss", MetadataProvider: "hardcover"},
+	}}
+	ol := &mockProvider{name: "openlibrary", searchAuthors: []models.Author{
+		{Name: "Rothfuss, Patrick", ForeignID: "OL1394865A", MetadataProvider: "openlibrary", Statistics: stats(23)},
+		{Name: "Patrick Rothfuss", ForeignID: "OL9999999A", MetadataProvider: "openlibrary", Statistics: stats(4)},
+	}}
+
+	got, err := newTestAggregator(hc, ol).SearchAuthors(context.Background(), "Patrick Rothfuss")
+	if err != nil {
+		t.Fatalf("SearchAuthors: %v", err)
+	}
+	if len(got) != 1 || got[0].ForeignID != "hc:patrick-rothfuss" {
+		t.Fatalf("Hardcover primary must keep the hc: identity, got %+v", got)
+	}
+	if got[0].Statistics == nil || got[0].Statistics.BookCount != 23 {
+		t.Errorf("BookCount: want the largest duplicate's 23, got %+v", got[0].Statistics)
+	}
+	// The provider's own slice must not be written through.
+	if hc.searchAuthors[0].Statistics != nil {
+		t.Errorf("the borrowed count leaked into the provider's record: %+v", hc.searchAuthors[0].Statistics)
+	}
+}
+
+func TestAggregator_SearchAuthors_KeepsWinnersOwnBookCount(t *testing.T) {
+	stats := func(n int) *models.AuthorStats { return &models.AuthorStats{BookCount: n} }
+	hc := &mockProvider{name: "hardcover", searchAuthors: []models.Author{
+		{Name: "Patrick Rothfuss", ForeignID: "hc:patrick-rothfuss", MetadataProvider: "hardcover", Statistics: stats(9)},
+	}}
+	ol := &mockProvider{name: "openlibrary", searchAuthors: []models.Author{
+		{Name: "Patrick Rothfuss", ForeignID: "OL1394865A", MetadataProvider: "openlibrary", Statistics: stats(23)},
+	}}
+
+	got, err := newTestAggregator(hc, ol).SearchAuthors(context.Background(), "Patrick Rothfuss")
+	if err != nil {
+		t.Fatalf("SearchAuthors: %v", err)
+	}
+	if len(got) != 1 || got[0].Statistics == nil || got[0].Statistics.BookCount != 9 {
+		t.Errorf("a winner that reports its own count keeps it, got %+v", got)
+	}
+}
+
+func TestAggregator_SearchAuthors_BorrowedBookCountKeepsWinnersOtherStats(t *testing.T) {
+	hc := &mockProvider{name: "hardcover", searchAuthors: []models.Author{
+		{Name: "Patrick Rothfuss", ForeignID: "hc:patrick-rothfuss", MetadataProvider: "hardcover", Statistics: &models.AuthorStats{AvailableBooks: 2}},
+	}}
+	ol := &mockProvider{name: "openlibrary", searchAuthors: []models.Author{
+		{Name: "Patrick Rothfuss", ForeignID: "OL1394865A", MetadataProvider: "openlibrary", Statistics: &models.AuthorStats{BookCount: 23}},
+	}}
+
+	got, err := newTestAggregator(hc, ol).SearchAuthors(context.Background(), "Patrick Rothfuss")
+	if err != nil {
+		t.Fatalf("SearchAuthors: %v", err)
+	}
+	if len(got) != 1 || got[0].Statistics == nil {
+		t.Fatalf("want one record with statistics, got %+v", got)
+	}
+	if got[0].Statistics.BookCount != 23 || got[0].Statistics.AvailableBooks != 2 {
+		t.Errorf("want the borrowed count beside the winner's own stats, got %+v", got[0].Statistics)
+	}
+	if hc.searchAuthors[0].Statistics.BookCount != 0 {
+		t.Errorf("the borrowed count was written through the provider's pointer: %+v", hc.searchAuthors[0].Statistics)
 	}
 }

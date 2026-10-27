@@ -37,8 +37,11 @@ export default function MetadataLinksMenu({ links }: { links: MetadataSourceLink
     <div
       ref={rootRef}
       className="relative inline-flex"
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
+      // Hover only means something for a mouse. A tap fires pointerenter and
+      // an emulated mouseenter but never a matching leave, so tracking it would
+      // pin the menu open and leave the trigger unable to close it.
+      onPointerEnter={event => { if (event.pointerType === 'mouse') setHovered(true) }}
+      onPointerLeave={event => { if (event.pointerType === 'mouse') setHovered(false) }}
       onBlur={event => {
         if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setExpanded(false)
       }}
@@ -58,7 +61,7 @@ export default function MetadataLinksMenu({ links }: { links: MetadataSourceLink
         aria-expanded={open}
         aria-controls={panelId}
         onClick={() => setExpanded(value => !value)}
-        className="inline-flex items-center gap-1 rounded border border-slate-300 dark:border-zinc-700 bg-slate-100 dark:bg-zinc-800 px-2 py-1 font-medium text-slate-600 dark:text-zinc-300 hover:border-slate-400 dark:hover:border-zinc-600 hover:text-slate-900 dark:hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500"
+        className="inline-flex items-center gap-1 rounded border border-slate-300 dark:border-zinc-700 bg-slate-100 dark:bg-zinc-800 px-2 py-1 font-medium text-slate-600 dark:text-zinc-300 hover:border-slate-400 dark:hover:border-zinc-600 hover:text-slate-900 dark:hover:text-white focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-emerald-500"
       >
         <ExternalLinkIcon className="w-3.5 h-3.5" />
         {t('common.links')}
@@ -78,10 +81,10 @@ export default function MetadataLinksMenu({ links }: { links: MetadataSourceLink
               rel="noopener noreferrer"
               title={link.label}
               aria-label={t('common.viewOnSource', { source: link.label })}
-              className="flex items-center justify-between gap-3 px-3 py-2 text-xs text-slate-700 dark:text-zinc-200 hover:bg-slate-100 dark:hover:bg-zinc-800 focus-visible:outline-none focus-visible:bg-slate-100 dark:focus-visible:bg-zinc-800"
+              className="flex items-center justify-between gap-3 px-3 py-2 text-xs text-slate-700 dark:text-zinc-200 hover:bg-slate-100 dark:hover:bg-zinc-800 rounded focus-visible:-outline-offset-2 focus-visible:bg-slate-100 dark:focus-visible:bg-zinc-800"
             >
               <span>{link.label}</span>
-              <ExternalLinkIcon className="w-3.5 h-3.5 text-slate-400 dark:text-zinc-500" />
+              <ExternalLinkIcon className="w-3.5 h-3.5 text-fg-muted" />
             </a>
           ))}
         </div>

@@ -2,13 +2,34 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
+	"io/fs"
+	"log/slog"
 	"net/http"
 	"os"
+	"syscall"
 
 	"github.com/vavallee/bindery/internal/auth"
 	"github.com/vavallee/bindery/internal/db"
 	"github.com/vavallee/bindery/internal/models"
 )
+
+// rootFolderStatMessage is the fixed text for a root folder path that could not
+// be stat'ed, one per cause class: a missing path (often a volume that is not
+// mounted into the container), a path Bindery may not read (a UID or mode
+// mismatch), a parent that is a file, and anything else.
+func rootFolderStatMessage(err error) string {
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return "path does not exist; check the path, and that the volume is mounted into the container"
+	case errors.Is(err, fs.ErrPermission):
+		return "path is not readable by Bindery; check the folder's owner and permissions"
+	case errors.Is(err, syscall.ENOTDIR):
+		return "path is not valid: a parent of it is a file, not a folder"
+	default:
+		return "path is not accessible"
+	}
+}
 
 type RootFolderHandler struct {
 	folders *db.RootFolderRepo
@@ -48,7 +69,11 @@ func (h *RootFolderHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 	info, err := os.Stat(req.Path)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "path does not exist or is not accessible: " + err.Error()})
+		// The os error carries the submitted path and the errno, so it stays
+		// in the log. The cause class is what the operator needs to fix a bad
+		// mount or a permissions problem, and each class has a fixed message.
+		slog.Warn("root folder: path not accessible", "path", req.Path, "error", err)
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": rootFolderStatMessage(err)})
 		return
 	}
 	if !info.IsDir() {

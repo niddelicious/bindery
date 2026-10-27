@@ -190,7 +190,7 @@ func TestAggregator_EnrichBook_SkipsOnSearchError(t *testing.T) {
 		name:          "hc",
 		searchBookErr: errors.New("hardcover unavailable"),
 	}
-	agg := &Aggregator{
+	agg := &aggregatorCore{requests: &requestCache{},
 		primary:   primary,
 		enrichers: []Provider{enricher},
 		cache:     newTTLCache(time.Minute),
@@ -211,7 +211,7 @@ func TestAggregator_enrichBook_FillsCoverWhenMissing(t *testing.T) {
 		name:        "gb",
 		searchBooks: []models.Book{{Title: "Sapiens", Description: "A description.", ImageURL: "https://books.google.com/cover.jpg"}},
 	}
-	agg := &Aggregator{enrichers: []Provider{enricher}, cache: newTTLCache(time.Minute)}
+	agg := &aggregatorCore{requests: &requestCache{}, enrichers: []Provider{enricher}, cache: newTTLCache(time.Minute)}
 
 	book := &models.Book{Title: "Sapiens", ImageURL: ""}
 	agg.enrichBook(context.Background(), book)
@@ -225,7 +225,7 @@ func TestAggregator_enrichBook_KeepsExistingCover(t *testing.T) {
 		name:        "gb",
 		searchBooks: []models.Book{{Title: "Dune", ImageURL: "https://books.google.com/other.jpg"}},
 	}
-	agg := &Aggregator{enrichers: []Provider{enricher}, cache: newTTLCache(time.Minute)}
+	agg := &aggregatorCore{requests: &requestCache{}, enrichers: []Provider{enricher}, cache: newTTLCache(time.Minute)}
 
 	existing := "https://covers.openlibrary.org/b/id/123-L.jpg"
 	book := &models.Book{Title: "Dune", ImageURL: existing}
@@ -252,7 +252,7 @@ func TestAggregator_enrichBook_AuthorMismatchSkipsEnrichment(t *testing.T) {
 			ImageURL:    "https://example.com/wrong.jpg",
 		}},
 	}
-	agg := &Aggregator{enrichers: []Provider{enricher}, cache: newTTLCache(time.Minute)}
+	agg := &aggregatorCore{requests: &requestCache{}, enrichers: []Provider{enricher}, cache: newTTLCache(time.Minute)}
 
 	book := &models.Book{
 		Title:    "Die Verwandlung",
@@ -279,7 +279,7 @@ func TestAggregator_enrichBook_FillsCoverFromCoverProvider(t *testing.T) {
 		mockProvider: mockProvider{name: "dnb-cover"},
 		urls:         map[string]string{"9783844935776": "https://portal.dnb.de/opac/mvb/cover?isbn=9783844935776"},
 	}
-	agg := &Aggregator{
+	agg := &aggregatorCore{requests: &requestCache{},
 		primary:   primary,
 		enrichers: []Provider{cover},
 		cache:     newTTLCache(time.Minute),
@@ -312,7 +312,7 @@ func TestEnrichBook_CachesAcrossCalls(t *testing.T) {
 			ImageURL: "https://books.google.com/sapiens.jpg",
 		}},
 	}
-	agg := &Aggregator{enrichers: []Provider{enricher}, cache: newTTLCache(time.Minute)}
+	agg := &aggregatorCore{requests: &requestCache{}, enrichers: []Provider{enricher}, cache: newTTLCache(time.Minute)}
 
 	first := &models.Book{
 		ForeignID:        "OLW-123",
@@ -354,7 +354,7 @@ func TestEnrichBook_DifferentBooksGetSeparateCacheEntries(t *testing.T) {
 			"Homo Deus": {{Title: "Homo Deus", ImageURL: "https://books.google.com/homo-deus.jpg"}},
 		},
 	}
-	agg := &Aggregator{enrichers: []Provider{enricher}, cache: newTTLCache(time.Minute)}
+	agg := &aggregatorCore{requests: &requestCache{}, enrichers: []Provider{enricher}, cache: newTTLCache(time.Minute)}
 
 	a := &models.Book{ForeignID: "OLW-A", MetadataProvider: "openlibrary", Title: "Sapiens"}
 	b := &models.Book{ForeignID: "OLW-B", MetadataProvider: "openlibrary", Title: "Homo Deus"}
@@ -392,7 +392,7 @@ func TestEnrichBook_CacheDoesNotAliasBookPointer(t *testing.T) {
 		name:        "gb",
 		searchBooks: []models.Book{{Title: "Dune", ImageURL: "https://books.google.com/dune.jpg"}},
 	}
-	agg := &Aggregator{enrichers: []Provider{enricher}, cache: newTTLCache(time.Minute)}
+	agg := &aggregatorCore{requests: &requestCache{}, enrichers: []Provider{enricher}, cache: newTTLCache(time.Minute)}
 
 	first := &models.Book{ForeignID: "OLW-DUNE", MetadataProvider: "openlibrary", Title: "Dune"}
 	agg.enrichBook(context.Background(), first)
@@ -424,7 +424,7 @@ func TestAggregator_enrichBook_CoverProviderSkippedWhenAlreadyHaveCover(t *testi
 		mockProvider: mockProvider{name: "dnb-cover"},
 		urls:         map[string]string{"9783844935776": "https://example.com/mvb.jpg"},
 	}
-	agg := &Aggregator{enrichers: []Provider{cover}, cache: newTTLCache(time.Minute)}
+	agg := &aggregatorCore{requests: &requestCache{}, enrichers: []Provider{cover}, cache: newTTLCache(time.Minute)}
 	isbn := "9783844935776"
 	existing := "https://existing.example/cover.jpg"
 	book := &models.Book{
@@ -488,7 +488,7 @@ func TestAggregator_enrichBook_PrefersStrongerRatingSignal(t *testing.T) {
 			RatingsCount:  9000,
 		}},
 	}
-	agg := &Aggregator{enrichers: []Provider{enricher}, cache: newTTLCache(time.Minute)}
+	agg := &aggregatorCore{requests: &requestCache{}, enrichers: []Provider{enricher}, cache: newTTLCache(time.Minute)}
 
 	book := &models.Book{
 		Title:         "Dune",
@@ -514,7 +514,7 @@ func TestAggregator_enrichBook_KeepsStrongerExistingRating(t *testing.T) {
 			RatingsCount:  12,
 		}},
 	}
-	agg := &Aggregator{enrichers: []Provider{enricher}, cache: newTTLCache(time.Minute)}
+	agg := &aggregatorCore{requests: &requestCache{}, enrichers: []Provider{enricher}, cache: newTTLCache(time.Minute)}
 
 	book := &models.Book{
 		Title:         "Dune",
@@ -543,7 +543,7 @@ func TestAggregator_GetBook_NoCover_EnrichedFromProvider(t *testing.T) {
 		name:        "gb",
 		searchBooks: []models.Book{{Title: "21 Lessons for the 21st Century", ImageURL: "https://books.google.com/cover-en.jpg"}},
 	}
-	agg := &Aggregator{primary: primary, enrichers: []Provider{enricher}, cache: newTTLCache(time.Minute)}
+	agg := &aggregatorCore{requests: &requestCache{}, primary: primary, enrichers: []Provider{enricher}, cache: newTTLCache(time.Minute)}
 
 	got, err := agg.GetBook(context.Background(), "OL123W")
 	if err != nil {
@@ -571,7 +571,7 @@ func TestAggregator_GetAuthorWorks_CoversEnrichedForMissingOnes(t *testing.T) {
 			"Homo Deus": {{Title: "Homo Deus", ImageURL: "https://books.google.com/homo-deus.jpg"}},
 		},
 	}
-	agg := &Aggregator{primary: primary, enrichers: []Provider{enricher}, cache: newTTLCache(time.Minute)}
+	agg := &aggregatorCore{requests: &requestCache{}, primary: primary, enrichers: []Provider{enricher}, cache: newTTLCache(time.Minute)}
 
 	got, err := agg.GetAuthorWorks(context.Background(), "OL123A")
 	if err != nil {
@@ -598,7 +598,7 @@ func TestAggregator_GetAuthorWorks_NoEnrichersNoCovers(t *testing.T) {
 			authorWorks: []models.Book{{ForeignID: "OL1W", Title: "No Cover Book", ImageURL: ""}},
 		},
 	}
-	agg := &Aggregator{primary: primary, cache: newTTLCache(time.Minute)}
+	agg := &aggregatorCore{requests: &requestCache{}, primary: primary, cache: newTTLCache(time.Minute)}
 
 	got, err := agg.GetAuthorWorks(context.Background(), "OL456A")
 	if err != nil {
@@ -606,5 +606,98 @@ func TestAggregator_GetAuthorWorks_NoEnrichersNoCovers(t *testing.T) {
 	}
 	if got[0].ImageURL != "" {
 		t.Errorf("expected empty cover with no enrichers, got %q", got[0].ImageURL)
+	}
+}
+
+// A translation's cover is another book's cover (#3018): the cover-by-ISBN
+// fallback skips editions in another language. Here the book's own edition
+// has no cover at the cover provider and the German translation's does, so
+// the book gets none.
+func TestAggregator_enrichBook_CoverProviderSkipsTranslations(t *testing.T) {
+	own, translation := "9788200000011", "9783000000012"
+	cover := &mockCoverProvider{
+		mockProvider: mockProvider{name: "dnb-cover"},
+		urls:         map[string]string{translation: "https://portal.dnb.de/opac/mvb/cover?isbn=" + translation},
+	}
+	agg := &aggregatorCore{requests: &requestCache{}, primary: &mockProvider{name: "nb"}, enrichers: []Provider{cover}, cache: newTTLCache(time.Minute)}
+	book := &models.Book{
+		Title:    "Fjellvinden",
+		Author:   &models.Author{Name: "Kari Nordmann"},
+		Language: "nob",
+		Editions: []models.Edition{{ISBN13: &own, Language: "nob"}, {ISBN13: &translation, Language: "ger"}},
+	}
+	agg.enrichBook(context.Background(), book)
+	if book.ImageURL != "" {
+		t.Errorf("took the translation's cover: %q", book.ImageURL)
+	}
+	if cover.coverCalls != 1 {
+		t.Errorf("cover lookups = %d, want 1 (the own-language edition only)", cover.coverCalls)
+	}
+}
+
+// The enrichment snapshot is keyed on its inputs, and the cover guard reads the
+// book's and each edition's language (#3018). A work enriched while its language
+// was unknown took the German edition's cover; once the language is known, the
+// same work must not be served that cover from the snapshot.
+func TestAggregator_enrichBook_SnapshotKeyedOnLanguage(t *testing.T) {
+	translation := "9783000000012"
+	cover := &mockCoverProvider{
+		mockProvider: mockProvider{name: "dnb-cover"},
+		urls:         map[string]string{translation: "https://portal.dnb.de/opac/mvb/cover?isbn=" + translation},
+	}
+	agg := &aggregatorCore{requests: &requestCache{}, primary: &mockProvider{name: "nb"}, enrichers: []Provider{cover}, cache: newTTLCache(time.Hour)}
+	newBook := func(language string) *models.Book {
+		return &models.Book{
+			ForeignID: "NB1W",
+			Title:     "Fjellvinden",
+			Author:    &models.Author{Name: "Kari Nordmann"},
+			Language:  language,
+			Editions:  []models.Edition{{ISBN13: &translation, Language: "ger"}},
+		}
+	}
+
+	first := newBook("")
+	agg.enrichBook(context.Background(), first)
+	if first.ImageURL == "" {
+		t.Fatal("precondition: with the language unknown the German edition supplies the cover")
+	}
+
+	second := newBook("nob")
+	agg.enrichBook(context.Background(), second)
+	if second.ImageURL != "" {
+		t.Errorf("served the cached translation cover to a Norwegian book: %q", second.ImageURL)
+	}
+
+	// An edition's language changing is an input change as well.
+	third := newBook("nob")
+	third.Editions[0].Language = "nob"
+	agg.enrichBook(context.Background(), third)
+	if third.ImageURL == "" {
+		t.Error("a same-language edition should supply the cover rather than reuse the snapshot made for another language")
+	}
+}
+
+// Same-language editions, and editions or books without a language, are used
+// exactly as before.
+func TestCoverLanguageMatches(t *testing.T) {
+	for _, c := range []struct {
+		book, edition string
+		want          bool
+	}{
+		{"ger", "ger", true},
+		{"ger", "deu", true}, // 639-2/T and /B
+		{"nob", "nor", true}, // Norwegian written standards fold together
+		{"nob", "nno", true},
+		{"en", "eng", true},
+		{"", "ger", true},
+		{"nob", "", true},
+		{"nob", "und", true},
+		{"mul", "ger", true},
+		{"nob", "ger", false},
+		{"eng", "fre", false},
+	} {
+		if got := coverLanguageMatches(c.book, c.edition); got != c.want {
+			t.Errorf("coverLanguageMatches(%q, %q) = %v, want %v", c.book, c.edition, got, c.want)
+		}
 	}
 }

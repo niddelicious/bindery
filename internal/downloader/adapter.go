@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/vavallee/bindery/internal/downloader/nzbget"
+	"github.com/vavallee/bindery/internal/downloader/qbittorrent"
 	"github.com/vavallee/bindery/internal/downloader/transmission"
 	"github.com/vavallee/bindery/internal/models"
 	"github.com/vavallee/bindery/internal/pathmap"
@@ -56,6 +57,95 @@ type SendOptions struct {
 	// global rule); -1 is the unlimited sentinel. Only honored by torrent
 	// clients; SAB/NZBGet ignore it (ratio is a torrent concept).
 	SeedRatio *float64
+	// SeedTimeMinutes and InactiveSeedTimeMinutes are the per-indexer seed time
+	// overrides (#2206), in minutes, nil for no override. qBittorrent honours
+	// both, Transmission only the inactive one; see unappliedSeedLimits for
+	// the full table. Usenet clients ignore them.
+	SeedTimeMinutes         *int
+	InactiveSeedTimeMinutes *int
+	// GlobalRemap is BINDERY_DOWNLOAD_PATH_REMAP. torrentSavePath falls back
+	// to it when the client's own PathRemap does not cover the download
+	// folder, the same precedence the importer reads paths back with (#2665).
+	GlobalRemap string
+}
+
+// SeedLimits is the set of per-indexer seeding overrides resolved for a grab.
+type SeedLimits struct {
+	Ratio                   *float64
+	SeedTimeMinutes         *int
+	InactiveSeedTimeMinutes *int
+}
+
+// SeedLimitsFor reads the seeding overrides off the indexer a release was
+// grabbed from. A nil indexer (unknown, or the lookup failed) has none.
+func SeedLimitsFor(idx *models.Indexer) SeedLimits {
+	if idx == nil {
+		return SeedLimits{}
+	}
+	return SeedLimits{
+		Ratio:                   idx.SeedRatio,
+		SeedTimeMinutes:         idx.SeedTimeMinutes,
+		InactiveSeedTimeMinutes: idx.InactiveSeedTimeMinutes,
+	}
+}
+
+// WithSeedLimits returns the options with the given seeding overrides set.
+func (o SendOptions) WithSeedLimits(l SeedLimits) SendOptions {
+	o.SeedRatio = l.Ratio
+	o.SeedTimeMinutes = l.SeedTimeMinutes
+	o.InactiveSeedTimeMinutes = l.InactiveSeedTimeMinutes
+	return o
+}
+
+// unappliedSeedLimits names the seed time overrides (#2206) a torrent client
+// has no per-torrent way to apply, so the grab can say so in the log instead
+// of quietly pretending:
+//
+//	client        seed ratio  seed time  inactive seed time
+//	qBittorrent   yes         yes        yes (4.6 and later)
+//	Transmission  yes         no         yes (seedIdleLimit)
+//	Deluge        yes         no         no
+//	rTorrent      no          no         no
+//
+// The ratio column is not reported here: rTorrent's client already warns about
+// an ignored ratio itself. Usenet clients have no seeding at all and report
+// nothing.
+func unappliedSeedLimits(clientType string, opts SendOptions) []string {
+	var seedTime, inactive bool
+	switch clientType {
+	case "transmission":
+		seedTime = true
+	case "deluge", "rtorrent":
+		seedTime, inactive = true, true
+	}
+	var out []string
+	if seedTime && opts.SeedTimeMinutes != nil {
+		out = append(out, "seedTimeMinutes")
+	}
+	if inactive && opts.InactiveSeedTimeMinutes != nil {
+		out = append(out, "inactiveSeedTimeMinutes")
+	}
+	return out
+}
+
+// logValue dereferences an optional override for a log line, which would
+// otherwise print the pointer's address. nil logs as nil ("not set").
+func logValue[T any](p *T) any {
+	if p == nil {
+		return nil
+	}
+	return *p
+}
+
+// logUnappliedSeedLimits records, at debug, any seed time override the
+// client cannot carry. Debug rather than warn because nothing is wrong with
+// the grab: the torrent seeds under the client's own rule, which is what the
+// settings help text says will happen for that client.
+func logUnappliedSeedLimits(clientType string, opts SendOptions) {
+	if skipped := unappliedSeedLimits(clientType, opts); len(skipped) > 0 {
+		slog.Debug("seed time override not supported by this download client; the client's own rule applies",
+			"client_type", clientType, "limits", skipped)
+	}
 }
 
 func IsTorrentClient(clientType string) bool {
@@ -130,10 +220,14 @@ func SendDownload(ctx context.Context, client *models.DownloadClient, sourceURL,
 		if !strings.HasPrefix(transDL, "/") {
 			transDL = ""
 		}
-		added, err := trans.AddTorrentDetailed(ctx, sourceURL, transDL, opts.SeedRatio)
+		added, err := trans.AddTorrentWithLimits(ctx, sourceURL, transDL, transmission.SeedLimits{
+			Ratio:       opts.SeedRatio,
+			IdleMinutes: opts.InactiveSeedTimeMinutes,
+		})
 		if err != nil {
 			return nil, err
 		}
+		logUnappliedSeedLimits(client.Type, opts)
 		if added.ID == 0 {
 			return nil, fmt.Errorf("downloader accepted request but did not return a trackable torrent ID")
 		}
@@ -161,14 +255,21 @@ func SendDownload(ctx context.Context, client *models.DownloadClient, sourceURL,
 		if hash == "" {
 			return nil, fmt.Errorf("downloader accepted request but did not return a trackable torrent ID")
 		}
-		// Apply the per-indexer seed-ratio override (#883). qBittorrent has no
-		// ratioLimit param on /torrents/add, so it is a separate setShareLimits
-		// call once the hash is known. nil = no override; -1/-2 are valid
-		// sentinels qBit recognizes. A failure here must not fail the grab — the
-		// torrent is already added — so the error is logged, not returned.
-		if opts.SeedRatio != nil {
-			if err := qb.SetShareLimits(ctx, hash, *opts.SeedRatio); err != nil {
-				slog.Warn("qbittorrent: failed to set seed-ratio limit", "hash", hash, "ratio", *opts.SeedRatio, "error", err)
+		// Apply the per-indexer seed ratio (#883) and seed time (#2206)
+		// overrides with one setShareLimits call once the hash is known. An
+		// unset limit is sent as -2 so it keeps qBittorrent's global rule, and
+		// with nothing set the call is skipped. A failure here must not fail
+		// the grab, since the torrent is already added, so it is logged.
+		limits := qbittorrent.ShareLimits{
+			Ratio:                      opts.SeedRatio,
+			SeedingTimeMinutes:         opts.SeedTimeMinutes,
+			InactiveSeedingTimeMinutes: opts.InactiveSeedTimeMinutes,
+		}
+		if !limits.IsZero() {
+			if err := qb.SetShareLimitsDetailed(ctx, hash, limits); err != nil {
+				slog.Warn("qbittorrent: failed to set seed limits", "hash", hash,
+					"ratio", logValue(opts.SeedRatio), "seed_time_minutes", logValue(opts.SeedTimeMinutes),
+					"inactive_seed_time_minutes", logValue(opts.InactiveSeedTimeMinutes), "error", err)
 			}
 		}
 		result.RemoteID = hash
@@ -179,6 +280,7 @@ func SendDownload(ctx context.Context, client *models.DownloadClient, sourceURL,
 		if err != nil {
 			return nil, err
 		}
+		logUnappliedSeedLimits(client.Type, opts)
 		if hash == "" {
 			return nil, fmt.Errorf("downloader accepted request but did not return a trackable torrent ID")
 		}
@@ -188,11 +290,12 @@ func SendDownload(ctx context.Context, client *models.DownloadClient, sourceURL,
 		rt := RtorrentFor(client)
 		// Category is the ruTorrent label (d.custom1); the download directory
 		// comes from Bindery's configured download dir run back through the
-		// client's PathRemap, same as qBittorrent's savePath.
+		// path remaps, same as qBittorrent's savePath.
 		hash, err := rt.AddTorrent(ctx, sourceURL, ResolveCategory(client, opts.MediaType), torrentSavePath(client, opts), opts.SeedRatio)
 		if err != nil {
 			return nil, err
 		}
+		logUnappliedSeedLimits(client.Type, opts)
 		hash = strings.ToLower(strings.TrimSpace(hash))
 		if hash == "" {
 			return nil, fmt.Errorf("downloader accepted request but did not return a trackable torrent ID")
@@ -222,14 +325,16 @@ func SendDownload(ctx context.Context, client *models.DownloadClient, sourceURL,
 }
 
 // torrentSavePath renders Bindery's target download directory in the download
-// client's own filesystem namespace by running it back through the client's
-// PathRemap. Shared by qBittorrent (savePath) and rTorrent (d.directory.set).
+// client's own filesystem namespace via ClientSidePath: the client's PathRemap
+// first, then the global remap in opts.GlobalRemap, the order the importer
+// reads the path back in. Shared by qBittorrent (savePath) and rTorrent
+// (d.directory.set).
 func torrentSavePath(client *models.DownloadClient, opts SendOptions) string {
 	localPath := TargetDownloadDir(opts.MediaType, opts.DownloadDir, opts.AudiobookDownloadDir)
 	if strings.TrimSpace(localPath) == "" {
 		return ""
 	}
-	return pathmap.Parse(client.PathRemap).ApplyInverse(localPath)
+	return ClientSidePath(client, localPath, pathmap.Parse(opts.GlobalRemap))
 }
 
 // errTransmissionSessionID is returned when a removal is asked to act on a
@@ -312,90 +417,137 @@ func RemoveDownload(ctx context.Context, client *models.DownloadClient, dl *mode
 	}
 }
 
-// GetStalledIDs returns the set of remote IDs the client reports as stalled.
-// For qBittorrent this is the `stalledDL` state; for Transmission it is
-// torrents stopped with a non-empty error string. SABnzbd has no stall
-// concept — its failures are already surfaced as Failed-status NZBs in the
-// existing checkSABnzbdDownloads path.
+// GetStalledTorrents reports what the download client says about its own
+// stalls, split by how far each signal can be trusted on its own. See
+// StallReport: ClientReported is the client asserting that one torrent has
+// gone wrong, NoMetadata is an inference about torrents the client accepted
+// and never resolved (#2709), and the caller owes the NoMetadata half an age
+// gate and the LooksLikeClientOutage breadth check before acting on it.
 //
-// Keys for torrent clients are lower-cased hash strings; for SABnzbd they
-// would be NZO IDs (but SABnzbd always returns nil here). The second return
-// value matches GetLiveStatuses: true when IDs are torrent hashes.
-func GetStalledIDs(ctx context.Context, client *models.DownloadClient) (map[string]bool, bool, error) {
+// SABnzbd has no stall concept — its failures are already surfaced as
+// Failed-status NZBs in the existing checkSABnzbdDownloads path — so it
+// returns a zero report with UsesTorrentID false.
+//
+// Keys for torrent clients are lower-cased info hashes, Transmission included
+// since downloads store its hash rather than the session id (#2711).
+func GetStalledTorrents(ctx context.Context, client *models.DownloadClient) (StallReport, error) {
+	report := StallReport{
+		ClientReported: map[string]bool{},
+		NoMetadata:     map[string]bool{},
+	}
 	switch client.Type {
 	case "qbittorrent":
+		report.UsesTorrentID = true
 		qb := QbittorrentFor(client)
 		// Poll every category this client may have grabbed under; categoriesToPoll
 		// returns both Category and CategoryAudiobook when the latter is set
 		// (closes #700).
-		out := make(map[string]bool)
 		for _, cat := range CategoriesToPoll(client) {
 			torrents, err := qb.GetTorrents(ctx, cat)
 			if err != nil {
-				return nil, true, err
+				return StallReport{}, err
 			}
 			for _, t := range torrents {
-				state := strings.ToLower(t.State)
-				if state == "stalleddl" {
-					out[strings.ToLower(t.Hash)] = true
+				if t.Progress < 1 {
+					report.Incomplete++
+				}
+				switch {
+				case strings.ToLower(t.State) == "stalleddl":
+					report.ClientReported[strings.ToLower(t.Hash)] = true
+				case qbittorrentHasNoMetadata(t):
+					report.NoMetadata[strings.ToLower(t.Hash)] = true
 				}
 			}
 		}
-		return out, true, nil
+		return report, nil
 	case "transmission":
+		report.UsesTorrentID = true
 		trans := TransmissionFor(client)
-		torrents, err := trans.GetTorrents(ctx, client.Category)
-		if err != nil {
-			return nil, true, err
-		}
-		out := make(map[string]bool, len(torrents))
-		for _, t := range torrents {
-			// status 0 = stopped; treat stopped+error as stalled
-			if t.Status == 0 && strings.TrimSpace(t.ErrorString) != "" {
-				// Keyed by info hash, which is what a download stores. The
-				// numeric id is deliberately not offered as a fallback: the
+		// Poll every category this client may have grabbed under, the same way
+		// the importer does (#2712). Polling Category alone left audiobook
+		// torrents out of stall detection. A torrent both filters return is
+		// counted once, or the outage guard's denominator would double it.
+		seen := make(map[int64]bool)
+		for _, cat := range CategoriesToPoll(client) {
+			torrents, err := trans.GetTorrents(ctx, cat)
+			if err != nil {
+				return StallReport{}, err
+			}
+			for _, t := range torrents {
+				if seen[t.ID] {
+					continue
+				}
+				seen[t.ID] = true
+				if t.PercentDone < 1 {
+					report.Incomplete++
+				}
+				// Keyed by info hash, which is what a download stores (#2711).
+				// The numeric id is deliberately not offered as a fallback: the
 				// caller removes what it matches here, and a session id that
-				// has been renumbered would remove the wrong torrent.
-				if hash := strings.ToLower(strings.TrimSpace(t.HashString)); hash != "" {
-					out[hash] = true
+				// has been renumbered would remove the wrong torrent. A magnet
+				// carries its info hash from the moment it is added, so one
+				// with no metadata still has a hash to key on.
+				hash := strings.ToLower(strings.TrimSpace(t.HashString))
+				if hash == "" {
+					continue
+				}
+				switch {
+				// status 0 = stopped; treat stopped+error as stalled
+				case t.Status == 0 && strings.TrimSpace(t.ErrorString) != "":
+					report.ClientReported[hash] = true
+				case transmissionHasNoMetadata(t):
+					report.NoMetadata[hash] = true
 				}
 			}
 		}
-		return out, true, nil
+		return report, nil
 	case "deluge":
+		report.UsesTorrentID = true
 		dl := DelugeFor(client)
 		torrents, err := dl.GetTorrents(ctx)
 		if err != nil {
-			return nil, true, err
+			return StallReport{}, err
 		}
-		out := make(map[string]bool, len(torrents))
 		for h, t := range torrents {
-			if strings.ToLower(t.State) == "error" {
-				out[h] = true
+			// Deluge reports progress as a percentage, not a fraction.
+			if t.Progress < 100 {
+				report.Incomplete++
+			}
+			switch {
+			case strings.ToLower(t.State) == "error":
+				report.ClientReported[h] = true
+			case delugeHasNoMetadata(t):
+				report.NoMetadata[h] = true
 			}
 		}
-		return out, true, nil
+		return report, nil
 	case "rtorrent":
+		report.UsesTorrentID = true
 		rt := RtorrentFor(client)
 		// One multicall covers every label this client may have grabbed under;
 		// rTorrent has no server-side filter, so the extra label costs nothing.
 		torrents, err := rt.GetTorrents(ctx, CategoriesToPoll(client)...)
 		if err != nil {
-			return nil, true, err
+			return StallReport{}, err
 		}
-		out := make(map[string]bool, len(torrents))
 		for _, t := range torrents {
+			if !t.Complete {
+				report.Incomplete++
+			}
+			switch {
 			// rTorrent has no stall state. d.message is its per-torrent error
 			// slot — a tracker rejection or a failed hash check lands there and
 			// the torrent then sits inactive, which is the shape the stall
 			// detector exists to surface.
-			if t.Message != "" && !t.Complete {
-				out[t.Hash] = true
+			case t.Message != "" && !t.Complete:
+				report.ClientReported[t.Hash] = true
+			case rtorrentHasNoMetadata(t):
+				report.NoMetadata[t.Hash] = true
 			}
 		}
-		return out, true, nil
+		return report, nil
 	default:
-		return nil, false, nil
+		return StallReport{}, nil
 	}
 }
 

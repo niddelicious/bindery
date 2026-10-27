@@ -34,6 +34,12 @@ func timeArg(t *time.Time) any {
 // timeValueArg is the non-pointer sibling of timeArg, used for columns that
 // are always populated (created_at, updated_at).
 func timeValueArg(t time.Time) any {
+	return timeValueText(t)
+}
+
+// timeValueText is timeValueArg's string form, for callers that must record
+// the exact text they stored.
+func timeValueText(t time.Time) string {
 	return t.UTC().Format(time.RFC3339Nano)
 }
 
@@ -120,34 +126,31 @@ func (r *BookRepo) WithTx(tx *sql.Tx) *BookRepo {
 	return &clone
 }
 
-// bookCTE is a WITH clause that materialises the first book_files row per
-// format for every book. Using CTEs + LEFT JOINs avoids the correlated
-// subqueries that previously fired 2 N extra SQLite queries per book list.
-const bookCTE = `WITH first_ebook AS (
-	SELECT book_id, path FROM book_files
-	WHERE format = 'ebook'
-	GROUP BY book_id HAVING id = MIN(id)
-),
-first_audiobook AS (
-	SELECT book_id, path FROM book_files
-	WHERE format = 'audiobook'
-	GROUP BY book_id HAVING id = MIN(id)
-)`
+// bookCTE is the WITH clause that used to materialise the first book_files row
+// per format for every book. It is now empty: the CTE was built over the whole
+// book_files table on every query, so a single GetByID paid for the whole
+// table (about 50 ms at 30k files) and a 50 row list page for every row of
+// every book. The first file paths are now looked up per book, only when the
+// stored books.ebook_file_path / audiobook_file_path column is empty (see
+// bookColumns), by correlated subqueries bound to book_id on index
+// idx_book_files_format_book (format, book_id, id). The constant stays so the
+// call sites that concatenate it keep compiling.
+const bookCTE = ""
 
 // bookColumns is the canonical column list for book SELECT queries.
 //
 // ebook_file_path and audiobook_file_path read the stored column first and
-// fall back to the first_ebook / first_audiobook CTE. That order is load
+// fall back to the first book_files row of that format. That order is load
 // bearing (#2186). The column is not user-writable and is not stale: every
 // mutation of book_files goes through refreshBookStatus, which recomputes it
-// from the rows and writes it back. The CTE cannot do the same job, because
-// choosing the right row means asking the filesystem which paths still
-// resolve and SQL cannot stat. Reading the CTE first therefore overrode the
+// from the rows and writes it back. The file rows cannot do the same job,
+// because choosing the right row means asking the filesystem which paths
+// still resolve and SQL cannot stat. Reading the file rows first therefore overrode the
 // answer refreshBookStatus had already worked out, and a book whose file had
 // moved kept rendering the dead path.
 //
-// The CTE remains the fallback for the shape migration 028 leaves behind: a
-// book backfilled from the legacy untyped file_path column got an 'ebook'
+// The correlated subqueries remain the fallback for the shape migration 028
+// leaves behind: a book backfilled from the legacy untyped file_path column got an 'ebook'
 // book_files row while books.ebook_file_path stayed empty, and it also covers
 // any book whose column was never written.
 //
@@ -163,20 +166,19 @@ const bookColumns = `books.id, books.foreign_id, books.author_id, books.title, b
 	books.any_edition_ok, books.selected_edition_id, books.file_path, books.language,
 	books.media_type, books.narrator, books.duration_seconds, books.asin,
 	books.calibre_id, books.metadata_provider, books.last_metadata_refresh_at,
-	books.created_at, books.updated_at,
-	COALESCE(NULLIF(books.ebook_file_path, ''), fe.path, ''),
-	COALESCE(NULLIF(books.audiobook_file_path, ''), fa.path, ''),
+	books.created_at, books.updated_at, CAST(books.updated_at AS TEXT),
+	COALESCE(NULLIF(books.ebook_file_path, ''),
+		(SELECT bf.path FROM book_files bf WHERE bf.format = 'ebook' AND bf.book_id = books.id ORDER BY bf.id LIMIT 1), ''),
+	COALESCE(NULLIF(books.audiobook_file_path, ''),
+		(SELECT bf.path FROM book_files bf WHERE bf.format = 'audiobook' AND bf.book_id = books.id ORDER BY bf.id LIMIT 1), ''),
 	books.excluded, COALESCE(books.dedup_key, ''),
 	au.id, au.foreign_id, au.name, au.sort_name,
 	COALESCE(books.owner_user_id, 0),
 	COALESCE(books.locked_fields, '[]')`
 
-// bookJoins are the LEFT JOINs that attach the first_ebook and first_audiobook
-// CTE results plus the author row to the books table. Must follow the FROM
-// books clause.
-const bookJoins = `LEFT JOIN first_ebook    fe ON fe.book_id = books.id
-LEFT JOIN first_audiobook fa ON fa.book_id = books.id
-LEFT JOIN authors         au ON au.id = books.author_id`
+// bookJoins is the LEFT JOIN that attaches the author row to the books table.
+// Must follow the FROM books clause.
+const bookJoins = `LEFT JOIN authors au ON au.id = books.author_id`
 
 func (r *BookRepo) List(ctx context.Context) ([]models.Book, error) {
 	return r.query(ctx, bookCTE+" SELECT "+bookColumns+" FROM books "+bookJoins+" WHERE excluded = 0 ORDER BY books.sort_key, sort_title", nil)
@@ -228,7 +230,9 @@ type BookListFilter struct {
 	Search string
 	// Status restricts to books with that status. As a special case, "wanted"
 	// additionally requires monitored = 1 (an unmonitored book is not wanted),
-	// matching the old client-side filter. Empty disables the filter.
+	// matching the old client-side filter. "imported" (In Library) also matches a
+	// wanted book that has at least one tracked file, so a partially owned dual
+	// format book shows under both (#3132). Empty disables the filter.
 	Status string
 	// MediaType is "ebook" (matches ebook/both/unset, mirroring the UI default)
 	// or "audiobook" (matches audiobook/both). Any other value disables it.
@@ -238,7 +242,8 @@ type BookListFilter struct {
 	// Lets the Books page surface unmonitored/unwanted books (#1349).
 	Monitored *bool
 	// Sort is one of "title-az" (default), "title-za", "date-new", "date-old",
-	// "author-az", "author-za", "type-az", "type-za", "status-az", "status-za".
+	// "author-az", "author-za", "type-az", "type-za", "status-az", "status-za",
+	// "rating-asc", "rating-desc".
 	Sort string
 	// ReleaseFrom / ReleaseBefore bound release_date to [ReleaseFrom, ReleaseBefore)
 	// (ISO date strings; lexical compare works for ISO-8601). Used by the
@@ -247,6 +252,15 @@ type BookListFilter struct {
 	// bound is set.
 	ReleaseFrom   string
 	ReleaseBefore string
+	// IncludeExcluded lists books flagged excluded as well. The default
+	// (false) drops them, which is what every list but the Wanted page's
+	// "show excluded" toggle wants.
+	IncludeExcluded bool
+	// DownloadableOnly restricts to books with status imported and a file path,
+	// which is what a download catalogue can serve. Unlike Status "imported" it
+	// does not admit a wanted book that owns some file, so a list and its total
+	// agree with a caller that drops anything it cannot link to.
+	DownloadableOnly bool
 }
 
 // bookSearchRank returns the ORDER BY prefix that ranks a search result set,
@@ -302,6 +316,11 @@ func bookSortOrder(sort string) string {
 		return "books.status COLLATE NOCASE ASC, " + bookTitleOrder
 	case "status-za":
 		return "books.status COLLATE NOCASE DESC, " + bookTitleOrder
+	// Unrated books sort last in both directions, like NULL release dates.
+	case "rating-asc":
+		return "books.average_rating <= 0, books.average_rating ASC, " + bookTitleOrder
+	case "rating-desc":
+		return "books.average_rating <= 0, books.average_rating DESC, books.ratings_count DESC, " + bookTitleOrder
 	default:
 		return bookTitleOrder
 	}
@@ -320,7 +339,11 @@ func (r *BookRepo) ListPageFiltered(ctx context.Context, f BookListFilter, limit
 		offset = 0
 	}
 
-	where, args := QueryScopeForIncludingNull("books.owner_user_id", "WHERE excluded = 0", f.UserID)
+	base := "WHERE excluded = 0"
+	if f.IncludeExcluded {
+		base = "WHERE 1 = 1"
+	}
+	where, args := QueryScopeForIncludingNull("books.owner_user_id", base, f.UserID)
 	searchOrder, rankArgs := "", []any(nil)
 	if folded := textutil.FoldForSearch(f.Search); folded != "" {
 		// A query that folds to nothing (all punctuation, or an emoji) leaves
@@ -333,25 +356,40 @@ func (r *BookRepo) ListPageFiltered(ctx context.Context, f BookListFilter, limit
 		// "muller" never found "Müller" and a decomposed query never found a
 		// composed row (#1660). Both sides now pass through FoldForSearch.
 		//
-		// Every token must appear somewhere in the title or the author, which
-		// is the "words" rule Algolia and Meilisearch both use: it lets
-		// "hobbit tolkien" find the book without the two words being adjacent,
-		// while still requiring evidence for each word the user typed. Capped
+		// Every token must appear somewhere in the title, the author or the
+		// name of a series the book is in (#3462), which is the "words" rule
+		// Algolia and Meilisearch both use: it lets "hobbit tolkien" find the
+		// book without the two words being adjacent, while still requiring
+		// evidence for each word the user typed. A series-only match ranks
+		// below every title or author match (bookSearchRank). Capped
 		// at maxSearchTokens (searchrank.go) so the statement's size is
 		// bounded by that constant, not by the input.
 		for _, tok := range searchTokens(folded) {
 			like := "%" + escapeLike(tok) + "%"
-			where += " AND (books.search_key LIKE ? ESCAPE '\\' OR COALESCE(au.search_key, '') LIKE ? ESCAPE '\\')"
-			args = append(args, like, like)
+			where += " AND (books.search_key LIKE ? ESCAPE '\\' OR COALESCE(au.search_key, '') LIKE ? ESCAPE '\\'" +
+				" OR EXISTS (SELECT 1 FROM series_books sb JOIN series s ON s.id = sb.series_id" +
+				" WHERE sb.book_id = books.id AND s.search_key LIKE ? ESCAPE '\\'))"
+			args = append(args, like, like, like)
 		}
 		searchOrder, rankArgs = bookSearchRank(folded)
 	}
-	if f.Status != "" {
+	if f.DownloadableOnly {
+		where += " AND books.status = '" + models.BookStatusImported + "' AND COALESCE(books.file_path, '') <> ''"
+	}
+	switch f.Status {
+	case "":
+	case models.BookStatusImported:
+		// In Library means "owns at least one format", not "owns every format
+		// it wants" (#3132). See InLibraryPredicate for the rule. With a format
+		// chip active the wanted branch must own that format, so Audiobook plus
+		// In Library does not list a book that only has an ebook.
+		where += " AND " + InLibraryPredicate("books", f.MediaType)
+	case models.BookStatusWanted:
+		where += " AND books.status = ? AND books.monitored = 1"
+		args = append(args, f.Status)
+	default:
 		where += " AND books.status = ?"
 		args = append(args, f.Status)
-		if f.Status == models.BookStatusWanted {
-			where += " AND books.monitored = 1"
-		}
 	}
 	switch f.MediaType {
 	case "ebook":
@@ -380,15 +418,35 @@ func (r *BookRepo) ListPageFiltered(ctx context.Context, f BookListFilter, limit
 		args = append(args, rb)
 	}
 
-	total, err := r.count(ctx, bookCTE+" SELECT COUNT(*) FROM books "+bookJoins+" "+where, args)
+	// The count needs the author join only for a search (it matches the author's
+	// search key); every other predicate reads books alone. Without a search it
+	// skips the joins and the two book_files CTEs, which otherwise build over the
+	// whole table to count rows they never read.
+	countSQL := "SELECT COUNT(*) FROM books " + where
+	if searchOrder != "" {
+		countSQL = bookCTE + " SELECT COUNT(*) FROM books " + bookJoins + " " + where
+	}
+	total, err := r.count(ctx, countSQL, args)
 	if err != nil {
 		return nil, 0, err
 	}
+	// With a search, relevance leads only under the default sort: none,
+	// title-az (which every list starts on), or a value bookSortOrder does
+	// not know and reads as title order. A sort the reader picked, such as
+	// Newest, leads and relevance breaks its ties: ranked first, the chosen
+	// sort only reordered books within one rank tier and looked ignored while
+	// the control still said Newest.
+	sortOrder := bookSortOrder(f.Sort)
+	orderBy := searchOrder + sortOrder
+	if searchOrder != "" && sortOrder != bookTitleOrder {
+		orderBy = sortOrder + ", " + strings.TrimSuffix(searchOrder, ", ")
+	}
 	q := bookCTE + " SELECT " + bookColumns + " FROM books " + bookJoins + " " + where +
-		" ORDER BY " + searchOrder + bookSortOrder(f.Sort) + " LIMIT ? OFFSET ?"
+		" ORDER BY " + orderBy + " LIMIT ? OFFSET ?"
 	// The rank placeholders live in ORDER BY, which the parser reaches after
 	// WHERE, so their values follow the filter's. The count query above has no
-	// ORDER BY and therefore takes args alone.
+	// ORDER BY and therefore takes args alone. Moving the rank after the sort
+	// keeps the order of the placeholders: the sort clauses bind none.
 	pageArgs := append(append(append([]any{}, args...), rankArgs...), limit, offset)
 	books, err := r.query(ctx, q, pageArgs)
 	if err != nil {
@@ -409,6 +467,26 @@ func (r *BookRepo) count(ctx context.Context, query string, args []any) (int, er
 		return 0, fmt.Errorf("count books: %w", err)
 	}
 	return total, nil
+}
+
+// SearchImported runs the same library search the Books page uses (title or
+// author, accent and case folded, every word must match) over the books the
+// caller owns that can be downloaded (imported, with a file; a wanted book that owns some file is excluded and not counted). userID 0 is unscoped; otherwise rows
+// with owner_user_id = userID or NULL are searched, as everywhere else. A query
+// that carries no searchable characters returns nothing rather than the whole
+// library, since this feeds a client's search box. The total is the full match
+// count for paging.
+func (r *BookRepo) SearchImported(ctx context.Context, query string, userID int64, limit, offset int) ([]models.Book, int, error) {
+	if textutil.FoldForSearch(query) == "" {
+		return nil, 0, nil
+	}
+	return r.ListPageFiltered(ctx, BookListFilter{
+		UserID: userID,
+		Search: query,
+		Sort:   "title-az",
+
+		DownloadableOnly: true,
+	}, limit, offset)
 }
 
 // ListIncludingExcluded returns all books regardless of their excluded flag.
@@ -626,6 +704,10 @@ func (r *BookRepo) Create(ctx context.Context, b *models.Book) error {
 	// was written by anything other than textutil.FoldForSearch is a row the
 	// search box cannot find, and it would fail silently.
 	b.DedupKey = indexer.CanonicalDedupKey(b.Title)
+	// The language is canonicalised here, at the one place every write passes
+	// through, so a provider or copy site that hands over a raw code ("nob",
+	// "deu", "en") cannot undo the startup backfill (#3086).
+	b.Language = models.NormalizeLanguageCode(b.Language)
 
 	lockedJSON, err := json.Marshal(lockedOrEmpty(b.LockedFields))
 	if err != nil {
@@ -666,6 +748,7 @@ func (r *BookRepo) Create(ctx context.Context, b *models.Book) error {
 	b.ID = id
 	b.CreatedAt = now
 	b.UpdatedAt = now
+	b.UpdatedAtRaw = timeValueText(now)
 
 	// Record the identities this book is known by (#1705). The primary id is
 	// always attached; HardcoverForeignID is attached too when the aggregator
@@ -713,10 +796,30 @@ func (r *BookRepo) Create(ctx context.Context, b *models.Book) error {
 }
 
 func (r *BookRepo) Update(ctx context.Context, b *models.Book) error {
+	_, err := r.update(ctx, b, "")
+	return err
+}
+
+// UpdateIfUnchanged is Update guarded on the row not having changed since b
+// was read: expectedUpdatedAt is the snapshot's UpdatedAtRaw, compared as
+// stored text like UpdateHydratedMetadata. It reports false, without writing
+// or reloading b, when a concurrent write got there first. For callers that must
+// write the whole row after a provider call, such as an ASIN metadata map
+// that changes the book's identity (#2926).
+func (r *BookRepo) UpdateIfUnchanged(ctx context.Context, b *models.Book, expectedUpdatedAt string) (bool, error) {
+	if b == nil || b.ID == 0 || expectedUpdatedAt == "" {
+		return false, fmt.Errorf("update book: invalid book snapshot")
+	}
+	return r.update(ctx, b, expectedUpdatedAt)
+}
+
+// update writes every column of b. A non-empty expectedUpdatedAt adds the
+// stored-text updated_at precondition.
+func (r *BookRepo) update(ctx context.Context, b *models.Book, expectedUpdatedAt string) (bool, error) {
 	now := time.Now().UTC()
 	genresJSON, err := json.Marshal(b.Genres)
 	if err != nil {
-		return fmt.Errorf("marshal book genres: %w", err)
+		return false, fmt.Errorf("marshal book genres: %w", err)
 	}
 
 	mediaType := b.MediaType
@@ -728,13 +831,17 @@ func (r *BookRepo) Update(ctx context.Context, b *models.Book) error {
 	// importers rewrites Title on every update, so recomputing here prevents a
 	// stale key after a title edit/refresh from silently breaking future binds.
 	b.DedupKey = indexer.CanonicalDedupKey(b.Title)
+	// The language is canonicalised here, at the one place every write passes
+	// through, so a provider or copy site that hands over a raw code ("nob",
+	// "deu", "en") cannot undo the startup backfill (#3086).
+	b.Language = models.NormalizeLanguageCode(b.Language)
 
 	lockedJSON, err := json.Marshal(lockedOrEmpty(b.LockedFields))
 	if err != nil {
-		return fmt.Errorf("marshal book locked_fields: %w", err)
+		return false, fmt.Errorf("marshal book locked_fields: %w", err)
 	}
 
-	_, err = r.exec.ExecContext(ctx, `
+	query := `
 		UPDATE books SET foreign_id=?, author_id=?, title=?, sort_title=?, original_title=?, description=?, image_url=?,
 		                 release_date=?, genres=?, average_rating=?, ratings_count=?,
 		                 monitored=?, status=?, any_edition_ok=?, selected_edition_id=?,
@@ -742,31 +849,111 @@ func (r *BookRepo) Update(ctx context.Context, b *models.Book) error {
 		                 metadata_provider=?, dedup_key=?, sort_key=?, search_key=?,
 		                 locked_fields=?, last_metadata_refresh_at=?, updated_at=?,
 		                 ebook_file_path=?, audiobook_file_path=?
-		WHERE id=?`,
+		WHERE id=?`
+	args := []any{
 		b.ForeignID, b.AuthorID, b.Title, b.SortTitle, b.OriginalTitle, b.Description, b.ImageURL,
 		timeArg(b.ReleaseDate), string(genresJSON), b.AverageRating, b.RatingsCount,
 		b.Monitored, b.Status, b.AnyEditionOK, b.SelectedEditionID,
 		b.FilePath, b.Language, mediaType, b.Narrator, b.DurationSeconds, b.ASIN,
 		b.MetadataProvider, b.DedupKey, bookSortKey(b.SortTitle, b.Title), textutil.FoldForSearch(b.Title),
 		string(lockedJSON), timeArg(b.LastMetadataRefreshAt), timeValueArg(now),
-		b.EbookFilePath, b.AudiobookFilePath, b.ID)
+		b.EbookFilePath, b.AudiobookFilePath, b.ID,
+	}
+	if expectedUpdatedAt != "" {
+		query += ` AND CAST(updated_at AS TEXT)=?`
+		args = append(args, expectedUpdatedAt)
+	}
+	res, err := r.exec.ExecContext(ctx, query, args...)
 	if err != nil {
-		return fmt.Errorf("update book %d: %w", b.ID, err)
+		return false, fmt.Errorf("update book %d: %w", b.ID, err)
+	}
+	if expectedUpdatedAt != "" {
+		n, err := res.RowsAffected()
+		if err != nil {
+			return false, fmt.Errorf("check update for book %d: %w", b.ID, err)
+		}
+		if n == 0 {
+			return false, nil
+		}
 	}
 	b.UpdatedAt = now
+	b.UpdatedAtRaw = timeValueText(now)
+	return true, nil
+}
+
+// UpdateHydratedMetadata persists only the fields written by edition hydration
+// and audiobook enrichment, provided the book has not changed since fetching
+// began. A concurrent edit wins the entire write; b is reloaded in that case so
+// callers cannot act on discarded ASINs, metadata, or locks.
+//
+// expectedUpdatedAt is the snapshot's UpdatedAtRaw. It is compared as stored
+// text because legacy rows hold shapes a reformatted time.Time never matches.
+func (r *BookRepo) UpdateHydratedMetadata(ctx context.Context, b *models.Book, expectedUpdatedAt string) (bool, error) {
+	if b == nil || b.ID == 0 || expectedUpdatedAt == "" {
+		return false, fmt.Errorf("update hydrated metadata: invalid book snapshot")
+	}
+	mediaType := b.MediaType
+	if mediaType == "" {
+		mediaType = models.MediaTypeEbook
+	}
+	b.Language = models.NormalizeLanguageCode(b.Language)
+	now := time.Now().UTC()
+	res, err := r.exec.ExecContext(ctx, `
+		UPDATE books SET language=?, image_url=?, media_type=?, status=?, asin=?,
+		                 narrator=?, duration_seconds=?, description=?, updated_at=?
+		WHERE id=? AND CAST(updated_at AS TEXT)=?`,
+		b.Language, b.ImageURL, mediaType, b.Status, b.ASIN,
+		b.Narrator, b.DurationSeconds, b.Description, timeValueArg(now),
+		b.ID, expectedUpdatedAt)
+	if err != nil {
+		return false, fmt.Errorf("update hydrated metadata for book %d: %w", b.ID, err)
+	}
+	updated, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("check hydrated metadata update for book %d: %w", b.ID, err)
+	}
+	if updated > 0 {
+		b.UpdatedAt = now
+		b.UpdatedAtRaw = timeValueText(now)
+		return true, nil
+	}
+	return false, r.ReloadHydratedBook(ctx, b)
+}
+
+// ReloadHydratedBook refreshes persisted state without dropping the provider
+// context that ingestion still needs after hydration.
+func (r *BookRepo) ReloadHydratedBook(ctx context.Context, b *models.Book) error {
+	current, err := r.GetByID(ctx, b.ID)
+	if err != nil {
+		return fmt.Errorf("reload book %d after hydration: %w", b.ID, err)
+	}
+	if current == nil {
+		return fmt.Errorf("reload book %d after hydration: %w", b.ID, sql.ErrNoRows)
+	}
+	// A concurrent rebind makes the old work's provider context invalid.
+	if current.ForeignID == b.ForeignID && current.MetadataProvider == b.MetadataProvider {
+		current.SeriesRefs = b.SeriesRefs
+		current.ProviderISBNs = b.ProviderISBNs
+		current.CreditedAuthorForeignIDs = b.CreditedAuthorForeignIDs
+		current.HardcoverForeignID = b.HardcoverForeignID
+		current.IsCompilation = b.IsCompilation
+		current.EditionCount = b.EditionCount
+		current.AuthorUnmonitored = b.AuthorUnmonitored
+	}
+	*b = *current
 	return nil
 }
 
 // FillMissingAudiobookDuration persists a duration derived from edition metadata
 // without rewriting a book that may have changed during the provider fetch.
-// On a guarded-write miss, it returns the current duration only if the book's
-// provider, media type, and ASIN still match the source of the fetched runtime.
-func (r *BookRepo) FillMissingAudiobookDuration(ctx context.Context, b *models.Book) (bool, int, error) {
+// After either a successful write or a guarded-write miss, b is refreshed so
+// callers use the current identity, duration, and monitoring state together.
+func (r *BookRepo) FillMissingAudiobookDuration(ctx context.Context, b *models.Book) (bool, error) {
 	if b == nil || b.ID == 0 || b.DurationSeconds <= 0 {
-		return false, 0, fmt.Errorf("fill missing audiobook duration: invalid book")
+		return false, fmt.Errorf("fill missing audiobook duration: invalid book")
 	}
 	if b.MediaType != models.MediaTypeAudiobook && b.MediaType != models.MediaTypeBoth {
-		return false, 0, nil
+		return false, nil
 	}
 	now := time.Now().UTC()
 	res, err := r.exec.ExecContext(ctx, `
@@ -775,28 +962,13 @@ func (r *BookRepo) FillMissingAudiobookDuration(ctx context.Context, b *models.B
 		  AND asin = ? AND duration_seconds <= 0`,
 		b.DurationSeconds, timeValueArg(now), b.ID, b.ForeignID, b.MetadataProvider, b.MediaType, b.ASIN)
 	if err != nil {
-		return false, 0, fmt.Errorf("fill missing audiobook duration for book %d: %w", b.ID, err)
+		return false, fmt.Errorf("fill missing audiobook duration for book %d: %w", b.ID, err)
 	}
 	updated, err := res.RowsAffected()
 	if err != nil {
-		return false, 0, fmt.Errorf("check audiobook duration update for book %d: %w", b.ID, err)
+		return false, fmt.Errorf("check audiobook duration update for book %d: %w", b.ID, err)
 	}
-	if updated == 0 {
-		var currentDuration int
-		err := r.exec.QueryRowContext(ctx, `
-			SELECT duration_seconds FROM books
-			WHERE id = ? AND foreign_id = ? AND metadata_provider = ? AND media_type = ? AND asin = ?`,
-			b.ID, b.ForeignID, b.MetadataProvider, b.MediaType, b.ASIN).Scan(&currentDuration)
-		if errors.Is(err, sql.ErrNoRows) {
-			return false, 0, nil
-		}
-		if err != nil {
-			return false, 0, fmt.Errorf("read current audiobook duration for book %d: %w", b.ID, err)
-		}
-		return false, currentDuration, nil
-	}
-	b.UpdatedAt = now
-	return true, b.DurationSeconds, nil
+	return updated > 0, r.ReloadHydratedBook(ctx, b)
 }
 
 // MarkWantedMonitored updates only the fields needed to queue a book for
@@ -815,22 +987,56 @@ func (r *BookRepo) MarkWantedMonitored(ctx context.Context, id int64) error {
 // AddBookFile records a new on-disk file in book_files and refreshes the
 // book's aggregate status. Multiple files for the same format are all tracked
 // (e.g. epub + mobi + pdf from a multi-file download).
+//
+// Re-adding a path the book already tracks is a no-op success. A path another
+// existing book tracks returns *PathOwnedError (match it with errors.As) and
+// records nothing, so a caller can never report an import that tracked
+// nothing as a success (#2937). A row left by a deleted book is taken over.
 func (r *BookRepo) AddBookFile(ctx context.Context, bookID int64, format, path string) error {
-	if err := r.files.Add(ctx, bookID, format, path); err != nil {
+	if _, err := r.trackBookFile(ctx, bookID, format, path); err != nil {
 		return err
 	}
 	return r.refreshBookStatus(ctx, bookID)
 }
 
 // AddBookFileIfMissing records a new on-disk file and reports whether this call
-// inserted it, refreshing the book's aggregate status either way. See
-// BookFileRepo.AddIfMissing for why the caller needs to know (#1635).
+// made the row the book's, refreshing the book's aggregate status either way.
+// See BookFileRepo.AddIfMissing for why the caller needs to know (#1635). A
+// path another book owns returns *PathOwnedError, as AddBookFile does.
 func (r *BookRepo) AddBookFileIfMissing(ctx context.Context, bookID int64, format, path string) (bool, error) {
-	created, err := r.files.AddIfMissing(ctx, bookID, format, path)
+	res, err := r.trackBookFile(ctx, bookID, format, path)
 	if err != nil {
 		return false, err
 	}
-	return created, r.refreshBookStatus(ctx, bookID)
+	return res.Created(), r.refreshBookStatus(ctx, bookID)
+}
+
+// trackBookFile is BookFileRepo.Track with the orphan takeover logged, since
+// it changes a row the caller did not create.
+func (r *BookRepo) trackBookFile(ctx context.Context, bookID int64, format, path string) (TrackResult, error) {
+	res, err := r.files.Track(ctx, bookID, format, path)
+	if err == nil && res.Outcome == TrackReclaimedOrphan {
+		slog.Warn("book_files: took over a row left by a deleted book",
+			"path", path, "bookID", bookID, "deletedBookID", res.PreviousBookID)
+	}
+	return res, err
+}
+
+// MoveBookFile makes toBookID the owner of path and refreshes the status of
+// both books, returning the previous owner (0 when the path was untracked).
+// Only an explicit user action that says the file belongs to toBookID (Fix
+// match) may call this; an import must use AddBookFile, which refuses (#2937).
+func (r *BookRepo) MoveBookFile(ctx context.Context, path string, toBookID int64, format string) (int64, error) {
+	prev, err := r.files.MoveToBook(ctx, toBookID, format, path)
+	if err != nil {
+		return 0, err
+	}
+	if prev != 0 && prev != toBookID {
+		if err := r.refreshBookStatus(ctx, prev); err != nil {
+			return prev, err
+		}
+	}
+	return prev, r.refreshBookStatus(ctx, toBookID)
 }
 
 // ListFiles returns all book_files rows for the given book.
@@ -894,6 +1100,20 @@ func (r *BookRepo) PathOwnedByOtherBook(ctx context.Context, path string, exclud
 	return r.files.PathOwnedByOtherBook(ctx, path, excludeBookID)
 }
 
+// PathUnderOtherBookDir reports whether a book other than
+// excludeBookID tracks a folder that contains path. See
+// BookFileRepo.PathUnderOtherBookDir (#3336).
+func (r *BookRepo) PathUnderOtherBookDir(ctx context.Context, path string, excludeBookID int64) (bool, error) {
+	return r.files.PathUnderOtherBookDir(ctx, path, excludeBookID)
+}
+
+// PathOwnedByLiveOtherBook is PathOwnedByOtherBook ignoring a row left by a
+// deleted book. For pre-checks of a write that takes such a row over, never
+// for a delete guard. See BookFileRepo.PathOwnedByLiveOtherBook.
+func (r *BookRepo) PathOwnedByLiveOtherBook(ctx context.Context, path string, excludeBookID int64) (bool, error) {
+	return r.files.PathOwnedByLiveOtherBook(ctx, path, excludeBookID)
+}
+
 // ListAllBookFilePaths returns every path in book_files.
 // Used by ScanLibrary to build the set of already-tracked files efficiently.
 func (r *BookRepo) ListAllBookFilePaths(ctx context.Context) ([]string, error) {
@@ -921,6 +1141,24 @@ func (r *BookRepo) BookFilesPathEpoch() uint64 {
 // (the manual-import scan's confident-match format check, #2480).
 func (r *BookRepo) ListFilesForBooks(ctx context.Context, bookIDs []int64) (map[int64][]models.BookFile, error) {
 	return r.files.ListByBooks(ctx, bookIDs)
+}
+
+// FileByPath returns the book_files row recorded at path, or nil when the path
+// is not tracked. Used by Fix match's correct-match-only mode (#2055) to find
+// the row it relinks and the format it was recorded as.
+func (r *BookRepo) FileByPath(ctx context.Context, path string) (*models.BookFile, error) {
+	return r.files.GetByPath(ctx, path)
+}
+
+// GetByTrackedPath returns the existing book whose book_files hold path, or
+// nil when no live book tracks it. The path is compared exactly; callers pass
+// it cleaned, the way it was recorded.
+func (r *BookRepo) GetByTrackedPath(ctx context.Context, path string) (*models.Book, error) {
+	id, err := r.files.LiveOwnerOfPath(ctx, path)
+	if err != nil || id == 0 {
+		return nil, err
+	}
+	return r.GetByID(ctx, id)
 }
 
 // ListBookFiles returns the book_files rows for a single book.
@@ -972,13 +1210,61 @@ func legacyFilePathFor(mediaType, ebookPath, audiobookPath string) string {
 // current book_files rows and updates both the status and legacy columns.
 // It queries book_files directly so the result is always authoritative,
 // bypassing the legacy-column fallback in bookColumns.
+//
+// It writes only the five columns it derives, guarded on the two it derives
+// them from (#2375). It used to write the whole row back through Update from
+// the snapshot it read at the top, so a user edit that landed in between (an
+// unmonitor, a rename, a media type change) was silently reverted by an
+// import recording its file. When media_type or status changed under it, the
+// guard misses and the derivation runs again against the new values.
 func (r *BookRepo) refreshBookStatus(ctx context.Context, bookID int64) error {
+	const attempts = 5
+	for range attempts {
+		written, err := r.refreshBookStatusOnce(ctx, bookID)
+		if err != nil || written {
+			return err
+		}
+	}
+	return fmt.Errorf("refreshBookStatus: book %d kept changing under the status refresh", bookID)
+}
+
+// refreshBookStatusLoaded is a test seam: when set, it runs after
+// refreshBookStatus has read the book and before it writes, which is the
+// window a concurrent edit has to land in (#2375).
+var refreshBookStatusLoaded func(bookID int64)
+
+// refreshBookStatusDerived is the same kind of seam, run once the paths have
+// been derived from book_files and before the write.
+var refreshBookStatusDerived func(bookID int64)
+
+// refreshBookStatusOnce is one guarded attempt. It reports false, having
+// written nothing, when media_type or status changed since it read the book.
+// A book that no longer exists counts as written: there is nothing to refresh.
+func (r *BookRepo) refreshBookStatusOnce(ctx context.Context, bookID int64) (bool, error) {
 	b, err := r.GetByID(ctx, bookID)
 	if err != nil {
-		return fmt.Errorf("refreshBookStatus: load book: %w", err)
+		return false, fmt.Errorf("refreshBookStatus: load book: %w", err)
 	}
 	if b == nil {
-		return nil
+		return true, nil
+	}
+	readMediaType, readStatus := b.MediaType, b.Status
+	// The stored path columns are guarded too, read raw: GetByID renders
+	// them through bookColumns' book_files view, which is not what the guard
+	// compares against. A concurrent refresh that moved a path (a reorganize
+	// running UpdateBookFilePath) changes only these, and writing back this
+	// attempt's older derivation would put the old path back.
+	var readEbookPath, readAudiobookPath sql.NullString
+	if err := r.exec.QueryRowContext(ctx,
+		`SELECT ebook_file_path, audiobook_file_path FROM books WHERE id=?`, bookID).
+		Scan(&readEbookPath, &readAudiobookPath); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return true, nil
+		}
+		return false, fmt.Errorf("refreshBookStatus: read stored paths: %w", err)
+	}
+	if refreshBookStatusLoaded != nil {
+		refreshBookStatusLoaded(bookID)
 	}
 
 	// Query book_files directly to get the path each format should render.
@@ -987,15 +1273,18 @@ func (r *BookRepo) refreshBookStatus(ctx context.Context, bookID int64) error {
 	// the value bookColumns now reads back (see its comment).
 	ebookPath, err := r.derivedFormatPath(ctx, bookID, models.MediaTypeEbook)
 	if err != nil {
-		return fmt.Errorf("refreshBookStatus: read ebook path: %w", err)
+		return false, fmt.Errorf("refreshBookStatus: read ebook path: %w", err)
 	}
 	audiobookPath, err := r.derivedFormatPath(ctx, bookID, models.MediaTypeAudiobook)
 	if err != nil {
-		return fmt.Errorf("refreshBookStatus: read audiobook path: %w", err)
+		return false, fmt.Errorf("refreshBookStatus: read audiobook path: %w", err)
 	}
 
 	b.EbookFilePath = ebookPath
 	b.AudiobookFilePath = audiobookPath
+	if refreshBookStatusDerived != nil {
+		refreshBookStatusDerived(bookID)
+	}
 
 	// Inventory-driven widening: media_type records acquisition intent, but a
 	// file on disk makes that intent moot. Without this, a book carrying both
@@ -1007,12 +1296,9 @@ func (r *BookRepo) refreshBookStatus(ctx context.Context, bookID int64) error {
 	// Hardcover *hydration* (bookhydrate.Options.MediaTypePinned), which
 	// widened books from metadata alone — "this work has an audio edition
 	// somewhere". Here the audiobook is already imported.
+	widened := false
 	if ebookPath != "" && audiobookPath != "" && b.MediaType != models.MediaTypeBoth {
-		// Log it: this changes a user-visible field the user may have set
-		// themselves, and a silent flip has no answer to "why did my book
-		// become dual-format".
-		slog.Info("widened media_type from on-disk inventory",
-			"book_id", b.ID, "title", b.Title, "from", b.MediaType, "to", models.MediaTypeBoth)
+		widened = true
 		b.MediaType = models.MediaTypeBoth
 	}
 
@@ -1026,7 +1312,40 @@ func (r *BookRepo) refreshBookStatus(ctx context.Context, bookID int64) error {
 	// Keep legacy file_path column in sync.
 	b.FilePath = legacyFilePathFor(b.MediaType, ebookPath, audiobookPath)
 
-	return r.Update(ctx, b)
+	mediaType := b.MediaType
+	if mediaType == "" {
+		mediaType = models.MediaTypeEbook
+	}
+	// The guard compares against what was read, so a NULL or empty column
+	// still matches: COALESCE on both sides keeps the comparison honest for
+	// legacy rows. The path columns compare with IS, which matches a NULL
+	// read as NULL.
+	res, err := r.exec.ExecContext(ctx, `
+		UPDATE books SET ebook_file_path=?, audiobook_file_path=?, media_type=?, status=?,
+		                 file_path=?, updated_at=?
+		WHERE id=? AND COALESCE(media_type,'')=? AND COALESCE(status,'')=?
+		  AND ebook_file_path IS ? AND audiobook_file_path IS ?`,
+		b.EbookFilePath, b.AudiobookFilePath, mediaType, b.Status,
+		b.FilePath, timeValueArg(time.Now().UTC()),
+		bookID, readMediaType, readStatus, readEbookPath, readAudiobookPath)
+	if err != nil {
+		return false, fmt.Errorf("update book %d: %w", bookID, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("check status refresh for book %d: %w", bookID, err)
+	}
+	if n == 0 {
+		return false, nil
+	}
+	if widened {
+		// Log it: this changes a user-visible field the user may have set
+		// themselves, and a silent flip has no answer to "why did my book
+		// become dual-format".
+		slog.Info("widened media_type from on-disk inventory",
+			"book_id", b.ID, "title", b.Title, "from", readMediaType, "to", models.MediaTypeBoth)
+	}
+	return true, nil
 }
 
 // BookFilePathResolves reports whether a tracked book file path still points
@@ -1048,7 +1367,11 @@ func BookFilePathResolves(path string) bool {
 }
 
 // derivedFormatPath picks the path a book renders for one format: the
-// lowest-id book_files row whose file still resolves on disk.
+// lowest-id book_files row whose file still resolves on disk. For ebooks a
+// book holding several formats renders the most preferred one (EbookFormatRank:
+// EPUB, KEPUB, AZW3, MOBI, PDF, the rest), lowest id breaking a tie, so the
+// result does not depend on which format happened to be imported first
+// (#3467). Nothing is deleted or demoted: every file stays in book_files.
 //
 // The plain "lowest id wins" rule this replaces is what made #2186 visible.
 // BookFileRepo.Add is INSERT OR IGNORE, so registering a file at a new
@@ -1092,8 +1415,10 @@ func (r *BookRepo) derivedFormatPath(ctx context.Context, bookID int64, format s
 			first = path
 		}
 		if BookFilePathResolves(path) {
-			live = path
-			break
+			if live == "" || (format == models.MediaTypeEbook && EbookFormatLess(path, live)) {
+				live = path
+			}
+			continue
 		}
 		vanished = append(vanished, path)
 	}
@@ -1113,6 +1438,13 @@ func (r *BookRepo) derivedFormatPath(ctx context.Context, bookID int64, format s
 			"book_id", bookID, "format", format, "missing", stale, "rendering", live)
 	}
 	return live, nil
+}
+
+// DerivedEbookPath is the ebook path the book would render right now, without
+// writing it. The library scan's sweep compares it with the stored column to
+// find books still rendering a less preferred format (#3467).
+func (r *BookRepo) DerivedEbookPath(ctx context.Context, bookID int64) (string, error) {
+	return r.derivedFormatPath(ctx, bookID, models.MediaTypeEbook)
 }
 
 // RefreshBookStatus recomputes a book's aggregate status and the file paths it
@@ -1196,9 +1528,11 @@ func (r *BookRepo) SetFilePath(ctx context.Context, id int64, filePath string) e
 // SetLanguage persists a book's language code. Used by the importer to fill an
 // empty language from an embedded EPUB dc:language at import time (#1160); the
 // caller is responsible for gating on an empty existing value and an unlocked
-// language field, so this only writes the single column.
+// language field. Advance updated_at so pending hydration sees the change.
 func (r *BookRepo) SetLanguage(ctx context.Context, id int64, language string) error {
-	_, err := r.db.ExecContext(ctx, "UPDATE books SET language=? WHERE id=?", language, id)
+	language = models.NormalizeLanguageCode(language)
+	_, err := r.exec.ExecContext(ctx, "UPDATE books SET language=?, updated_at=? WHERE id=?",
+		language, timeValueArg(time.Now().UTC()), id)
 	return err
 }
 
@@ -1214,6 +1548,22 @@ func (r *BookRepo) SetImageURL(ctx context.Context, id int64, imageURL string) e
 	return nil
 }
 
+// FillImageURL sets a book's cover only while it has none, and reports
+// whether it did. Covers read from a book's own file use it, so a provider
+// cover that lands between reading the book and writing the cover is kept.
+func (r *BookRepo) FillImageURL(ctx context.Context, id int64, imageURL string) (bool, error) {
+	res, err := r.exec.ExecContext(ctx, "UPDATE books SET image_url=?, updated_at=? WHERE id=? AND image_url=''",
+		imageURL, timeValueArg(time.Now().UTC()), id)
+	if err != nil {
+		return false, fmt.Errorf("fill book %d image_url: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("fill book %d image_url: %w", id, err)
+	}
+	return n > 0, nil
+}
+
 // ListWithLocalImagePath returns books whose image_url is an absolute
 // filesystem path rather than a URL, including excluded ones, so the #2564
 // startup repair can rewrite them. Nothing in Bindery wrote such a value to
@@ -1221,6 +1571,13 @@ func (r *BookRepo) SetImageURL(ctx context.Context, id int64, imageURL string) e
 // alongside the editions that did hold one.
 func (r *BookRepo) ListWithLocalImagePath(ctx context.Context) ([]models.Book, error) {
 	return r.query(ctx, bookCTE+" SELECT "+bookColumns+" FROM books "+bookJoins+" WHERE (books.image_url LIKE '/%' OR books.image_url LIKE '_:\\%') ORDER BY books.id", nil)
+}
+
+// ListWithFilesWithoutCover returns books that have at least one file on disk
+// but no cover, so the library scan can fill the cover from the file (see
+// importer.Scanner.WithCoverStore).
+func (r *BookRepo) ListWithFilesWithoutCover(ctx context.Context) ([]models.Book, error) {
+	return r.query(ctx, bookCTE+" SELECT "+bookColumns+" FROM books "+bookJoins+" WHERE books.image_url = '' AND EXISTS (SELECT 1 FROM book_files bf WHERE bf.book_id = books.id) ORDER BY books.id", nil)
 }
 
 // SetCalibreID stores the Calibre-assigned book id for the given Bindery
@@ -1412,6 +1769,30 @@ func (r *BookRepo) SetExcluded(ctx context.Context, id int64, excluded bool) err
 	return err
 }
 
+// ExcludeIfNoFiles sets the excluded flag only while the book has no file:
+// no book_files row and no legacy file_path, ebook_file_path or
+// audiobook_file_path. It reports whether the row was excluded. The check
+// and the write are one UPDATE, so an import that lands between a caller's
+// read and this call can never be excluded on a stale "no files" (#2999).
+// An already excluded book with no files reports true.
+func (r *BookRepo) ExcludeIfNoFiles(ctx context.Context, id int64) (bool, error) {
+	res, err := r.db.ExecContext(ctx, `UPDATE books SET excluded = 1, updated_at = ?
+		WHERE id = ?
+		  AND COALESCE(file_path, '') = ''
+		  AND COALESCE(ebook_file_path, '') = ''
+		  AND COALESCE(audiobook_file_path, '') = ''
+		  AND NOT EXISTS (SELECT 1 FROM book_files WHERE book_id = books.id)`,
+		timeValueArg(time.Now().UTC()), id)
+	if err != nil {
+		return false, fmt.Errorf("exclude book %d if no files: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 func (r *BookRepo) Delete(ctx context.Context, id int64) error {
 	// book_files rows are removed via ON DELETE CASCADE on the FK.
 	_, err := r.exec.ExecContext(ctx, "DELETE FROM books WHERE id=?", id)
@@ -1496,7 +1877,7 @@ func (r *BookRepo) query(ctx context.Context, q string, args []any) ([]models.Bo
 			&b.FilePath, &b.Language, &b.MediaType,
 			&b.Narrator, &b.DurationSeconds, &b.ASIN,
 			&b.CalibreID, &b.MetadataProvider, &lastMetadataRefreshAtStr,
-			&createdAtStr, &updatedAtStr,
+			&createdAtStr, &updatedAtStr, &b.UpdatedAtRaw,
 			&b.EbookFilePath, &b.AudiobookFilePath,
 			&excluded, &b.DedupKey,
 			&authorID, &authorForeignID, &authorName, &authorSortName,

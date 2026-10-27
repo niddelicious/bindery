@@ -12,6 +12,17 @@ import (
 	"github.com/vavallee/bindery/internal/models"
 )
 
+// Errors a rollback or its preview returns for a request that cannot be
+// carried out, as opposed to a storage fault. The API maps these to 404 and
+// 503 and answers anything else with a generic 500.
+var (
+	// ErrRunNotFound is returned when the run id names no import run.
+	ErrRunNotFound = errors.New("abs import run not found")
+	// ErrRollbackUnavailable is returned when the importer was built without
+	// the repositories a rollback needs.
+	ErrRollbackUnavailable = errors.New("abs rollback is unavailable")
+)
+
 type RollbackStats struct {
 	ActionsPlanned     int `json:"actionsPlanned"`
 	EntitiesDeleted    int `json:"entitiesDeleted"`
@@ -99,26 +110,29 @@ func (i *Importer) Rollback(ctx context.Context, runID int64) (*RollbackResult, 
 
 func (i *Importer) rollback(ctx context.Context, runID int64, preview bool) (*RollbackResult, error) {
 	if i.runs == nil || i.runEntities == nil {
-		return nil, errors.New("abs rollback is unavailable")
+		return nil, ErrRollbackUnavailable
 	}
 	// Nil-repo guards: every case below relies on at least one of these, and a
 	// silent nil-deref would turn "safe rollback" into a crash that leaves the
 	// run in an inconsistent half-rolled state.
 	if i.provenance == nil || i.books == nil || i.authors == nil || i.series == nil || i.editions == nil {
-		return nil, errors.New("abs rollback is unavailable: one or more repositories are not configured")
+		return nil, fmt.Errorf("%w: one or more repositories are not configured", ErrRollbackUnavailable)
 	}
 	run, err := i.runs.GetByID(ctx, runID)
 	if err != nil {
 		return nil, err
 	}
 	if run == nil {
-		return nil, fmt.Errorf("abs import run %d not found", runID)
+		return nil, fmt.Errorf("%w: %d", ErrRunNotFound, runID)
 	}
 	result := &RollbackResult{
-		RunID:    runID,
-		Preview:  preview,
-		DryRun:   run.DryRun,
-		Status:   run.Status,
+		RunID:   runID,
+		Preview: preview,
+		DryRun:  run.DryRun,
+		Status:  run.Status,
+		// Never nil: the UI reads actions.length, and a nil slice
+		// marshals as null for a run with nothing to undo.
+		Actions:  []RollbackAction{},
 		Finished: time.Now().UTC(),
 	}
 	if run.DryRun {
@@ -772,7 +786,7 @@ func restoreBookFromSnapshot(book *models.Book, before, after *bookRollbackSnaps
 	restoreString(&book.Status, before.Status, after.Status, &changed)
 	restoreBool(&book.AnyEditionOK, before.AnyEditionOK, after.AnyEditionOK, &changed)
 	restoreInt64Ptr(&book.SelectedEditionID, before.SelectedEditionID, after.SelectedEditionID, &changed)
-	restoreString(&book.Language, before.Language, after.Language, &changed)
+	restoreLanguage(&book.Language, before.Language, after.Language, &changed)
 	restoreString(&book.MediaType, before.MediaType, after.MediaType, &changed)
 	restoreString(&book.Narrator, before.Narrator, after.Narrator, &changed)
 	restoreInt(&book.DurationSeconds, before.DurationSeconds, after.DurationSeconds, &changed)
@@ -844,6 +858,23 @@ func restoreString(target *string, before, after string, changed *bool) {
 	if *target != after {
 		return
 	}
+	if *target != before {
+		*changed = true
+	}
+	*target = before
+}
+
+// restoreLanguage is restoreString for a language code. The import run's
+// snapshot can predate the startup backfill that rewrote every stored language
+// into its ISO 639-2/B form (#3086), so "en" recorded by the run and "eng" on
+// the row now are the same value: the row still holds what the run wrote, and
+// is restored. What goes back is normalized too, so a rollback never
+// reintroduces a spelling the backfill removed.
+func restoreLanguage(target *string, before, after string, changed *bool) {
+	if models.NormalizeLanguageCode(*target) != models.NormalizeLanguageCode(after) {
+		return
+	}
+	before = models.NormalizeLanguageCode(before)
 	if *target != before {
 		*changed = true
 	}

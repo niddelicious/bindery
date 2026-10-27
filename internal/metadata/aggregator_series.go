@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-func (a *Aggregator) SearchSeries(ctx context.Context, query string, limit int) ([]SeriesSearchResult, error) {
+func (a *aggregatorCore) SearchSeries(ctx context.Context, query string, limit int) ([]SeriesSearchResult, error) {
 	query = strings.TrimSpace(query)
 	if query == "" {
 		return nil, nil
@@ -15,7 +15,7 @@ func (a *Aggregator) SearchSeries(ctx context.Context, query string, limit int) 
 	if limit <= 0 {
 		limit = 10
 	}
-	key := "series-search:" + strings.ToLower(query) + ":" + strconv.Itoa(limit)
+	key := "series-search:" + a.providerSetKey() + ":" + strings.ToLower(query) + ":" + strconv.Itoa(limit)
 	if cached, ok := a.cache.get(key); ok {
 		return cached.([]SeriesSearchResult), nil
 	}
@@ -37,12 +37,12 @@ func (a *Aggregator) SearchSeries(ctx context.Context, query string, limit int) 
 }
 
 // GetSeriesCatalog fetches the ordered book catalog for a provider series.
-func (a *Aggregator) GetSeriesCatalog(ctx context.Context, foreignID string) (*SeriesCatalog, error) {
+func (a *aggregatorCore) GetSeriesCatalog(ctx context.Context, foreignID string) (*SeriesCatalog, error) {
 	foreignID = strings.TrimSpace(foreignID)
 	if foreignID == "" {
 		return nil, nil
 	}
-	key := "series-catalog:" + foreignID
+	key := "series-catalog:" + a.providerSetKey() + ":" + foreignID
 	if cached, ok := a.cache.get(key); ok {
 		return cached.(*SeriesCatalog), nil
 	}
@@ -62,7 +62,7 @@ func (a *Aggregator) GetSeriesCatalog(ctx context.Context, foreignID string) (*S
 	return nil, lastErr
 }
 
-func (a *Aggregator) seriesCatalogProviders() []SeriesCatalogProvider {
+func (a *aggregatorCore) seriesCatalogProviders() []SeriesCatalogProvider {
 	if a == nil {
 		return nil
 	}

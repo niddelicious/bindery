@@ -39,6 +39,28 @@ func LongStopWords() []string {
 	return out
 }
 
+// volumeMarkers are the spellings of a volume marker that release names and
+// metadata titles use interchangeably: "Volume 17", "Vol. 17", "Vols 1-3",
+// "Volumes 1-3". SigWords keeps all four as keywords, so without this a title
+// saying "Volume 17" demanded the literal word "volume" and dropped a release
+// saying "Vol 17".
+//
+// "book"/"bk" and "part"/"pt" are deliberately not here. "bk" and "pt" are
+// under three bytes, so SigWords never emits them, and "pt" is also the
+// Portuguese release language tag: treating it as "part" would let a title
+// saying "Part 2" match any Portuguese release.
+var volumeMarkers = map[string]bool{
+	"vol": true, "vols": true, "volume": true, "volumes": true,
+}
+
+// IsVolumeMarker reports whether w (already lowercased, as SigWords emits it)
+// is one of the interchangeable volume marker spellings. A keyword for which
+// this is true matches any of the spellings at match time, word bounded; see
+// indexer.keywordPattern.
+func IsVolumeMarker(w string) bool {
+	return volumeMarkers[w]
+}
+
 // SigWords returns the meaningful (non-stop, long enough) words from s.
 //
 // "Long enough" is three BYTES of UTF-8, not three characters, and that is
@@ -66,9 +88,20 @@ func LongStopWords() []string {
 // so "Ender's" produces the token "enders", matching the apostrophe-free form
 // used in most release names. Unicode letters (CJK, accented Latin) count as
 // word characters so non-Latin titles still tokenise.
+//
+// The one place the keyword alphabet differs from the release alphabet: ä, ö
+// and ü are KEPT here ("Müller" yields "müller"), where NormalizeRelease
+// expands them ("mueller"). Which digraphs began as umlauts is what decides
+// whether a keyword may match a compact release spelling ("Muller"), and
+// "michael" cannot be told from "mueller" once both are folded (#3123). The
+// regex builder, indexer.keywordPattern, reads the umlaut and makes only that
+// digraph optional. A keyword is therefore not a release-alphabet string:
+// compare it to one through textutil.TransliterateUmlauts, or not at all. The
+// word count, the order and the three byte floor are unchanged, since an
+// umlaut and its digraph are both two bytes.
 func SigWords(s string) []string {
 	var out []string
-	for _, w := range strings.Fields(textutil.FoldForTitleMatch(s)) {
+	for _, w := range strings.Fields(textutil.FoldForKeyword(s)) {
 		if len(w) >= 3 && !stopWords[w] {
 			out = append(out, w)
 		}
@@ -129,7 +162,10 @@ func ElideApostrophes(s string) string {
 // against the whole haystack, so collapsing punctuation to spaces would only
 // remove separators the substring test already tolerates.
 func foldForSigWordMatch(s string) string {
-	s = strings.ToLower(s)
+	// Composed first, as FoldForTitleMatch does, so a release title a tracker
+	// stores decomposed ("a" + U+030A for "å") holds the same words as the
+	// query's composed title.
+	s = strings.ToLower(norm.NFC.String(s))
 	s = strings.ReplaceAll(s, "'", "")
 	s = strings.ReplaceAll(s, "’", "")
 	return textutil.TransliterateUmlauts(s)
@@ -174,4 +210,42 @@ var queryUmlautReplacer = strings.NewReplacer(
 // (guaranteed by the NFC compose below) and idempotence.
 func TransliterateQuery(s string) string {
 	return queryUmlautReplacer.Replace(norm.NFC.String(s))
+}
+
+// SeriesPositionTitle returns the book's own title from a "Series N: Title"
+// name, or "" when title does not have that shape.
+//
+// Providers often store a series entry with the series and its position ahead
+// of the colon ("Feral Mage 4: The Mining Company Contract"), while release
+// names carry only the book's own title ("The Mining Company Contract by Chase
+// Kilgore"). The full title then needs "feral" and "mage", and the part before
+// the colon is the series, not the book, so neither reading can match a
+// release that names the book correctly.
+//
+// The shape is recognised only when the part before the colon ends in a
+// position: a number, optionally prefixed with "#" or followed by a period
+// ("Feral Mage 4", "Book 8", "Discworld #3", "Vol. 2."), with at least one word
+// ahead of it. An ordinary "Title: Subtitle" has no such number, so it is left
+// to the existing readings. The returned title is a fallback reading for the
+// relevance checks and must never replace the stricter ones.
+func SeriesPositionTitle(title string) string {
+	i := strings.Index(title, ":")
+	if i <= 0 {
+		return ""
+	}
+	head := strings.Fields(title[:i])
+	tail := strings.TrimSpace(title[i+1:])
+	if len(head) < 2 || tail == "" {
+		return ""
+	}
+	pos := strings.TrimSuffix(strings.TrimPrefix(head[len(head)-1], "#"), ".")
+	if pos == "" {
+		return ""
+	}
+	for _, r := range pos {
+		if r < '0' || r > '9' {
+			return ""
+		}
+	}
+	return tail
 }

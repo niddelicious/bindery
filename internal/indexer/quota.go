@@ -228,8 +228,8 @@ type quotaTicket struct {
 // Take admits one request and counts it, or refuses once the window is full.
 //
 // Refusing here rather than only at the top of the fan-out is what makes the cap
-// exact: a single BookSearch can issue up to eight requests, so a per-search
-// check would overshoot by seven every time an indexer crossed the line
+// exact: a single BookSearch can issue up to twelve requests, so a per-search
+// check would overshoot by eleven every time an indexer crossed the line
 // mid-cascade.
 func (t *quotaTicket) Take() bool {
 	q := t.quota

@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/json"
 	"net/http"
 	"strconv"
 	"strings"
@@ -68,8 +67,7 @@ func (h *NotificationHandler) Get(w http.ResponseWriter, r *http.Request) {
 
 func (h *NotificationHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var n models.Notification
-	if err := json.NewDecoder(r.Body).Decode(&n); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	if !decodeJSON(w, r, &n) {
 		return
 	}
 	if n.Name == "" || n.URL == "" {
@@ -95,14 +93,17 @@ func (h *NotificationHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	existing, err := h.notifications.GetByID(r.Context(), id)
-	if err != nil || existing == nil {
+	if err != nil {
+		writeServerError(w, r, err)
+		return
+	}
+	if existing == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "notification not found"})
 		return
 	}
 
 	var n models.Notification
-	if err := json.NewDecoder(r.Body).Decode(&n); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	if !decodeJSON(w, r, &n) {
 		return
 	}
 	if n.URL != "" {
@@ -140,7 +141,11 @@ func (h *NotificationHandler) Test(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	n, err := h.notifications.GetByID(r.Context(), id)
-	if err != nil || n == nil {
+	if err != nil {
+		writeServerError(w, r, err)
+		return
+	}
+	if n == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "notification not found"})
 		return
 	}

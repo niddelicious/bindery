@@ -180,11 +180,9 @@ func (l *existingBookSeriesLinker) linkDeferred(ctx context.Context) {
 // against the normaliser: it folds case, collapses a doubled internal space,
 // ignores an apostrophe difference and drops a parenthetical suffix, so
 // "The Expanse", "The  Expanse", "the expanse" and
-// "The Expanse (Publication Order)" all agree.
-//
-// Known gap: an inverted article ("Expanse, The" against "The Expanse") does
-// NOT agree, and produces a second series row. Fixing it belongs in the shared
-// normaliser rather than here, where it would apply to book titles too.
+// "The Expanse (Publication Order)" all agree. So does an inverted article
+// ("Expanse, The" against "The Expanse"), since the shared normaliser folds the
+// library filing form (#3122); that used to be a known gap here.
 func seriesTitleKey(title string) string {
 	return indexer.CanonicalDedupKey(title)
 }

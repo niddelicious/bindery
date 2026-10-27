@@ -49,6 +49,8 @@ func addProviderIdentifier(out map[string]string, provider, foreignID string) {
 		val = trimIdentifierPrefix(val, "gb:")
 	case "dnb":
 		val = trimIdentifierPrefix(val, "dnb:")
+	case "bnf":
+		val = trimIdentifierPrefix(val, "bnf:")
 	case "hardcover":
 		val = trimIdentifierPrefix(val, "hc:")
 	case "openlibrary":

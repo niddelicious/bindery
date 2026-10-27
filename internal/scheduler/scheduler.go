@@ -6,6 +6,7 @@ package scheduler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -58,13 +59,35 @@ type outcomeSearcher interface {
 	SearchBookWithOutcomes(ctx context.Context, indexers []models.Indexer, c indexer.MatchCriteria) ([]newznab.SearchResult, []indexer.IndexerDebug)
 }
 
+// debugSearcher is the optional capability of returning the whole audit
+// trail the interactive search panel shows. The scheduler asks for it only
+// when it has a DebugLog to record into, so GET /search/last-debug can show
+// an automatic search too (#2154). SearchBookWithOutcomes is a projection of
+// the same call, so asking for the trail costs nothing extra.
+type debugSearcher interface {
+	SearchBookWithDebug(ctx context.Context, indexers []models.Indexer, c indexer.MatchCriteria) ([]newznab.SearchResult, *indexer.SearchDebug)
+}
+
 // searchBookWithOutcomes runs the search, reporting per-indexer outcomes when
-// the searcher can supply them.
-func (s *Scheduler) searchBookWithOutcomes(ctx context.Context, idxs []models.Indexer, crit indexer.MatchCriteria) ([]newznab.SearchResult, []indexer.IndexerDebug) {
-	if os, ok := s.searcher.(outcomeSearcher); ok {
-		return os.SearchBookWithOutcomes(ctx, idxs, crit)
+// the searcher can supply them, and the full audit trail when there is a
+// debug log to record it in.
+func (s *Scheduler) searchBookWithOutcomes(ctx context.Context, idxs []models.Indexer, crit indexer.MatchCriteria) ([]newznab.SearchResult, []indexer.IndexerDebug, *indexer.SearchDebug) {
+	if ds, ok := s.searcher.(debugSearcher); ok && s.debugLog != nil {
+		results, dbg := ds.SearchBookWithDebug(ctx, idxs, crit)
+		if dbg == nil {
+			return results, nil, nil
+		}
+		// Dropped releases are for the interactive search's "filtered"
+		// section (#2334); an automatic search never acts on them, and the
+		// debug log should not hold their raw URLs.
+		dbg.Dropped = nil
+		return results, dbg.Indexers, dbg
 	}
-	return s.searcher.SearchBook(ctx, idxs, crit), nil
+	if os, ok := s.searcher.(outcomeSearcher); ok {
+		results, outcomes := os.SearchBookWithOutcomes(ctx, idxs, crit)
+		return results, outcomes, nil
+	}
+	return s.searcher.SearchBook(ctx, idxs, crit), nil, nil
 }
 
 // RecommendationEngine is the narrow interface the scheduler calls to
@@ -96,7 +119,8 @@ type eventNotifier interface {
 // here to avoid having the scheduler import notifier just for two string
 // constants (and to keep the eventNotifier interface untied to the real type).
 const (
-	notifierEventGrabbed = "grabbed"
+	notifierEventGrabbed        = "grabbed"
+	notifierEventDownloadFailed = "downloadFailed"
 )
 
 // defaultSearchInterval is the fallback wanted-book search cadence used when
@@ -187,24 +211,29 @@ type Scheduler struct {
 	cron     *cron.Cron
 	scanner  *importer.Scanner
 	searcher bookSearcher
+	// debugLog receives the audit trail of every automatic search, for
+	// GET /search/last-debug (#2154). Optional; nil records nothing.
+	debugLog *indexer.DebugLog
 	meta     *metadata.Aggregator
 
-	authors         *db.AuthorRepo
-	books           *db.BookRepo
-	indexers        *db.IndexerRepo
-	downloads       *db.DownloadRepo
-	clients         *db.DownloadClientRepo
-	history         *db.HistoryRepo
-	settings        *db.SettingsRepo
-	blocklist       *db.BlocklistRepo
-	delayProfiles   *db.DelayProfileRepo
-	pending         *db.PendingReleaseRepo
-	aliases         *db.AuthorAliasRepo     // optional; used for non-latin author matching
-	profiles        *db.MetadataProfileRepo // optional; applies profile language filters to auto-grab
-	qualityProfiles *db.QualityProfileRepo  // optional; enforces the profile's allowed formats on auto-grab (#1693)
-	editions        *db.EditionRepo         // optional; supplies the book ISBN the ranker's exact-match bonus needs (#1724)
-	calibreSyncer   CalibreSyncer           // optional; nil if Calibre is not configured
-	recommender     RecommendationEngine    // optional; generates recommendations
+	authors            *db.AuthorRepo
+	books              *db.BookRepo
+	indexers           *db.IndexerRepo
+	downloads          *db.DownloadRepo
+	clients            *db.DownloadClientRepo
+	history            *db.HistoryRepo
+	settings           *db.SettingsRepo
+	blocklist          *db.BlocklistRepo
+	delayProfiles      *db.DelayProfileRepo
+	pending            *db.PendingReleaseRepo
+	aliases            *db.AuthorAliasRepo     // optional; used for non-latin author matching
+	profiles           *db.MetadataProfileRepo // optional; applies profile language filters to auto-grab
+	qualityProfiles    *db.QualityProfileRepo  // optional; enforces the profile's allowed formats on auto-grab (#1693)
+	editions           *db.EditionRepo         // optional; supplies the book ISBN the ranker's exact-match bonus needs (#1724)
+	libraryContextWarn sync.Once
+	series             *db.SeriesRepo       // optional; supplies the wanted book's series position to the relevance filter (#3268)
+	calibreSyncer      CalibreSyncer        // optional; nil if Calibre is not configured
+	recommender        RecommendationEngine // optional; generates recommendations
 	// operatorUserID resolves the user the recommendation job writes under.
 	// Optional; nil falls back to the historical hardcoded admin id (#1725).
 	operatorUserID       func(context.Context) int64
@@ -213,12 +242,23 @@ type Scheduler struct {
 	logs                 *db.LogRepo     // optional; enables periodic log retention trim
 	notif                eventNotifier   // optional; fires EventGrabbed on auto-grab success (#849)
 	logRetainDays        int             // 0 = use default (14)
+	downloadRetainDays   int             // 0 = never trim finished download rows
 	downloadDir          string
 	audiobookDownloadDir string
 	// downloadHealth and downloadPathRemap back the periodic client-health
 	// probe (#2029). nil store means the job is not registered.
+	// downloadPathRemap is also the global remap automatic grabs send their
+	// save path through (#2665) and rTorrent removals resolve data with.
 	downloadHealth    *downloader.HealthStore
 	downloadPathRemap string
+
+	// metadataCooldown holds authors whose profile refresh failed for their
+	// own reasons, until when they are passed over (#2595). In memory only.
+	metadataCooldownMu sync.Mutex
+	metadataCooldown   map[int64]time.Time
+	// metadataBreakerTrips counts, per author, the tripped passes in a row it
+	// was part of; see metadataRefreshBreakerTripsToCool.
+	metadataBreakerTrips map[int64]breakerTrip
 }
 
 const scheduledWantedSearchConcurrency = 2
@@ -302,6 +342,14 @@ func (s *Scheduler) WithAliases(aliases *db.AuthorAliasRepo) {
 	s.aliases = aliases
 }
 
+// WithSeries attaches the series repo so auto-grab can give the relevance
+// filter the wanted book's position in its series (#3268). Optional: without
+// it the filter judges a numbered release on the release name alone. Must be
+// called before Start.
+func (s *Scheduler) WithSeries(series *db.SeriesRepo) {
+	s.series = series
+}
+
 // WithMetadataProfiles attaches the metadata profile repo so auto-grab can
 // apply the author's allowed-languages set to search results — previously
 // only the interactive search honoured it (Discussion #1572). Must be called
@@ -319,7 +367,8 @@ func (s *Scheduler) WithEditions(editions *db.EditionRepo) {
 
 // WithDownloadClientHealth attaches the health store and the global path remap
 // so client health can be re-probed on a schedule (#2029). Without it the
-// periodic job is not registered and health stays what it was at boot.
+// periodic job is not registered and health stays what it was at boot. The
+// remap is also what automatic grabs and rTorrent removals fall back to.
 func (s *Scheduler) WithDownloadClientHealth(store *downloader.HealthStore, globalRemap string) {
 	s.downloadHealth = store
 	s.downloadPathRemap = globalRemap
@@ -378,6 +427,13 @@ func (s *Scheduler) WithRecommender(engine RecommendationEngine) {
 	s.recommender = engine
 }
 
+// WithSearchDebugLog shares the log behind GET /search/last-debug, so the
+// automatic searches the scheduler runs (scheduled, bulk, series fill and the
+// rest) are recorded there next to the interactive ones (#2154).
+func (s *Scheduler) WithSearchDebugLog(l *indexer.DebugLog) {
+	s.debugLog = l
+}
+
 // WithOperatorUserID supplies the identity the recommendation job attributes
 // its batch to. It must agree with the id the auth layer stamps on
 // install-authenticated requests, or a manual refresh and the nightly job
@@ -404,6 +460,40 @@ func (s *Scheduler) WithTelemetry(p TelemetryPinger) {
 func (s *Scheduler) WithLogRepo(logs *db.LogRepo, retainDays int) {
 	s.logs = logs
 	s.logRetainDays = retainDays
+}
+
+// WithDownloadRetention sets how many days a finished (imported or failed)
+// download row is kept before the retention job deletes it. 0, the zero value,
+// registers no job and keeps every row. Must be called before Start.
+func (s *Scheduler) WithDownloadRetention(days int) {
+	s.downloadRetainDays = days
+}
+
+// downloadTrimBatch and downloadTrimPause shape the retention delete: small
+// batches with a pause between them, so the single database connection is
+// handed back to request handlers and the 15 second download poll between
+// batches instead of being held for one large delete.
+const (
+	downloadTrimBatch = 500
+	downloadTrimPause = 250 * time.Millisecond
+)
+
+// trimFinishedDownloads deletes imported and failed download rows older than
+// the retention window. See db.DownloadRepo.TrimTerminal for what it keeps.
+// A zero or negative window, or no downloads store, does nothing.
+func (s *Scheduler) trimFinishedDownloads(ctx context.Context) {
+	if s.downloads == nil || s.downloadRetainDays <= 0 {
+		return
+	}
+	cutoff := time.Now().UTC().Add(-time.Duration(s.downloadRetainDays) * 24 * time.Hour)
+	n, err := s.downloads.TrimTerminal(ctx, cutoff, downloadTrimBatch, downloadTrimPause)
+	if err != nil {
+		slog.Warn("download retention trim failed", "removed_before_error", n, "error", err)
+		return
+	}
+	if n > 0 {
+		slog.Info("trimmed finished download rows", "removed", n, "older_than_days", s.downloadRetainDays)
+	}
 }
 
 // WithNotifier attaches a webhook event notifier so auto-grab successes
@@ -494,8 +584,10 @@ func (s *Scheduler) Start() {
 		s.searchWanted()
 	}))
 
-	// Refresh author metadata every 24 hours
-	s.cron.AddFunc("@every 24h", runJob("refresh-metadata", func() {
+	// Refresh author profiles a batch at a time, so each author is refreshed
+	// about once every 24 hours without a nightly burst (#2595). See
+	// metadata_refresh.go for the batch size and the staleness cursor.
+	s.cron.AddFunc("@every 1h", runJob("refresh-metadata", func() {
 		slog.Info("job: refresh metadata")
 		s.refreshMetadata()
 	}))
@@ -589,6 +681,18 @@ func (s *Scheduler) Start() {
 			if err := s.logs.Trim(s.ctx(), cutoff); err != nil {
 				slog.Warn("log trim failed", "error", err)
 			}
+		}))
+	}
+
+	// Trim finished download rows (imported or failed, past the retention
+	// window) four times a day rather than once: a daily timer restarts from
+	// zero on every process start, so an install that restarts more often than
+	// that would never reach it. A pass with nothing to trim is one indexed
+	// query. Not registered when retention is off (BINDERY_DOWNLOAD_RETENTION_DAYS=0).
+	if s.downloads != nil && s.downloadRetainDays > 0 {
+		s.cron.AddFunc("@every 6h", runJob("download-trim", func() {
+			slog.Debug("job: trim finished downloads")
+			s.trimFinishedDownloads(s.ctx())
 		}))
 	}
 
@@ -911,19 +1015,106 @@ func (s *Scheduler) resolveAllowedLanguages(ctx context.Context, author *models.
 	return models.ParseAllowedLanguages(p.AllowedLanguages)
 }
 
-// resolveSeedRatio looks up the per-indexer seed-ratio override (#883) for the
-// indexer a release was grabbed from. Returns nil (no override) when the
-// indexer repo is unset, the id is zero, the lookup fails, or the indexer has
-// no override stored, so the download client keeps its global ratio rule.
-func (s *Scheduler) resolveSeedRatio(ctx context.Context, indexerID int64) *float64 {
+// pinnedClient returns the download client the release's indexer is pinned to
+// (#3080), or (nil, nil) when the indexer has no pin. A pin that cannot be
+// honoured is a *db.PinnedClientError, never a different client.
+func (s *Scheduler) pinnedClient(ctx context.Context, res *newznab.SearchResult) (*models.DownloadClient, error) {
+	if s.indexers == nil || res.IndexerID == 0 {
+		return nil, nil
+	}
+	idx, err := s.indexers.GetByID(ctx, res.IndexerID)
+	if err != nil {
+		return nil, err
+	}
+	if idx == nil || idx.DownloadClientID == nil {
+		return nil, nil
+	}
+	return s.clients.ResolvePinnedClient(ctx, idx, res.Protocol)
+}
+
+// checkPin decides whether an approved release may go ahead. It returns the
+// pinned client for a pinned indexer, a nil client for an unpinned one, and
+// skip=true when the indexer is pinned to a client that cannot take it. The
+// first failure for an indexer is logged and recorded; later releases from the
+// same indexer in this sweep are skipped quietly.
+func (s *Scheduler) checkPin(ctx context.Context, book models.Book, res *newznab.SearchResult, skipped map[int64]bool) (*models.DownloadClient, bool, error) {
+	if skipped[res.IndexerID] {
+		return nil, true, nil
+	}
+	c, err := s.pinnedClient(ctx, res)
+	if err == nil {
+		return c, false, nil
+	}
+	var perr *db.PinnedClientError
+	if !errors.As(err, &perr) {
+		return nil, false, err
+	}
+	slog.Warn("SearchAndGrabBook: the indexer's pinned download client cannot take the grab, skipping that indexer",
+		"book", book.Title, "release", res.Title, "error", perr.Error())
+	skipped[res.IndexerID] = true
+	s.recordPinnedFailure(ctx, book.ID, res, perr)
+	return nil, true, nil
+}
+
+// pinnedFailureCode marks a History event written for a pinned client failure.
+const pinnedFailureCode = "indexer_client_unavailable"
+
+// pinnedFailureQuietPeriod is how long an identical failure for the same book
+// and indexer stays recorded only once. The wanted sweep can run hourly, and a
+// down client would otherwise write one row per book per sweep.
+const pinnedFailureQuietPeriod = 24 * time.Hour
+
+// recordPinnedFailure writes the refused grab to History and the notifier, so
+// it is not only a log line. History is readable by every user and a webhook
+// leaves the house, so both name the indexer and not the client; the log line
+// carries both. An identical failure for the same book and indexer in the last
+// day is not recorded again.
+func (s *Scheduler) recordPinnedFailure(ctx context.Context, bookID int64, res *newznab.SearchResult, perr *db.PinnedClientError) {
+	if s.history == nil {
+		return
+	}
+	message := perr.Message(false)
+	if events, err := s.history.ListByBook(ctx, bookID); err == nil {
+		cutoff := time.Now().UTC().Add(-pinnedFailureQuietPeriod)
+		for _, e := range events {
+			if e.EventType != models.HistoryEventDownloadFailed || e.CreatedAt.Before(cutoff) {
+				continue
+			}
+			var prior struct {
+				Code      string `json:"code"`
+				IndexerID int64  `json:"indexerId"`
+				Message   string `json:"message"`
+			}
+			if json.Unmarshal([]byte(e.Data), &prior) == nil && prior.Code == pinnedFailureCode &&
+				prior.IndexerID == res.IndexerID && prior.Message == message {
+				return
+			}
+		}
+	}
+	data, _ := json.Marshal(map[string]any{"guid": res.GUID, "message": message, "code": pinnedFailureCode, "indexerId": res.IndexerID})
+	_ = s.history.Create(ctx, &models.HistoryEvent{
+		BookID:      &bookID,
+		EventType:   models.HistoryEventDownloadFailed,
+		SourceTitle: res.Title,
+		Data:        string(data),
+	})
+	s.notify(ctx, notifierEventDownloadFailed, map[string]interface{}{"title": res.Title, "message": message})
+}
+
+// resolveSeedLimits looks up the per-indexer seed ratio (#883) and seed time
+// (#2206) overrides for the indexer a release was grabbed from. Each is nil
+// (no override) when the indexer repo is unset, the id is zero, the lookup
+// fails, or the indexer has none stored, so the download client keeps its own
+// rule.
+func (s *Scheduler) resolveSeedLimits(ctx context.Context, indexerID int64) downloader.SeedLimits {
 	if s.indexers == nil || indexerID == 0 {
-		return nil
+		return downloader.SeedLimits{}
 	}
 	idx, err := s.indexers.GetByID(ctx, indexerID)
-	if err != nil || idx == nil {
-		return nil
+	if err != nil {
+		return downloader.SeedLimits{}
 	}
-	return idx.SeedRatio
+	return downloader.SeedLimitsFor(idx)
 }
 
 // freeleechOnlyIndexerIDs returns the set of indexer ids whose freeleech-only
@@ -956,7 +1147,17 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 	started := time.Now()
 	outcome := "aborted"
 	var indexerCount, rawResults, afterFilters, approved int
+	// dbg is the search's audit trail, set only when there is a debug log to
+	// record it in. It is recorded on the way out, with the outcome, so
+	// GET /search/last-debug shows automatic searches too (#2154).
+	var dbg *indexer.SearchDebug
 	defer func() {
+		if dbg != nil {
+			dbg.Origin = string(indexer.SearchOriginFrom(ctx))
+			dbg.BookID = book.ID
+			dbg.Outcome = outcome
+			s.debugLog.RecordBackground(book.OwnerUserID, dbg)
+		}
 		slog.Info("book search finished",
 			"origin", string(indexer.SearchOriginFrom(ctx)),
 			"book", book.Title,
@@ -1011,10 +1212,33 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 		// first approved release in ranked order, so this is what decides
 		// which format the sweep picks.
 		Profile: qualityProfile,
+		// The book's stored runtime lets the size term score an audio release
+		// by its density instead of its total size; zero keeps the flat bonus
+		// (#2740).
+		DurationSeconds: book.DurationSeconds,
 	}
 	if book.ReleaseDate != nil {
 		crit.Year = book.ReleaseDate.Year()
 	}
+	// What the library knows about the wanted book lets the relevance filter
+	// tell a release of this book from the next one in its series (#3268).
+	// Two reads per search, never per release; a missing repo or a failed
+	// read only leaves the rules that need it quiet.
+	indexer.WarnLibraryContextMissing(&s.libraryContextWarn, "scheduler", s.series == nil, s.books == nil)
+	var seriesRead indexer.SeriesReader
+	if s.series != nil {
+		seriesRead = s.series.GetPrimarySeriesForBook
+	}
+	var booksRead indexer.AuthorBooksReader
+	if s.books != nil {
+		// The wanted book's owner scopes the author's titles, as the
+		// interactive search scopes them to the caller. No owner means no
+		// scope, the same fallback ListByAuthorAndUser applies to user 0.
+		booksRead = func(ctx context.Context, authorID int64) ([]models.Book, error) {
+			return s.books.ListByAuthorAndUser(ctx, authorID, book.OwnerUserID)
+		}
+	}
+	crit.SetLibraryContext(ctx, book, seriesRead, booksRead)
 	if s.editions != nil {
 		if eds, err := s.editions.ListByBook(ctx, book.ID); err != nil {
 			slog.Warn("failed to load editions for search ISBN", "book_id", book.ID, "error", err)
@@ -1023,7 +1247,8 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 		}
 	}
 
-	results, outcomes := s.searchBookWithOutcomes(ctx, idxs, crit)
+	results, outcomes, searchDbg := s.searchBookWithOutcomes(ctx, idxs, crit)
+	dbg = searchDbg
 	rawResults = len(results)
 	// An indexer that failed contributed zero results and is otherwise
 	// indistinguishable from one that answered with nothing, so a grab decided
@@ -1050,11 +1275,21 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 	} else {
 		results = indexer.FilterByLanguage(results, lang)
 	}
+	if dbg != nil && len(results) < rawResults {
+		dbg.Filters = append(dbg.Filters, indexer.FilterDebug{
+			Stage:  "language",
+			Reason: "release name tagged with a language outside the profile",
+			Title:  "(" + strconv.Itoa(rawResults-len(results)) + " result(s) dropped)",
+		})
+	}
 	afterFilters = len(results)
 
 	var specs []decision.Specification
 	if entries, ok := s.sweepBlocklist(ctx, sweep); ok {
 		specs = append(specs, decision.NewBlocklistedSpec(entries))
+	}
+	if guid := stalledReleaseFrom(ctx); guid != "" {
+		specs = append(specs, stalledReleaseSpec{guid: guid})
 	}
 	// Multi-book pack guard (#2276). A download row carries one BookID and the
 	// importer computes one destination from it, so an explicit "Books 1-4"
@@ -1125,10 +1360,36 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 	}
 
 	var best *newznab.SearchResult
+	// bestClient is the client the best release's indexer is pinned to
+	// (#3080), nil for an unpinned indexer. skippedPinned holds the indexers
+	// whose pinned client could not take a release this sweep: their other
+	// releases would fail the same way, so they are passed over without a second
+	// record, and the next approved release from a different indexer is tried.
+	// A pinned indexer's release is never sent to another client.
+	var bestClient *models.DownloadClient
+	skippedPinned := map[int64]bool{}
 	for i, d := range dm.Evaluate(releases, book) {
 		if d.Approved {
+			c, skip, err := s.checkPin(ctx, book, &results[i], skippedPinned)
+			if err != nil {
+				slog.Error("SearchAndGrabBook: failed to resolve the indexer's pinned download client", "indexer", results[i].IndexerName, "error", err)
+				outcome = "download client lookup failed"
+				return
+			}
+			if skip {
+				continue
+			}
 			best = &results[i]
+			bestClient = c
 			break
+		}
+		if dbg != nil {
+			dbg.Filters = append(dbg.Filters, indexer.FilterDebug{
+				Title:       results[i].Title,
+				IndexerName: results[i].IndexerName,
+				Stage:       "decision",
+				Reason:      d.Rejection,
+			})
 		}
 		// Store delay-rejected releases so they can be re-evaluated next sweep.
 		// The sentinel "delay not met" matches both "usenet delay not met" and
@@ -1156,11 +1417,22 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 	}
 	if best == nil {
 		// Re-evaluate any existing pending releases for this book/format with the current age.
-		best = s.checkPendingReleases(ctx, book, mediaType, dm)
+		var pendErr error
+		best, bestClient, pendErr = s.pendingApproved(ctx, book, mediaType, dm, func(res *newznab.SearchResult) (*models.DownloadClient, bool, error) {
+			return s.checkPin(ctx, book, res, skippedPinned)
+		})
+		if pendErr != nil {
+			slog.Error("SearchAndGrabBook: failed to resolve the indexer's pinned download client for a pending release", "error", pendErr)
+			outcome = "download client lookup failed"
+			return
+		}
 		if best == nil {
-			if rawResults == 0 {
+			switch {
+			case len(skippedPinned) > 0:
+				outcome = "pinned download client unavailable"
+			case rawResults == 0:
 				outcome = "no results"
-			} else {
+			default:
 				outcome = "nothing approved"
 			}
 			return
@@ -1168,11 +1440,18 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 	}
 	approved = 1
 
-	candidates, err := s.clients.GetEnabledByProtocol(ctx, best.Protocol)
-	if err != nil {
-		slog.Error("SearchAndGrabBook: failed to list download clients", "protocol", best.Protocol, "error", err)
-		outcome = "download client lookup failed"
-		return
+	// An indexer pinned to a download client (#3080) sends every grab to that
+	// client or, above, was skipped. There is deliberately no fallback to the
+	// default pick for its releases.
+	client := bestClient
+	if client == nil {
+		candidates, err := s.clients.GetEnabledByProtocol(ctx, best.Protocol)
+		if err != nil {
+			slog.Error("SearchAndGrabBook: failed to list download clients", "protocol", best.Protocol, "error", err)
+			outcome = "download client lookup failed"
+			return
+		}
+		client = db.PickClientForMediaType(candidates, mediaType)
 	}
 	// No cross-protocol fallback: a usenet release must not be pushed to a
 	// torrent client (qBittorrent would accept the .nzb URL, fail to parse it
@@ -1266,12 +1545,11 @@ func (s *Scheduler) searchAndGrabFormat(ctx context.Context, book models.Book, m
 		MediaType:            mediaType,
 		DownloadDir:          s.downloadDir,
 		AudiobookDownloadDir: s.audiobookDownloadDir,
-		SeedRatio:            s.resolveSeedRatio(ctx, best.IndexerID),
-	})
+		GlobalRemap:          s.downloadPathRemap,
+	}.WithSeedLimits(s.resolveSeedLimits(ctx, best.IndexerID)))
 	if err != nil {
-		slog.Error("SearchAndGrabBook: failed to send to eligible client", "client", client.Name, "title", best.Title, "error", err)
-		wrapped := fmt.Errorf("failed to send to eligible download client %s: %w", client.Name, err)
-		if setErr := s.downloads.SetError(ctx, dl.ID, wrapped.Error()); setErr != nil {
+		slog.Error("SearchAndGrabBook: failed to send to downloader", "client", client.Type, "client_name", client.Name, "indexer", best.IndexerName, "title", best.Title, "error", err)
+		if setErr := s.downloads.SetError(ctx, dl.ID, err.Error()); setErr != nil {
 			slog.Warn("failed to persist download error", "download_id", dl.ID, "error", setErr)
 		}
 		outcome = "send to downloader failed"
@@ -1379,12 +1657,24 @@ func (s *Scheduler) storePending(ctx context.Context, bookID int64, mediaType st
 // book's ebook and audiobook pending entries are evaluated independently.
 // If any now passes the decision engine it is returned for immediate grab.
 func (s *Scheduler) checkPendingReleases(ctx context.Context, book models.Book, mediaType string, dm *decision.DecisionMaker) *newznab.SearchResult {
+	res, _, _ := s.pendingApproved(ctx, book, mediaType, dm, nil)
+	return res
+}
+
+// pendingApproved is checkPendingReleases with a gate. accept, when set, is
+// asked about each approved release before it is taken: it returns the client to
+// use, whether to skip the release, or an error that stops the sweep. A skipped
+// release stays pending, untouched, for the next sweep (a pinned client that is
+// down must not cost the user a held release), and the next approved row is
+// tried. Only a release that is taken is deleted from pending.
+func (s *Scheduler) pendingApproved(ctx context.Context, book models.Book, mediaType string, dm *decision.DecisionMaker,
+	accept func(*newznab.SearchResult) (*models.DownloadClient, bool, error)) (*newznab.SearchResult, *models.DownloadClient, error) {
 	if s.pending == nil {
-		return nil
+		return nil, nil, nil
 	}
 	pendingList, err := s.pending.ListByBookAndMediaType(ctx, book.ID, mediaType)
 	if err != nil || len(pendingList) == 0 {
-		return nil
+		return nil, nil, nil
 	}
 
 	// Re-hydrate stored releases and re-evaluate with current age.
@@ -1397,16 +1687,27 @@ func (s *Scheduler) checkPendingReleases(ctx context.Context, book models.Book, 
 		rel := decision.ReleaseFromSearchResult(res)
 		decisions := dm.Evaluate([]decision.Release{rel}, book)
 		if len(decisions) > 0 && decisions[0].Approved {
+			var client *models.DownloadClient
+			if accept != nil {
+				c, skip, err := accept(&res)
+				if err != nil {
+					return nil, nil, err
+				}
+				if skip {
+					continue
+				}
+				client = c
+			}
 			if err := s.pending.DeleteByID(ctx, pendingList[i].ID); err != nil {
 				// If the entry survives it is re-approved and re-grabbed on the
 				// next cycle — duplicate grabs with no visible cause.
 				slog.Warn("failed to delete pending release after approval",
 					"pending_id", pendingList[i].ID, "book_id", book.ID, "guid", res.GUID, "error", err)
 			}
-			return &res
+			return &res, client, nil
 		}
 	}
-	return nil
+	return nil, nil, nil
 }
 
 func (s *Scheduler) searchWanted() {
@@ -1490,10 +1791,20 @@ func (s *Scheduler) wantedSearchQueue(ctx context.Context) []wantedSearch {
 	}
 
 	inFlight := s.inFlightFormatsByBook(ctx)
+	splitParts := s.coveredSplitEditionParts(ctx)
 
 	searchQueue := make([]wantedSearch, 0, len(wanted))
 	for _, book := range wanted {
 		if book.Excluded {
+			continue
+		}
+		// A split edition part of a book the library already has or is
+		// already looking for is not a missing volume (#3048). Searching it
+		// downloads text that is already on the shelf. The row stays as it
+		// is; the series page offers to unmonitor it.
+		if whole, ok := splitParts[book.ID]; ok {
+			slog.Debug("skipping wanted search: the book is a split edition part of a book already in the library",
+				"book", book.Title, "bookID", book.ID, "wholeBookID", whole)
 			continue
 		}
 		held := inFlight[book.ID]
@@ -1533,6 +1844,22 @@ func (s *Scheduler) wantedSearchQueue(ctx context.Context) []wantedSearch {
 		searchQueue = append(searchQueue, wantedSearch{book: book, formats: formats})
 	}
 	return searchQueue
+}
+
+// coveredSplitEditionParts maps the id of every book that is a split edition
+// part of a whole already in the library to that whole's id (#3048). A lookup
+// failure skips nothing, so a broken query can never stop the sweep.
+func (s *Scheduler) coveredSplitEditionParts(ctx context.Context) map[int64]int64 {
+	parts, err := s.books.ListCoveredSplitEditionParts(ctx, 0)
+	if err != nil {
+		slog.Warn("failed to list split edition parts; searching every wanted book", "error", err)
+		return nil
+	}
+	covered := make(map[int64]int64, len(parts))
+	for _, p := range parts {
+		covered[p.BookID] = p.WholeBookID
+	}
+	return covered
 }
 
 // inFlightFormatsByBook maps a book id to the set of media types that already
@@ -1608,67 +1935,6 @@ func downloadMediaType(dl *models.Download) string {
 	}
 }
 
-func (s *Scheduler) refreshMetadata() {
-	ctx := s.ctx()
-
-	authors, err := s.authors.List(ctx)
-	if err != nil {
-		slog.Error("failed to list authors", "error", err)
-		return
-	}
-
-	for _, author := range authors {
-		if !author.Monitored {
-			continue
-		}
-
-		// Calibre-imported authors have synthetic "calibre:author:N" IDs with
-		// no counterpart in OL/Hardcover; skip to avoid noisy 404 errors.
-		if strings.HasPrefix(author.ForeignID, "calibre:") {
-			continue
-		}
-
-		updated, err := s.meta.GetAuthor(ctx, author.ForeignID)
-		if err != nil {
-			slog.Warn("failed to refresh author", "author", author.Name, "error", err)
-			continue
-		}
-		// Aggregator returns (nil, nil) when no configured provider owns this
-		// foreignID prefix (e.g. a Hardcover-prefixed author after Hardcover
-		// was disabled, or any author whose ForeignID prefix no longer maps to
-		// a provider). Without this guard the deref below panics, which exits
-		// the range loop and kills every subsequent author's refresh that
-		// cycle.
-		if updated == nil {
-			slog.Debug("no metadata provider for author, skipping refresh", "author", author.Name, "foreignID", author.ForeignID)
-			continue
-		}
-
-		// Update changed fields. Only overwrite when the upstream record
-		// actually carries a value: a sparse OpenLibrary refresh must not
-		// clobber a previously enriched description/ratings with empties
-		// (#1463). Same guard the ImageURL update has always had.
-		if updated.Description != "" {
-			author.Description = updated.Description
-		}
-		if updated.ImageURL != "" {
-			author.ImageURL = updated.ImageURL
-		}
-		if updated.AverageRating != 0 {
-			author.AverageRating = updated.AverageRating
-		}
-		if updated.RatingsCount != 0 {
-			author.RatingsCount = updated.RatingsCount
-		}
-		if err := s.authors.Update(ctx, &author); err != nil {
-			slog.Warn("failed to persist refreshed author", "author", author.Name, "error", err)
-			continue
-		}
-
-		slog.Debug("refreshed author", "author", author.Name)
-	}
-}
-
 // stallTimeoutDefault is the duration a download must be in the downloading
 // state before it can be considered stalled. Configurable via the
 // stall.timeout_minutes setting (default 120 minutes / 2 hours).
@@ -1680,9 +1946,15 @@ const stallTimeoutDefault = 120 * time.Minute
 // re-grabbed, and a fresh search is triggered for the same book.
 //
 // Detection uses the download client's native stall signal where available
-// (qBittorrent: stalledDL state; Transmission: stopped with error). For
-// SABnzbd the existing Failed-state detection in CheckDownloads already
-// covers failures, so this job adds nothing for usenet downloads.
+// (qBittorrent: stalledDL state; Transmission: stopped with error), plus the
+// "accepted but never resolved" rule that catches a magnet the client is still
+// holding with no metadata (#2709). For SABnzbd the existing Failed-state
+// detection in CheckDownloads already covers failures, so this job adds
+// nothing for usenet downloads.
+//
+// The grabbed_at cutoff below is what makes the no-metadata rule safe: a
+// healthy magnet is indistinguishable from a dead one until it resolves, so
+// nothing is judged before it has had the whole stall timeout to do so.
 func (s *Scheduler) checkStalledDownloads(ctx context.Context) {
 	timeout := stallTimeoutDefault
 	if s.settings != nil {
@@ -1718,7 +1990,7 @@ func (s *Scheduler) checkStalledDownloads(ctx context.Context) {
 			continue
 		}
 
-		stalledIDs, _, err := downloader.GetStalledIDs(ctx, client)
+		report, err := downloader.GetStalledTorrents(ctx, client)
 		if err != nil {
 			// Warn, not Debug: a persistent failure here silently disables stall
 			// detection for this client (same invisibility class as #1019).
@@ -1726,7 +1998,21 @@ func (s *Scheduler) checkStalledDownloads(ctx context.Context) {
 				"client", client.Name, "error", err)
 			continue
 		}
-		if len(stalledIDs) == 0 {
+		// Breadth guard (#2709). "No metadata" is as much a property of the
+		// network as of the release, so a client that has lost DHT, UDP or its
+		// port forward reports it for everything it is working on at once.
+		// Failing that batch would turn one temporary fault into a pile of
+		// failed downloads. One line per client per run, at Warn, because a
+		// silent skip here looks exactly like a working stall detector.
+		if report.LooksLikeClientOutage() {
+			slog.Warn("stall check: most of this client's unfinished torrents have no metadata, so this is a download client or network fault rather than bad releases. Leaving them alone",
+				"client", client.Name,
+				"no_metadata", len(report.NoMetadata),
+				"incomplete", report.Incomplete,
+			)
+			report.NoMetadata = nil
+		}
+		if len(report.ClientReported) == 0 && len(report.NoMetadata) == 0 {
 			continue
 		}
 
@@ -1734,29 +2020,56 @@ func (s *Scheduler) checkStalledDownloads(ctx context.Context) {
 			if dl.TorrentID == nil {
 				continue
 			}
-			if !stalledIDs[strings.ToLower(*dl.TorrentID)] {
+			id := strings.ToLower(*dl.TorrentID)
+			var kind downloader.StallKind
+			switch {
+			case report.ClientReported[id]:
+				kind = downloader.StallClientReported
+			case report.NoMetadata[id]:
+				kind = downloader.StallNoMetadata
+			default:
 				continue
 			}
 			slog.Warn("stall detected",
 				"title", dl.Title,
 				"grabbed_at", dl.GrabbedAt,
 				"client", client.Name,
+				"kind", kind.String(),
+				"reason", kind.Reason(),
+				"blocklisted", kind.Blocklists(),
 			)
-			s.handleStalledDownload(ctx, &dl, client)
+			s.handleStalledDownload(ctx, &dl, client, kind)
 		}
 	}
 }
 
 // handleStalledDownload removes the stalled release from the download client,
-// marks the download failed, records history, adds the release to the
-// blocklist, and triggers a fresh search for the same book.
+// marks the download failed, records history, blocklists the release when the
+// stall says something about it, and triggers a fresh search for the same
+// book.
 //
 // client is the download client the release lives in; it may be nil for
 // callers that have no client to hand, in which case the removal is skipped.
-func (s *Scheduler) handleStalledDownload(ctx context.Context, dl *models.Download, client *models.DownloadClient) {
-	reason := "stalled: no peers / no download progress"
+//
+// kind decides the wording and whether the release is blocklisted. Only the
+// client's own per torrent signal blocklists: it is the client asserting that
+// something is wrong with this torrent. A no-metadata stall does not, because
+// nothing was learned about the release, and the blocklist is permanent and
+// hand-cleared, so one lost port forward could otherwise ban a run of good
+// releases for ever. See StallKind.Blocklists.
+//
+// kind must be a real stall. StallNone is rejected rather than defaulted,
+// because a caller that forgot to set it would otherwise fail a download with
+// a plausible-looking reason.
+func (s *Scheduler) handleStalledDownload(ctx context.Context, dl *models.Download, client *models.DownloadClient, kind downloader.StallKind) {
+	if kind == downloader.StallNone {
+		slog.Error("stall: handler called with no stall reason, ignoring",
+			"download_id", dl.ID, "title", dl.Title)
+		return
+	}
+	reason := kind.Reason()
 
-	s.removeStalledFromClient(ctx, dl, client)
+	s.removeStalledFromClient(ctx, dl, client, kind.DeletesData())
 
 	// Mark failed in DB.
 	if err := s.downloads.SetError(ctx, dl.ID, reason); err != nil {
@@ -1774,8 +2087,13 @@ func (s *Scheduler) handleStalledDownload(ctx context.Context, dl *models.Downlo
 		})
 	}
 
-	// Blocklist the release so the next search skips it.
-	if s.blocklist != nil && dl.IndexerID != nil {
+	// Blocklist the release so the next search skips it, but only for a stall
+	// that says something about the release itself.
+	if !kind.Blocklists() {
+		slog.Info("stall: not blocklisting the release, the stall says nothing about it",
+			"download_id", dl.ID, "title", dl.Title, "kind", kind.String())
+	}
+	if kind.Blocklists() && s.blocklist != nil && dl.IndexerID != nil {
 		entry := &models.BlocklistEntry{
 			BookID:    dl.BookID,
 			GUID:      dl.GUID,
@@ -1818,7 +2136,7 @@ func (s *Scheduler) handleStalledDownload(ctx context.Context, dl *models.Downlo
 	s.bgWg.Add(1)
 	go func() {
 		defer s.bgWg.Done()
-		s.SearchAndGrabBook(indexer.WithSearchOrigin(ctx, indexer.OriginRequeue), *book)
+		s.SearchAndGrabBook(withStalledRelease(indexer.WithSearchOrigin(ctx, indexer.OriginRequeue), dl.GUID), *book)
 	}()
 }
 
@@ -1831,23 +2149,39 @@ func (s *Scheduler) handleStalledDownload(ctx context.Context, dl *models.Downlo
 // failed rows, so nothing ever looked at it again. A user's queue filled with
 // dead torrents Bindery had already written off.
 //
-// Files are deleted along with it. Only qBittorrent's stalledDL and its
-// equivalents reach here (see downloader.GetStalledIDs) — never a seeding
-// torrent — so there is no completed release to keep sharing, and the partial
-// data belongs to a release that has just been blocklisted and replaced. Per
-// indexer seed-ratio overrides (#883) apply to what a client does with a
-// download it finished; they have nothing to say about one that never started.
+// For a client reported stall, files are deleted along with it. Only
+// qBittorrent's stalledDL and its equivalents reach here (see
+// downloader.GetStalledTorrents) — never a seeding torrent — so there is no
+// completed release to keep sharing, and the partial data belongs to a release
+// that has just been blocklisted and replaced. Per indexer seed-ratio
+// overrides (#883) apply to what a client does with a download it finished;
+// they have nothing to say about one that never started.
+//
+// A torrent that never resolved its metadata has no files at all, so it is
+// removed without asking the client to delete data (deleteFiles false), the
+// same way remove on import takes the entry and leaves the disk alone (#2046).
+// Asking for a data delete there could only ever hit something that is not
+// this torrent's, which on rTorrent means Bindery's own RemoveAll.
 //
 // A removal failure is logged and swallowed: the blocklist and the re-search
 // below are the recovery, and they must not be skipped because the client was
 // unreachable for a moment.
-func (s *Scheduler) removeStalledFromClient(ctx context.Context, dl *models.Download, client *models.DownloadClient) {
+//
+// While another download row still uses the torrent, the client is left alone
+// (downloader.ClientJobShared). This row is marked failed straight after, and
+// failed rows do not count as users, so the last row of a shared stalled
+// torrent is the one whose pass removes it.
+func (s *Scheduler) removeStalledFromClient(ctx context.Context, dl *models.Download, client *models.DownloadClient, deleteFiles bool) {
 	if client == nil {
 		return
 	}
-	if err := downloader.RemoveDownload(ctx, client, dl, true, s.downloadPathRemap); err != nil {
+	removed, err := downloader.RemoveDownloadUnlessShared(ctx, s.downloads, client, dl, deleteFiles, s.downloadPathRemap, "stall")
+	if err != nil {
 		slog.Warn("stall: failed to remove the stalled release from the download client",
 			"download_id", dl.ID, "title", dl.Title, "client", client.Name, "error", err)
+		return
+	}
+	if !removed {
 		return
 	}
 	slog.Info("stall: removed the stalled release from the download client",

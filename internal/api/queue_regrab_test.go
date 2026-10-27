@@ -15,6 +15,7 @@ import (
 	"github.com/vavallee/bindery/internal/auth"
 	"github.com/vavallee/bindery/internal/db"
 	"github.com/vavallee/bindery/internal/httpsec"
+	"github.com/vavallee/bindery/internal/indexer/newznab"
 	"github.com/vavallee/bindery/internal/models"
 )
 
@@ -204,15 +205,17 @@ func TestQueueGrab_LiveDownloadStillBlocksRegrabWithReason(t *testing.T) {
 			if rec.Code != http.StatusConflict {
 				t.Fatalf("expected 409 for a %s download, got %d: %s", tc.name, rec.Code, rec.Body.String())
 			}
-			var payload map[string]string
+			var payload struct {
+				Error string `json:"error"`
+			}
 			if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
 				t.Fatal(err)
 			}
-			if !strings.Contains(payload["error"], "already grabbed") {
-				t.Errorf("expected the sentinel preserved for clients matching on it, got %q", payload["error"])
+			if !strings.Contains(payload.Error, "already grabbed") {
+				t.Errorf("expected the sentinel preserved for clients matching on it, got %q", payload.Error)
 			}
-			if !strings.Contains(payload["error"], tc.want) {
-				t.Errorf("expected the 409 body to explain why (%q), got %q", tc.want, payload["error"])
+			if !strings.Contains(payload.Error, tc.want) {
+				t.Errorf("expected the 409 body to explain why (%q), got %q", tc.want, payload.Error)
 			}
 		})
 	}
@@ -434,6 +437,11 @@ func TestQueueGrab_ReusedRowBelongsToNewGrabber(t *testing.T) {
 	}
 
 	bobBook := regrabOwnedBook(t, database, books, "bob", bob)
+	// Bob is a user account, so his grab must name a release a search
+	// returned (SearchResultRegistry).
+	registry := NewSearchResultRegistry()
+	registry.remember([]newznab.SearchResult{{GUID: "guid-2289-owner", NZBURL: indexerURL + "/new.nzb", Title: "New Release"}})
+	h.WithSearchResults(registry)
 	body := `{"guid":"guid-2289-owner","nzbUrl":"` + indexerURL + `/new.nzb","title":"New Release","bookId":` +
 		strconv.FormatInt(bobBook.ID, 10) + `}`
 	rec := httptest.NewRecorder()

@@ -1,0 +1,244 @@
+<?xml version="1.0" encoding="UTF-8"?><srw:searchRetrieveResponse xmlns:srw="http://www.loc.gov/zing/srw/" xmlns="http://catalogue.bnf.fr/namespaces/InterXMarc" xmlns:ixm="http://catalogue.bnf.fr/namespaces/InterXMarc" xmlns:mn="http://catalogue.bnf.fr/namespaces/motsnotices" xmlns:sd="http://www.loc.gov/zing/srw/diagnostic/">
+<srw:version>1.2</srw:version>
+<srw:echoedSearchRetrieveRequest>
+<srw:version>1.2</srw:version>
+<srw:query>aut.accesspoint all "carroll lewis" and aut.type any "pep"</srw:query>
+</srw:echoedSearchRetrieveRequest>
+<srw:numberOfRecords>2</srw:numberOfRecords>
+<srw:records>
+<srw:record>
+<srw:recordSchema>marcxchange</srw:recordSchema>
+<srw:recordPacking>xml</srw:recordPacking>
+<srw:recordData>
+<mxc:record xmlns:mxc="info:lc/xmlns/marcxchange-v2" format="UNIMARC" id="ark:/12148/cb139769982" type="Authority">
+<mxc:leader>     cx  a22        45  </mxc:leader>
+<mxc:controlfield tag="001">FRBNF139769989</mxc:controlfield>
+<mxc:controlfield tag="003">http://catalogue.bnf.fr/ark:/12148/cb139769982</mxc:controlfield>
+<mxc:controlfield tag="005">20240729</mxc:controlfield>
+<mxc:datafield tag="010" ind1=" " ind2=" ">
+<mxc:subfield code="a">0000000059338445</mxc:subfield>
+<mxc:subfield code="2">VIAF</mxc:subfield>
+<mxc:subfield code="d">20130731</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="100" ind1=" " ind2=" ">
+<mxc:subfield code="a">19950602afrey50      ba0</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="102" ind1=" " ind2=" ">
+<mxc:subfield code="a">US</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="103" ind1=" " ind2=" ">
+<mxc:subfield code="a"> 19371023  19950218 </mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="105" ind1=" " ind2=" ">
+<mxc:subfield code="a">i</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="106" ind1=" " ind2=" ">
+<mxc:subfield code="a">1  </mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="120" ind1=" " ind2=" ">
+<mxc:subfield code="a">b</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="152" ind1=" " ind2=" ">
+<mxc:subfield code="c">2</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="200" ind1=" " ind2="|">
+<mxc:subfield code="7">ba0yba0y</mxc:subfield>
+<mxc:subfield code="8">fre   </mxc:subfield>
+<mxc:subfield code="9"> 0 </mxc:subfield>
+<mxc:subfield code="a">Carroll</mxc:subfield>
+<mxc:subfield code="b">Johnny</mxc:subfield>
+<mxc:subfield code="f">1937-1995</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="300" ind1="0" ind2=" ">
+<mxc:subfield code="a">Chanteur et guitariste de rockabilly</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="301" ind1=" " ind2=" ">
+<mxc:subfield code="a">Cleburne (Texas, Etats-Unis)</mxc:subfield>
+<mxc:subfield code="b">Godley (Texas, Etats-Unis)</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="400" ind1=" " ind2="|">
+<mxc:subfield code="7">ba0yba0y</mxc:subfield>
+<mxc:subfield code="8">fre   </mxc:subfield>
+<mxc:subfield code="9">   </mxc:subfield>
+<mxc:subfield code="a">Carroll</mxc:subfield>
+<mxc:subfield code="b">Johnny Lewis</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="510" ind1="|" ind2="|">
+<mxc:subfield code="5">xxxk</mxc:subfield>
+<mxc:subfield code="0">Membre de : </mxc:subfield>
+<mxc:subfield code="3">17818314</mxc:subfield>
+<mxc:subfield code="7">ba0yba0y</mxc:subfield>
+<mxc:subfield code="8">fre   </mxc:subfield>
+<mxc:subfield code="9">20 </mxc:subfield>
+<mxc:subfield code="a">Johnny Carroll and his hot rocks</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="801" ind1=" " ind2=" ">
+<mxc:subfield code="a">FR</mxc:subfield>
+<mxc:subfield code="b">FR-751131015</mxc:subfield>
+<mxc:subfield code="c">20240729</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="810" ind1=" " ind2=" ">
+<mxc:subfield code="a">Rock baby, rock it / Johnny Carroll. In : The very best of Sun rockabilly. Charly CPCD82742 [Musique exécutée : audio]</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="810" ind1=" " ind2=" ">
+<mxc:subfield code="a">LC authorities - https://lccn.loc.gov/no98007589 (2024-07-29)</mxc:subfield>
+<mxc:subfield code="a">Jukebox magazine n °92, mai 1995</mxc:subfield>
+</mxc:datafield>
+</mxc:record>      </srw:recordData>
+<srw:recordIdentifier>ark:/12148/cb139769982</srw:recordIdentifier>
+<srw:recordPosition>1</srw:recordPosition>
+<srw:extraRecordData>
+<ixm:attr name="CreationDate">19950602</ixm:attr>
+<ixm:attr name="LastModificationDate">20240729</ixm:attr>
+<mn:score>8.962906</mn:score>
+</srw:extraRecordData>
+</srw:record>
+<srw:record>
+<srw:recordSchema>marcxchange</srw:recordSchema>
+<srw:recordPacking>xml</srw:recordPacking>
+<srw:recordData>
+<mxc:record xmlns:mxc="info:lc/xmlns/marcxchange-v2" format="UNIMARC" id="ark:/12148/cb118859183" type="Authority">
+<mxc:leader>     cx  a22        45  </mxc:leader>
+<mxc:controlfield tag="001">FRBNF118859180</mxc:controlfield>
+<mxc:controlfield tag="003">http://catalogue.bnf.fr/ark:/12148/cb118859183</mxc:controlfield>
+<mxc:controlfield tag="005">20170301</mxc:controlfield>
+<mxc:datafield tag="010" ind1=" " ind2=" ">
+<mxc:subfield code="a">000000012137136X</mxc:subfield>
+<mxc:subfield code="2">ISNI</mxc:subfield>
+<mxc:subfield code="d">20170818</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="039" ind1=" " ind2=" ">
+<mxc:subfield code="o">OPL</mxc:subfield>
+<mxc:subfield code="a">00251318X</mxc:subfield>
+<mxc:subfield code="z">AMA</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="039" ind1=" " ind2=" ">
+<mxc:subfield code="o">OPL</mxc:subfield>
+<mxc:subfield code="a">00035641X</mxc:subfield>
+<mxc:subfield code="z">APP</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="039" ind1=" " ind2=" ">
+<mxc:subfield code="o">OPP</mxc:subfield>
+<mxc:subfield code="a">14856271</mxc:subfield>
+<mxc:subfield code="d">20061010</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="039" ind1=" " ind2=" ">
+<mxc:subfield code="o">OPP</mxc:subfield>
+<mxc:subfield code="a">10889028</mxc:subfield>
+<mxc:subfield code="d">20120518</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="039" ind1=" " ind2=" ">
+<mxc:subfield code="o">OPP</mxc:subfield>
+<mxc:subfield code="a">14672331</mxc:subfield>
+<mxc:subfield code="d">20120518</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="039" ind1=" " ind2=" ">
+<mxc:subfield code="o">OPP</mxc:subfield>
+<mxc:subfield code="a">16450529</mxc:subfield>
+<mxc:subfield code="d">20131204</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="039" ind1=" " ind2=" ">
+<mxc:subfield code="o">OPP</mxc:subfield>
+<mxc:subfield code="a">16782838</mxc:subfield>
+<mxc:subfield code="d">20160804</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="100" ind1=" " ind2=" ">
+<mxc:subfield code="a">19840425afrey50      ba0</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="101" ind1=" " ind2=" ">
+<mxc:subfield code="a">eng</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="102" ind1=" " ind2=" ">
+<mxc:subfield code="a">GB</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="103" ind1=" " ind2=" ">
+<mxc:subfield code="a"> 18320127  18980114 </mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="105" ind1=" " ind2=" ">
+<mxc:subfield code="a">a</mxc:subfield>
+<mxc:subfield code="a">i</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="106" ind1=" " ind2=" ">
+<mxc:subfield code="a">010</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="120" ind1=" " ind2=" ">
+<mxc:subfield code="a">b</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="152" ind1=" " ind2=" ">
+<mxc:subfield code="c">2</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="200" ind1=" " ind2="|">
+<mxc:subfield code="7">ba0yba0y</mxc:subfield>
+<mxc:subfield code="8">fre   </mxc:subfield>
+<mxc:subfield code="9"> 0 </mxc:subfield>
+<mxc:subfield code="a">Carroll</mxc:subfield>
+<mxc:subfield code="b">Lewis</mxc:subfield>
+<mxc:subfield code="f">1832-1898</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="300" ind1="|" ind2=" ">
+<mxc:subfield code="a">Écrivain. - Photographe. - Professeur de mathématiques</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="301" ind1=" " ind2=" ">
+<mxc:subfield code="a">Daresbury (Royaume-Uni)</mxc:subfield>
+<mxc:subfield code="b">Guildford (Royaume-Uni)</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="400" ind1=" " ind2="|">
+<mxc:subfield code="7">ba0yba0y</mxc:subfield>
+<mxc:subfield code="8">fre   </mxc:subfield>
+<mxc:subfield code="9">   </mxc:subfield>
+<mxc:subfield code="a">Dodgson</mxc:subfield>
+<mxc:subfield code="b">Charles Lutwidge</mxc:subfield>
+<mxc:subfield code="f">1832-1898</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="400" ind1=" " ind2="|">
+<mxc:subfield code="5">e</mxc:subfield>
+<mxc:subfield code="7">ba0yba0y</mxc:subfield>
+<mxc:subfield code="8">fre   </mxc:subfield>
+<mxc:subfield code="9">   </mxc:subfield>
+<mxc:subfield code="a">Holiday</mxc:subfield>
+<mxc:subfield code="b">Henry</mxc:subfield>
+<mxc:subfield code="f">1832-1898</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="400" ind1=" " ind2="|">
+<mxc:subfield code="7">ba0yba0y</mxc:subfield>
+<mxc:subfield code="8">freara</mxc:subfield>
+<mxc:subfield code="9">   </mxc:subfield>
+<mxc:subfield code="a">Kārūl</mxc:subfield>
+<mxc:subfield code="b">Lūwīs</mxc:subfield>
+<mxc:subfield code="f">1832-1898</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="540" ind1=" " ind2=" ">
+<mxc:subfield code="3">16741446</mxc:subfield>
+<mxc:subfield code="a">Saylor</mxc:subfield>
+<mxc:subfield code="b">Maurice</mxc:subfield>
+<mxc:subfield code="f">1957-....</mxc:subfield>
+<mxc:subfield code="t">[The hunting of the snark]</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="801" ind1=" " ind2=" ">
+<mxc:subfield code="a">FR</mxc:subfield>
+<mxc:subfield code="b">FR-751131015</mxc:subfield>
+<mxc:subfield code="c">20170301</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="810" ind1=" " ind2=" ">
+<mxc:subfield code="a">Euclid and his modern rivals / by Charles L. Dodgson, 1879</mxc:subfield>
+<mxc:subfield code="a">Alice au pays des merveilles / Lewis Carroll ; texte français de Michel J. Arnaud, [1932]</mxc:subfield>
+<mxc:subfield code="a">Alīs fī bilād al-ʿaǧāʾib / taʾlīf Lūwīs Kārūl ; rusūm Ǧūn Tinyil, cop. 2015</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="810" ind1=" " ind2=" ">
+<mxc:subfield code="a">BLNA, 1993-09 : Carroll, Lewis, 1832-1898 et Dodgson, C. L. (Charles Lutwidge), 1832-1898</mxc:subfield>
+<mxc:subfield code="a">GDEL</mxc:subfield>
+</mxc:datafield>
+<mxc:datafield tag="810" ind1=" " ind2=" ">
+<mxc:subfield code="a">BN Cat. gén. : Dodgson (Charles Lutwidge)</mxc:subfield>
+</mxc:datafield>
+</mxc:record>      </srw:recordData>
+<srw:recordIdentifier>ark:/12148/cb118859183</srw:recordIdentifier>
+<srw:recordPosition>2</srw:recordPosition>
+<srw:extraRecordData>
+<ixm:attr name="CreationDate">19850622</ixm:attr>
+<ixm:attr name="LastModificationDate">20170818</ixm:attr>
+<mn:score>4.5725117</mn:score>
+</srw:extraRecordData>
+</srw:record>
+</srw:records>
+</srw:searchRetrieveResponse>

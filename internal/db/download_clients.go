@@ -19,7 +19,7 @@ type DownloadClientRepo struct {
 const downloadClientSelectColumns = `
 	id, name, type, host, port, api_key, use_ssl, url_base, username, password,
 	category, category_audiobook, path_remap, priority, enabled,
-	enabled_for_books, enabled_for_audiobooks, created_at, updated_at`
+	enabled_for_books, enabled_for_audiobooks, remove_on_import, created_at, updated_at`
 
 // torrentClientTypes and usenetClientTypes are the download-client types each
 // protocol can be served by. They back the protocol-scoped queries below; a new
@@ -143,16 +143,17 @@ func (r *DownloadClientRepo) List(ctx context.Context) ([]models.DownloadClient,
 	var clients []models.DownloadClient
 	for rows.Next() {
 		var c models.DownloadClient
-		var enabled, useSSL, enabledForBooks, enabledForAudiobooks int
+		var enabled, useSSL, enabledForBooks, enabledForAudiobooks, removeOnImport int
 		if err := rows.Scan(&c.ID, &c.Name, &c.Type, &c.Host, &c.Port, &c.APIKey,
 			&useSSL, &c.URLBase, &c.Username, &c.Password, &c.Category, &c.CategoryAudiobook, &c.PathRemap, &c.Priority,
-			&enabled, &enabledForBooks, &enabledForAudiobooks, &c.CreatedAt, &c.UpdatedAt); err != nil {
+			&enabled, &enabledForBooks, &enabledForAudiobooks, &removeOnImport, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
 		c.Enabled = enabled == 1
 		c.UseSSL = useSSL == 1
 		c.EnabledForBooks = enabledForBooks == 1
 		c.EnabledForAudiobooks = enabledForAudiobooks == 1
+		c.RemoveOnImport = removeOnImport == 1
 		hydrateClientCredentials(&c)
 		clients = append(clients, c)
 	}
@@ -161,13 +162,13 @@ func (r *DownloadClientRepo) List(ctx context.Context) ([]models.DownloadClient,
 
 func (r *DownloadClientRepo) GetByID(ctx context.Context, id int64) (*models.DownloadClient, error) {
 	var c models.DownloadClient
-	var enabled, useSSL, enabledForBooks, enabledForAudiobooks int
+	var enabled, useSSL, enabledForBooks, enabledForAudiobooks, removeOnImport int
 	err := r.db.QueryRowContext(ctx, `
 		SELECT `+downloadClientSelectColumns+`
 		FROM download_clients WHERE id=?`, id).
 		Scan(&c.ID, &c.Name, &c.Type, &c.Host, &c.Port, &c.APIKey,
 			&useSSL, &c.URLBase, &c.Username, &c.Password, &c.Category, &c.CategoryAudiobook, &c.PathRemap, &c.Priority,
-			&enabled, &enabledForBooks, &enabledForAudiobooks, &c.CreatedAt, &c.UpdatedAt)
+			&enabled, &enabledForBooks, &enabledForAudiobooks, &removeOnImport, &c.CreatedAt, &c.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -178,6 +179,7 @@ func (r *DownloadClientRepo) GetByID(ctx context.Context, id int64) (*models.Dow
 	c.UseSSL = useSSL == 1
 	c.EnabledForBooks = enabledForBooks == 1
 	c.EnabledForAudiobooks = enabledForAudiobooks == 1
+	c.RemoveOnImport = removeOnImport == 1
 	hydrateClientCredentials(&c)
 	return &c, nil
 }
@@ -195,16 +197,17 @@ func (r *DownloadClientRepo) ListEnabled(ctx context.Context) ([]models.Download
 	var clients []models.DownloadClient
 	for rows.Next() {
 		var c models.DownloadClient
-		var enabled, useSSL, enabledForBooks, enabledForAudiobooks int
+		var enabled, useSSL, enabledForBooks, enabledForAudiobooks, removeOnImport int
 		if err := rows.Scan(&c.ID, &c.Name, &c.Type, &c.Host, &c.Port, &c.APIKey,
 			&useSSL, &c.URLBase, &c.Username, &c.Password, &c.Category, &c.CategoryAudiobook, &c.PathRemap, &c.Priority,
-			&enabled, &enabledForBooks, &enabledForAudiobooks, &c.CreatedAt, &c.UpdatedAt); err != nil {
+			&enabled, &enabledForBooks, &enabledForAudiobooks, &removeOnImport, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
 		c.Enabled = enabled == 1
 		c.UseSSL = useSSL == 1
 		c.EnabledForBooks = enabledForBooks == 1
 		c.EnabledForAudiobooks = enabledForAudiobooks == 1
+		c.RemoveOnImport = removeOnImport == 1
 		hydrateClientCredentials(&c)
 		clients = append(clients, c)
 	}
@@ -213,13 +216,13 @@ func (r *DownloadClientRepo) ListEnabled(ctx context.Context) ([]models.Download
 
 func (r *DownloadClientRepo) GetFirstEnabled(ctx context.Context) (*models.DownloadClient, error) {
 	var c models.DownloadClient
-	var enabled, useSSL, enabledForBooks, enabledForAudiobooks int
+	var enabled, useSSL, enabledForBooks, enabledForAudiobooks, removeOnImport int
 	err := r.db.QueryRowContext(ctx, `
 		SELECT `+downloadClientSelectColumns+`
 		FROM download_clients WHERE enabled=1 ORDER BY priority LIMIT 1`).
 		Scan(&c.ID, &c.Name, &c.Type, &c.Host, &c.Port, &c.APIKey,
 			&useSSL, &c.URLBase, &c.Username, &c.Password, &c.Category, &c.CategoryAudiobook, &c.PathRemap, &c.Priority,
-			&enabled, &enabledForBooks, &enabledForAudiobooks, &c.CreatedAt, &c.UpdatedAt)
+			&enabled, &enabledForBooks, &enabledForAudiobooks, &removeOnImport, &c.CreatedAt, &c.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -230,6 +233,7 @@ func (r *DownloadClientRepo) GetFirstEnabled(ctx context.Context) (*models.Downl
 	c.UseSSL = useSSL == 1
 	c.EnabledForBooks = enabledForBooks == 1
 	c.EnabledForAudiobooks = enabledForAudiobooks == 1
+	c.RemoveOnImport = removeOnImport == 1
 	hydrateClientCredentials(&c)
 	return &c, nil
 }
@@ -239,14 +243,14 @@ func (r *DownloadClientRepo) GetFirstEnabled(ctx context.Context) (*models.Downl
 // Returns (nil, nil) if no matching client is configured.
 func (r *DownloadClientRepo) GetFirstEnabledByProtocol(ctx context.Context, protocol string) (*models.DownloadClient, error) {
 	var c models.DownloadClient
-	var enabled, useSSL, enabledForBooks, enabledForAudiobooks int
+	var enabled, useSSL, enabledForBooks, enabledForAudiobooks, removeOnImport int
 	placeholders, args := clientTypesForProtocol(protocol)
 	err := r.db.QueryRowContext(ctx, `
 		SELECT `+downloadClientSelectColumns+`
 		FROM download_clients WHERE enabled=1 AND type IN (`+placeholders+`) ORDER BY priority LIMIT 1`, args...).
 		Scan(&c.ID, &c.Name, &c.Type, &c.Host, &c.Port, &c.APIKey,
 			&useSSL, &c.URLBase, &c.Username, &c.Password, &c.Category, &c.CategoryAudiobook, &c.PathRemap, &c.Priority,
-			&enabled, &enabledForBooks, &enabledForAudiobooks, &c.CreatedAt, &c.UpdatedAt)
+			&enabled, &enabledForBooks, &enabledForAudiobooks, &removeOnImport, &c.CreatedAt, &c.UpdatedAt)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
@@ -257,6 +261,7 @@ func (r *DownloadClientRepo) GetFirstEnabledByProtocol(ctx context.Context, prot
 	c.UseSSL = useSSL == 1
 	c.EnabledForBooks = enabledForBooks == 1
 	c.EnabledForAudiobooks = enabledForAudiobooks == 1
+	c.RemoveOnImport = removeOnImport == 1
 	hydrateClientCredentials(&c)
 	return &c, nil
 }
@@ -277,16 +282,17 @@ func (r *DownloadClientRepo) GetEnabledByProtocol(ctx context.Context, protocol 
 	var clients []models.DownloadClient
 	for rows.Next() {
 		var c models.DownloadClient
-		var enabled, useSSL, enabledForBooks, enabledForAudiobooks int
+		var enabled, useSSL, enabledForBooks, enabledForAudiobooks, removeOnImport int
 		if err := rows.Scan(&c.ID, &c.Name, &c.Type, &c.Host, &c.Port, &c.APIKey,
 			&useSSL, &c.URLBase, &c.Username, &c.Password, &c.Category, &c.CategoryAudiobook, &c.PathRemap, &c.Priority,
-			&enabled, &enabledForBooks, &enabledForAudiobooks, &c.CreatedAt, &c.UpdatedAt); err != nil {
+			&enabled, &enabledForBooks, &enabledForAudiobooks, &removeOnImport, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
 		c.Enabled = enabled == 1
 		c.UseSSL = useSSL == 1
 		c.EnabledForBooks = enabledForBooks == 1
 		c.EnabledForAudiobooks = enabledForAudiobooks == 1
+		c.RemoveOnImport = removeOnImport == 1
 		hydrateClientCredentials(&c)
 		clients = append(clients, c)
 	}
@@ -297,9 +303,9 @@ func (r *DownloadClientRepo) Create(ctx context.Context, c *models.DownloadClien
 	normalizeClientCredentialStorage(c)
 	now := time.Now().UTC()
 	result, err := r.db.ExecContext(ctx, `
-		INSERT INTO download_clients (name, type, host, port, api_key, use_ssl, url_base, username, password, category, category_audiobook, path_remap, priority, enabled, enabled_for_books, enabled_for_audiobooks, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		c.Name, c.Type, c.Host, c.Port, c.APIKey, c.UseSSL, c.URLBase, c.Username, c.Password, c.Category, c.CategoryAudiobook, c.PathRemap, c.Priority, c.Enabled, c.EnabledForBooks, c.EnabledForAudiobooks, now, now)
+		INSERT INTO download_clients (name, type, host, port, api_key, use_ssl, url_base, username, password, category, category_audiobook, path_remap, priority, enabled, enabled_for_books, enabled_for_audiobooks, remove_on_import, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		c.Name, c.Type, c.Host, c.Port, c.APIKey, c.UseSSL, c.URLBase, c.Username, c.Password, c.Category, c.CategoryAudiobook, c.PathRemap, c.Priority, c.Enabled, c.EnabledForBooks, c.EnabledForAudiobooks, c.RemoveOnImport, now, now)
 	if err != nil {
 		return fmt.Errorf("create download client: %w", err)
 	}
@@ -319,16 +325,29 @@ func (r *DownloadClientRepo) Update(ctx context.Context, c *models.DownloadClien
 	_, err := r.db.ExecContext(ctx, `
 		UPDATE download_clients SET name=?, type=?, host=?, port=?, api_key=?, use_ssl=?,
 		                            url_base=?, username=?, password=?, category=?, category_audiobook=?, path_remap=?, priority=?, enabled=?,
-		                            enabled_for_books=?, enabled_for_audiobooks=?, updated_at=?
+		                            enabled_for_books=?, enabled_for_audiobooks=?, remove_on_import=?, updated_at=?
 		WHERE id=?`,
 		c.Name, c.Type, c.Host, c.Port, c.APIKey, c.UseSSL, c.URLBase, c.Username, c.Password, c.Category, c.CategoryAudiobook, c.PathRemap, c.Priority, c.Enabled,
-		c.EnabledForBooks, c.EnabledForAudiobooks, now, c.ID)
+		c.EnabledForBooks, c.EnabledForAudiobooks, c.RemoveOnImport, now, c.ID)
 	return err
 }
 
+// Delete removes a client. It is refused with a *ClientPinnedError while any
+// indexer is pinned to the client (#3080): quietly unpinning those indexers
+// would send their grabs to the default client, which is the fallback the pin
+// exists to prevent. The foreign key on indexers.download_client_id is the
+// backstop for a pin written between the check and the delete.
 func (r *DownloadClientRepo) Delete(ctx context.Context, id int64) error {
-	_, err := r.db.ExecContext(ctx, "DELETE FROM download_clients WHERE id=?", id)
-	return err
+	if err := r.pinnedError(ctx, id); err != nil {
+		return err
+	}
+	if _, err := r.db.ExecContext(ctx, "DELETE FROM download_clients WHERE id=?", id); err != nil {
+		if pinned := r.pinnedError(ctx, id); pinned != nil {
+			return pinned
+		}
+		return err
+	}
+	return nil
 }
 
 // PickClientForMediaType selects the best client from a list for the given

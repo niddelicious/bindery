@@ -66,6 +66,13 @@ func dispatchCatalogueFetch(ctx context.Context, newlyAdded []*models.Author, on
 	if onFetch == nil || len(newlyAdded) == 0 {
 		return
 	}
+	// A tracker on ctx counts the backfill for the status endpoint. The total
+	// is registered here, before the goroutine starts, so it is already set
+	// when the import reports done.
+	if t := catalogueTrackerFrom(ctx); t != nil {
+		t.add(len(newlyAdded))
+		onFetch = t.track(onFetch)
+	}
 	bgCtx := context.WithoutCancel(ctx)
 	go concurrency.RunBoundedPaced(bgCtx, newlyAdded, catalogueFetchConcurrency, catalogueFetchPaceInterval,
 		func(_ context.Context, a *models.Author) { onFetch(a) })
@@ -142,15 +149,23 @@ func ImportCSVAuthors(
 	res.Requested = len(rows)
 
 	var newlyAdded []*models.Author
+	defer func() { dispatchCatalogueFetch(ctx, newlyAdded, onCatalogueFetch) }()
 	outage := &primaryOutage{}
+	known := newLibraryAuthors(authors)
 
 	for _, row := range rows {
+		if err := agg.CheckQuota(ctx); err != nil {
+			return res, err
+		}
 		name := row.name
 		if name == "" {
 			continue
 		}
 
-		full := resolveAndCreateAuthor(ctx, "csv", name, row.monitored, authors, settings, agg, outage, res)
+		full := resolveAndCreateAuthor(ctx, "csv", name, row.monitored, authors, settings, agg, outage, known, res)
+		if err := agg.CheckQuota(ctx); err != nil {
+			return res, err
+		}
 		if full == nil {
 			continue
 		}
@@ -160,7 +175,6 @@ func ImportCSVAuthors(
 	// Always populate the catalogue for every newly-created author — the
 	// callback fetches metadata but never auto-grabs (see func doc). An
 	// empty catalogue would leave the library scan nothing to match against.
-	dispatchCatalogueFetch(ctx, newlyAdded, onCatalogueFetch)
 
 	return res, nil
 }

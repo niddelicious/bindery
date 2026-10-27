@@ -93,6 +93,7 @@ var stringFolds = []struct {
 	fn   func(string) string
 }{
 	{"textutil.FoldForTitleMatch", textutil.FoldForTitleMatch},
+	{"textutil.FoldForKeyword", textutil.FoldForKeyword},
 	{"textutil.NormalizeAuthorName", textutil.NormalizeAuthorName},
 	{"indexer.NormalizeRelease", indexer.NormalizeRelease},
 	{"indexer.NormalizeTitleForDedup", indexer.NormalizeTitleForDedup},

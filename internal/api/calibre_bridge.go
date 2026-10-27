@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
@@ -60,11 +59,11 @@ type calibreBridgeWorker interface {
 	NotePullContact(version string, caps []string, remote string)
 }
 
-// bridgePathGate is the library root allow list the download routes use
-// (FileHandler.isAllowedPath), so a delivery row can never serve a file the
-// ordinary download route would refuse.
+// bridgePathGate is the gate the download routes use (FileHandler.openServable),
+// so a delivery row can never serve a file the ordinary download route would
+// refuse: outside the library roots, a symlink, or anything but a regular file.
 type bridgePathGate interface {
-	isAllowedPath(ctx context.Context, p string) bool
+	openServable(ctx context.Context, p string) (*servedPath, error)
 }
 
 // CalibreBridgeHandler serves /bridge/v1.
@@ -281,6 +280,30 @@ func bridgeFileExt(format string) string {
 	return b.String()
 }
 
+// bridgeServeError answers a delivery whose file could not be opened and
+// reports whether it did. Only a file that does not exist marks the delivery
+// skipped (PullFileMissing is permanent); any other filesystem error, such as
+// permission denied or a stale NFS handle, is a 500 and the row stays pending
+// so the plugin retries it.
+func (h *CalibreBridgeHandler) bridgeServeError(w http.ResponseWriter, r *http.Request, row *models.CalibreDelivery, err error) bool {
+	switch {
+	case err == nil:
+		return false
+	case errors.Is(err, errServeNotFound):
+		h.worker.PullFileMissing(r.Context(), row)
+		writeBridgeError(w, http.StatusNotFound, bridgeCodeNotFound, "file is gone")
+	case errors.Is(err, errServeOutside):
+		slog.Warn("calibre bridge: refused a delivery outside the library roots", "deliveryId", row.ID, "path", row.FilePath)
+		writeBridgeError(w, http.StatusForbidden, bridgeCodePathForbidden, "file is outside the library")
+	case errors.Is(err, errServeNotRegular):
+		slog.Warn("calibre bridge: refused a delivery that is not a regular file", "deliveryId", row.ID, "path", row.FilePath)
+		writeBridgeError(w, http.StatusForbidden, bridgeCodePathForbidden, "not a regular file")
+	default:
+		h.serverError(w, r, err)
+	}
+	return true
+}
+
 // File is GET /bridge/v1/deliveries/{id}/file. It serves only the path the
 // delivery row records, and only when that path is inside a library root
 // and is a regular file.
@@ -289,38 +312,24 @@ func (h *CalibreBridgeHandler) File(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !h.files.isAllowedPath(r.Context(), row.FilePath) {
-		slog.Warn("calibre bridge: refused a delivery outside the library roots", "deliveryId", row.ID, "path", row.FilePath)
-		writeBridgeError(w, http.StatusForbidden, bridgeCodePathForbidden, "file is outside the library")
+	sp, err := h.files.openServable(r.Context(), row.FilePath)
+	if h.bridgeServeError(w, r, row, err) {
 		return
 	}
-	f, err := os.Open(row.FilePath)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			h.worker.PullFileMissing(r.Context(), row)
-			writeBridgeError(w, http.StatusNotFound, bridgeCodeNotFound, "file is gone")
-			return
-		}
-		h.serverError(w, r, err)
+	defer sp.Close()
+	// The same open the download route uses: a directory is refused, and the
+	// handle must be the file that was checked, so a link swapped in after the
+	// checks is refused too. Stat comes from the handle that will be served.
+	f, info, err := sp.openFile()
+	if h.bridgeServeError(w, r, row, err) {
 		return
 	}
-	defer f.Close()
-	// Stat the handle that will be served, not the path, so what is checked
-	// is what is sent.
-	info, err := f.Stat()
-	if err != nil {
-		h.serverError(w, r, err)
-		return
-	}
-	if !info.Mode().IsRegular() {
-		slog.Warn("calibre bridge: refused a delivery that is not a regular file", "deliveryId", row.ID, "path", row.FilePath)
-		writeBridgeError(w, http.StatusForbidden, bridgeCodePathForbidden, "not a regular file")
-		return
-	}
+	defer func() { _ = f.Close() }()
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", `attachment; filename="book.`+bridgeFileExt(row.Format)+`"`)
 	w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
 	w.Header().Set("Cache-Control", "no-store")
+	w = withStallDeadline(w)
 	http.ServeContent(w, r, "", info.ModTime(), f)
 }
 
@@ -336,6 +345,12 @@ func (h *CalibreBridgeHandler) Cover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if path == "" {
+		writeBridgeError(w, http.StatusNotFound, bridgeCodeNotFound, "no cover")
+		return
+	}
+	// The cover comes from Bindery's own covers store, not the library, so
+	// the library roots do not apply. A link there is still never followed.
+	if li, err := os.Lstat(path); err != nil || !li.Mode().IsRegular() {
 		writeBridgeError(w, http.StatusNotFound, bridgeCodeNotFound, "no cover")
 		return
 	}

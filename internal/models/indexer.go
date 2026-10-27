@@ -41,6 +41,23 @@ type Indexer struct {
 	// choice. See the SeedRatioSource* constants. The empty string means "unset"
 	// and is eligible for Prowlarr auto-population.
 	SeedRatioSource string `json:"seedRatioSource,omitempty"`
+	// SeedTimeMinutes is the per-indexer total seeding time limit (#2206): stop
+	// seeding a torrent grabbed from this indexer after this many minutes. nil
+	// means "no override" so the download client keeps its own rule. Honoured
+	// by qBittorrent only; Transmission, Deluge and rTorrent have no per
+	// torrent total seed time and the adapter logs that it was not applied.
+	SeedTimeMinutes *int `json:"seedTimeMinutes,omitempty"`
+	// SeedTimeSource is the provenance of SeedTimeMinutes, with the same values
+	// and rules as SeedRatioSource: Prowlarr's per-indexer seedTime fills it
+	// unless the user owns it. It is tracked separately from the ratio so a
+	// user owned ratio does not stop Prowlarr from filling the seed time.
+	SeedTimeSource string `json:"seedTimeSource,omitempty"`
+	// InactiveSeedTimeMinutes is the per-indexer inactive seeding limit
+	// (#2206): stop seeding after this many minutes without upload activity.
+	// nil means "no override". Honoured by qBittorrent (4.6 and later) and
+	// Transmission (seedIdleLimit). Prowlarr has no equivalent setting, so it
+	// is only ever set by the user and carries no provenance.
+	InactiveSeedTimeMinutes *int `json:"inactiveSeedTimeMinutes,omitempty"`
 	// DailyQueryLimit caps how many requests Bindery will send this indexer in
 	// the last 24 hours (#2312). nil, and any value <= 0, means no cap.
 	//
@@ -69,6 +86,13 @@ type Indexer struct {
 	// of the cap is spent. It is never persisted and anything a client sends in
 	// it is ignored. nil on an indexer with no cap set.
 	DailyQueriesUsed *int `json:"dailyQueriesUsed,omitempty"`
+	// DownloadClientID pins this indexer to one download client (#3080). nil,
+	// the default, keeps today's routing. When set, every grab from this
+	// indexer goes to that client and to no other: a disabled, missing or
+	// wrong protocol client fails the grab instead of falling back. It is local
+	// configuration like Priority and the seed limits, so a Prowlarr sync keeps
+	// it.
+	DownloadClientID *int64 `json:"downloadClientId"`
 	// Search health, written by the searcher rather than by the user (#1935).
 	// All four are nil on an indexer that has never been searched.
 	//
@@ -91,6 +115,15 @@ type Indexer struct {
 	UpdatedAt      time.Time  `json:"updatedAt"`
 }
 
+// Protocol is the release protocol this indexer serves: torznab is torrent and
+// everything else is usenet, the same mapping the searcher stamps on results.
+func (i Indexer) Protocol() string {
+	if i.Type == "torznab" {
+		return "torrent"
+	}
+	return "usenet"
+}
+
 // NeedsAttention reports whether the last search against this indexer failed
 // with something only a human can fix: Newznab's 1xx range (100 bad
 // credentials, 101 account suspended, 102 VPN forbidden). A 5xx rate limit and
@@ -102,7 +135,8 @@ func (i Indexer) NeedsAttention() bool {
 	return *i.LastErrorCode >= 100 && *i.LastErrorCode <= 199
 }
 
-// Provenance values for Indexer.SeedRatioSource.
+// Provenance values for Indexer.SeedRatioSource, and for Indexer.SeedTimeSource
+// with the same meaning applied to the seed time.
 const (
 	// SeedRatioSourceUnset means no one has set a seed-ratio override; the
 	// Prowlarr syncer may auto-populate it.

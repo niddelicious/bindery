@@ -790,7 +790,6 @@ func TestGetAuthorWorksByName_NoTokenSkipsRequest(t *testing.T) {
 func TestGetAuthorWorkLanguageEvidence_BatchesAllowedEditionLookup(t *testing.T) {
 	requests := 0
 	c := newMockClient(func(r *http.Request) (*http.Response, error) {
-		requests++
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Fatal(err)
@@ -799,6 +798,12 @@ func TestGetAuthorWorkLanguageEvidence_BatchesAllowedEditionLookup(t *testing.T)
 		if err := json.Unmarshal(body, &req); err != nil {
 			t.Fatal(err)
 		}
+		if strings.Contains(req.Query, "GetAuthorWorkKnownLanguages") {
+			// The follow up for blank-language works (#3091), covered by
+			// its own tests. Finding nothing leaves hc:unknown as it was.
+			return gqlResponse(t, http.StatusOK, map[string]interface{}{"editions": []interface{}{}}), nil
+		}
+		requests++
 		for _, fragment := range []string{
 			"distinct_on: [book_id]",
 			"order_by: [{book_id: asc}, {id: asc}]",
@@ -822,11 +827,20 @@ func TestGetAuthorWorkLanguageEvidence_BatchesAllowedEditionLookup(t *testing.T)
 		if !slices.Equal(gotCodes, []string{"en", "eng"}) {
 			t.Errorf("languageCodes = %v, want [en eng]", gotCodes)
 		}
-		bookIDs, ok := req.Variables["bookIds"].([]interface{})
-		if !ok || len(bookIDs) != 1 || bookIDs[0] != float64(42) {
-			t.Errorf("bookIds = %#v, want [42]", req.Variables["bookIds"])
-		}
-		if limit := req.Variables["limit"]; limit != float64(6) {
+		if _, byID := req.Variables["bookIds"]; byID {
+			// hc:42 is named by numeric id, so it also gets a book_id query,
+			// sent on its own rather than in an _or with the slugs (#3333).
+			bookIDs, ok := req.Variables["bookIds"].([]interface{})
+			if !ok || len(bookIDs) != 1 || bookIDs[0] != float64(42) {
+				t.Errorf("bookIds = %#v, want [42]", req.Variables["bookIds"])
+			}
+			if _, ok := req.Variables["slugs"]; ok {
+				t.Errorf("book_id query also sent slugs: %#v", req.Variables)
+			}
+			if limit := req.Variables["limit"]; limit != float64(1) {
+				t.Errorf("book_id limit = %#v, want 1", limit)
+			}
+		} else if limit := req.Variables["limit"]; limit != float64(6) {
 			t.Errorf("limit = %#v, want 6 unique applicable works", limit)
 		}
 		return gqlResponse(t, http.StatusOK, map[string]interface{}{
@@ -870,8 +884,8 @@ func TestGetAuthorWorkLanguageEvidence_BatchesAllowedEditionLookup(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if requests != 1 {
-		t.Fatalf("requests = %d, want one batch request", requests)
+	if requests != 2 {
+		t.Fatalf("requests = %d, want one batch request per predicate (slug, book_id)", requests)
 	}
 	want := map[string]metadata.AuthorWorkLanguageEvidence{
 		"hc:translated-default": {State: metadata.AuthorWorkLanguageAllowed, Language: "eng"},
@@ -3143,5 +3157,55 @@ func TestSearchBooks_ExplicitNullContributionIsAnAuthor(t *testing.T) {
 	}
 	if books[0].Author == nil || books[0].Author.Name != "Frank Herbert" {
 		t.Errorf("Author = %+v, want Frank Herbert — a null role is the author, not a rejected credit", books[0].Author)
+	}
+}
+
+// The Hardcover author search document carries books_count; without it an
+// author row in the add dialog has no work count whenever Hardcover supplies
+// the record.
+func TestSearchAuthors_CarriesBookCount(t *testing.T) {
+	c := newMockClient(func(r *http.Request) (*http.Response, error) {
+		data := map[string]interface{}{
+			"search": map[string]interface{}{
+				"results": map[string]interface{}{
+					"hits": []map[string]interface{}{
+						{"document": map[string]interface{}{"id": 1, "name": "Brandon Sanderson", "slug": "brandon-sanderson", "books_count": 214}},
+						{"document": map[string]interface{}{"id": 2, "name": "Brandon Sanders", "slug": "brandon-sanders"}},
+					},
+				},
+			},
+		}
+		return gqlResponse(t, http.StatusOK, data), nil
+	})
+
+	authors, err := c.SearchAuthors(context.Background(), "Sanderson")
+	if err != nil {
+		t.Fatalf("SearchAuthors: %v", err)
+	}
+	if len(authors) != 2 {
+		t.Fatalf("expected 2 authors, got %d", len(authors))
+	}
+	if authors[0].Statistics == nil || authors[0].Statistics.BookCount != 214 {
+		t.Errorf("BookCount: want 214, got %+v", authors[0].Statistics)
+	}
+	// No count reported means unknown, not zero works.
+	if authors[1].Statistics != nil {
+		t.Errorf("an author without books_count must carry no statistics, got %+v", authors[1].Statistics)
+	}
+}
+
+// The single-book query does not ask for genres or language, so the record
+// must say it cannot speak for them (#3104).
+func TestGetBook_MarksGenresAndLanguageUnknown(t *testing.T) {
+	c := newMockClient(func(r *http.Request) (*http.Response, error) {
+		data := map[string]interface{}{"books": []map[string]interface{}{{"id": 99, "title": "T", "slug": "t"}}}
+		return gqlResponse(t, http.StatusOK, data), nil
+	})
+	book, err := c.GetBook(context.Background(), "hc:t")
+	if err != nil || book == nil {
+		t.Fatalf("GetBook: %v %v", book, err)
+	}
+	if !slices.Contains(book.UnknownFields, models.BookFieldGenres) || !slices.Contains(book.UnknownFields, models.BookFieldLanguage) {
+		t.Errorf("UnknownFields = %v", book.UnknownFields)
 	}
 }

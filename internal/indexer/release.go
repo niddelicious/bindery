@@ -164,42 +164,89 @@ func StripArticles(s string) string {
 // matcher only asks whether a match exists.
 const wordSep = `[^\p{L}\p{N}]`
 
-// umlautFlexRegex makes "ae", "oe", "ue" in an already-QuoteMeta'd keyword
-// flexible by appending "?" to the second letter: "ae"→"ae?", "oe"→"oe?",
-// "ue"→"ue?". This allows a single regex to match both the German
-// umlaut-expanded form (ä→ae, as produced by transliterateUmlauts) and the
-// compact form (ä→a) used by some NZB uploaders. Must be called AFTER
+// umlautFlexReplacer rewrites a kept umlaut as its digraph with an optional
+// second letter: ä→"ae?", ö→"oe?", ü→"ue?". Both cases are listed because the
+// keyword is not always lowercased on the way in (the regexes are (?i)).
+var umlautFlexReplacer = strings.NewReplacer(
+	"ä", "ae?", "ö", "oe?", "ü", "ue?",
+	"Ä", "ae?", "Ö", "oe?", "Ü", "ue?",
+)
+
+// umlautFlexRegex turns each ä, ö or ü in an already-QuoteMeta'd keyword into
+// its digraph with the "e" optional, so one regex matches the expanded release
+// spelling (ä→ae, which NormalizeRelease produces from both "Müller" and
+// "Mueller") and the compact one (ä→a) some NZB uploaders use.
+//
+// Only a real umlaut is flexible. The keyword comes from newznab.SigWords or
+// authorTokens, which keep ä/ö/ü (textutil.FoldForKeyword) precisely so this
+// can tell them from a digraph that was ASCII all along. Flexing every "ue"
+// let "michael" match "Michal" and "samuel" match "Samul" (#3123). The price
+// is that a source typed as "Mueller" no longer matches a release that says
+// "Muller": a typed digraph is taken at its word. Must be called AFTER
 // regexp.QuoteMeta so the inserted "?" acts as a regex quantifier.
 func umlautFlexRegex(kw string) string {
-	kw = strings.ReplaceAll(kw, "ae", "ae?")
-	kw = strings.ReplaceAll(kw, "oe", "oe?")
-	kw = strings.ReplaceAll(kw, "ue", "ue?")
-	return kw
+	return umlautFlexReplacer.Replace(kw)
+}
+
+// volumeMarkerPattern matches any spelling of a volume marker: vol, vols,
+// volume, volumes. See keywordPattern.
+const volumeMarkerPattern = `(?:vol(?:ume)?s?)`
+
+// keywordPattern returns the regex fragment for one keyword, shared by every
+// title matcher (WordBoundaryRegex, phraseRegex, inOrderRegex) so they agree.
+//
+// A volume marker keyword (newznab.IsVolumeMarker) matches any of its
+// spellings, so a title saying "Volume 17" matches a release saying "Vol 17"
+// and the other way round. The callers put a word boundary on both sides, so
+// "vol" still cannot match inside "volcano" or "revolution". Which VOLUME a
+// cross spelling match names is checked separately, see volumeNumberAgrees.
+//
+// A keyword made only of digits matches the same number with any zero
+// padding: "7", "07" and "007" are one number, because release names pad
+// series and volume positions ("Vol 07", "Book 07") while titles usually do
+// not. The callers' word boundaries keep "7" from matching inside "17" or
+// "70". This is the same rule sameVolumeNumber applies to volume numbers.
+//
+// Every other keyword is QuoteMeta'd with the umlaut flex, exactly as before.
+// lower is the keyword lowercased for the marker lookup only; the fragment
+// keeps the caller's own casing so the umlaut flex sees what it always saw.
+func keywordPattern(kw, lower string) string {
+	if newznab.IsVolumeMarker(lower) {
+		return volumeMarkerPattern
+	}
+	if isAllDigits(kw) {
+		if n := strings.TrimLeft(kw, "0"); n != "" {
+			return `0*` + n
+		}
+		return `0+`
+	}
+	return umlautFlexRegex(regexp.QuoteMeta(kw))
 }
 
 // WordBoundaryRegex returns a cached case-insensitive regex matching kw as a
-// whole token in a normalized haystack. Safe for concurrent use. German umlaut
-// expansions (ae/oe/ue) produced by transliterateUmlauts are treated as
-// flexible so the regex matches both the expanded (ae) and compact (a)
-// NZB-name conventions. See wordSep for why this is not `\b` (#1642).
+// whole token in a normalized haystack. Safe for concurrent use. An ä, ö or ü
+// kept in kw (see newznab.SigWords) matches its expanded (ae) and compact (a)
+// NZB-name conventions; a digraph typed as ae, oe or ue matches only itself
+// (#3123). See wordSep for why this is not `\b` (#1642).
 func WordBoundaryRegex(kw string) *regexp.Regexp {
 	if re, ok := regexCache.load(kw); ok {
 		return re
 	}
-	re := compileRegex(`(?i)(?:^|` + wordSep + `)` + umlautFlexRegex(regexp.QuoteMeta(kw)) + `(?:` + wordSep + `|$)`)
+	re := compileRegex(`(?i)(?:^|` + wordSep + `)` + keywordPattern(kw, strings.ToLower(kw)) + `(?:` + wordSep + `|$)`)
 	regexCache.store(kw, re)
 	return re
 }
 
 // phraseRegex returns the cached contiguous-phrase regex for the given words:
 // each word at a boundary, separated only by non-word characters, with German
-// umlaut expansions matched flexibly (ae/oe/ue optionally contracts to a/o/u).
+// umlauts matched flexibly (a kept ä/ö/ü matches ae/a, oe/o, ue/u).
 // Callers needing the match position (see matchAnchored in searcher.go) share
 // this instead of rebuilding the pattern.
 func phraseRegex(phrase []string) *regexp.Regexp {
 	parts := make([]string, len(phrase))
 	for i, w := range phrase {
-		parts[i] = umlautFlexRegex(regexp.QuoteMeta(strings.ToLower(w)))
+		lw := strings.ToLower(w)
+		parts[i] = keywordPattern(lw, lw)
 	}
 	// wordSep rather than \b/\W so non-ASCII words match (#1642). The inner
 	// separator also swallows any word SigWords itself dropped, see phraseGap.
@@ -259,8 +306,8 @@ var (
 
 // ContainsPhrase returns true if all words in phrase appear in haystack in the
 // given order, separated only by non-word characters. haystack must already be
-// normalized (lowercased, separators→space). German umlaut expansions in phrase
-// words are matched flexibly (ae/oe/ue optionally contracts to a/o/u).
+// normalized (lowercased, separators→space). A kept ä/ö/ü in a phrase word is
+// matched flexibly (ae/a, oe/o, ue/u); a typed ae/oe/ue is not (#3123).
 func ContainsPhrase(haystack string, phrase []string) bool {
 	if len(phrase) == 0 {
 		return true

@@ -24,6 +24,15 @@ export interface Indexer {
   // seedCriteria.seedRatio (a later Prowlarr change may refresh it); 'user' = the
   // user set/cleared it (Prowlarr won't touch it); omitted/'' = unset.
   seedRatioSource?: string
+  // Per-indexer seed time overrides (#2206), in whole minutes. Omitted/null =
+  // no override. seedTimeMinutes is the total seeding time (qBittorrent only);
+  // inactiveSeedTimeMinutes stops after that long without upload (qBittorrent
+  // 4.6+ and Transmission). seedTimeSource has the same meaning as
+  // seedRatioSource, filled from Prowlarr's seedTime; Prowlarr has no
+  // inactive seed time, so that one has no source.
+  seedTimeMinutes?: number | null
+  seedTimeSource?: string
+  inactiveSeedTimeMinutes?: number | null
   // Only auto-grab freeleech releases from this indexer. Non-freeleech
   // releases are held in the Pending queue for manual approval instead of
   // being grabbed automatically. Interactive search is unaffected.
@@ -33,6 +42,11 @@ export interface Indexer {
   // requests rather than books: one book on one indexer costs between one and
   // eight, depending on how far the query cascade falls through.
   dailyQueryLimit?: number | null
+  // Download client this indexer is pinned to (#3080). null/omitted = no pin
+  // (automatic routing). When set, every grab from this indexer goes to that
+  // client and fails rather than falling back if it cannot take it. The
+  // client must be enabled and of the indexer's protocol when pinning.
+  downloadClientId?: number | null
   // How much of dailyQueryLimit is spent, written by the backend rather than
   // the user, and absent on an indexer with no cap. It lags the live tally by
   // up to one flush interval, so it is a display figure and not the number the
@@ -115,7 +129,7 @@ export const indexersApi = {
   addProwlarr: (data: Partial<ProwlarrInstance>) => request<ProwlarrInstance>('/prowlarr', { method: 'POST', body: JSON.stringify(data) }),
   updateProwlarr: (id: number, data: Partial<ProwlarrInstance>) => request<ProwlarrInstance>(`/prowlarr/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteProwlarr: (id: number) => request<void>(`/prowlarr/${id}`, { method: 'DELETE' }),
-  testProwlarr: (id: number) => request<{ ok: string; version?: string; error?: string }>(`/prowlarr/${id}/test`, { method: 'POST' }),
+  testProwlarr: (id: number) => request<{ ok: boolean; version?: string; error?: string }>(`/prowlarr/${id}/test`, { method: 'POST' }),
   syncProwlarr: (id: number) => request<{ added: number; updated: number; removed: number }>(`/prowlarr/${id}/sync`, { method: 'POST' }),
   searchIndexers: (q: string) => request<SearchResult[]>(`/indexer/search?q=${encodeURIComponent(q)}`),
 }

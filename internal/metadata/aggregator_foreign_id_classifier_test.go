@@ -16,6 +16,8 @@ func TestProviderNameForForeignIDMatchesModels(t *testing.T) {
 		"hc:brandon":       "hardcover",
 		"gb:zyTCAlFPjgYC":  "googlebooks",
 		"dnb:118540238":    "dnb",
+		"nb:author:1":      "nb",
+		"bnf:cb48780493c":  "bnf",
 		"OL26320A":         "openlibrary",
 		"":                 "openlibrary",
 	}
@@ -79,5 +81,33 @@ func TestSafeToBindUnchangedForProviderIDs(t *testing.T) {
 		if failed.SafeToBind(id) {
 			t.Errorf("SafeToBind(%q) = true after a primary failure, want false", id)
 		}
+	}
+}
+
+// TestBnFForeignIDsRouteOnlyToBnF pins the "bnf:" prefix (#3144). Before the
+// prefix was known it classified as openlibrary, so with OpenLibrary primary
+// a bnf: author would have been handed to the OpenLibrary client, and
+// SafeToBind would have treated a BnF match as the primary's after an
+// OpenLibrary failure.
+func TestBnFForeignIDsRouteOnlyToBnF(t *testing.T) {
+	ol := &mockProvider{name: "openlibrary"}
+	if got := newTestAggregator(ol).providerForForeignID("bnf:author:11885918"); got != nil {
+		t.Errorf("bnf: id routed to %q with OpenLibrary primary, want nil", providerName(got))
+	}
+	bnf := &mockProvider{name: "bnf"}
+	if got := providerName(newTestAggregator(bnf, ol).providerForForeignID("bnf:cb48780493c")); got != "bnf" {
+		t.Errorf("bnf: id routed to %q with BnF primary, want bnf", got)
+	}
+
+	olFailed := SearchOutcome{Primary: "openlibrary", PrimaryFailed: true, FailedProviders: []string{"openlibrary"}}
+	if olFailed.SafeToBind("bnf:author:11885918") {
+		t.Error("SafeToBind(bnf:) = true after an OpenLibrary primary failure, want false")
+	}
+	bnfFailed := SearchOutcome{Primary: "bnf", PrimaryFailed: true, FailedProviders: []string{"bnf"}}
+	if !bnfFailed.SafeToBind("bnf:author:11885918") {
+		t.Error("SafeToBind(bnf:) = false with BnF primary, want true: the match came from the primary")
+	}
+	if bnfFailed.SafeToBind("OL26320A") {
+		t.Error("SafeToBind(OL id) = true after a BnF primary failure, want false")
 	}
 }

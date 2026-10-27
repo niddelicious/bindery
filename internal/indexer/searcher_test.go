@@ -6,11 +6,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/vavallee/bindery/internal/indexer/newznab"
 	"github.com/vavallee/bindery/internal/models"
+	"golang.org/x/text/unicode/norm"
 )
 
 // newTestSearcher returns a Searcher whose client factory bypasses the
@@ -146,13 +149,18 @@ func TestFilterRelevantSubtitle(t *testing.T) {
 		"Dune.Herbert.epub",               // surname only — post-#563 rejected
 	)
 	got := filterRelevant(results, "Dune: Messiah", "Frank Herbert", nil)
-	for _, title := range []string{
-		"Frank.Herbert.Dune.Messiah.epub",
-		"Frank.Herbert.Dune.epub",
-	} {
-		if !contains(got, title) {
-			t.Errorf("expected %q to pass subtitle filter, got %v", title, resultTitles(got))
-		}
+	if !contains(got, "Frank.Herbert.Dune.Messiah.epub") {
+		t.Errorf("expected the full title release to pass subtitle filter, got %v", resultTitles(got))
+	}
+	// #3268 part 2: the primary-only release is a sibling of the full title
+	// release in the same batch, so it is dropped there. It is still accepted
+	// when nothing in the batch carries the full title.
+	if contains(got, "Frank.Herbert.Dune.epub") {
+		t.Errorf("a primary-only release must be dropped when another result carries the full title, got %v", resultTitles(got))
+	}
+	alone := filterRelevant(toResults("Frank.Herbert.Dune.epub"), "Dune: Messiah", "Frank Herbert", nil)
+	if !contains(alone, "Frank.Herbert.Dune.epub") {
+		t.Errorf("expected the primary-only release to pass when nothing carries the full title, got %v", resultTitles(alone))
 	}
 	// Post-#563: primary-title-only with surname-only author is now rejected.
 	if contains(got, "Dune.Herbert.epub") {
@@ -427,6 +435,36 @@ func TestFilterCategoriesForMedia(t *testing.T) {
 	}
 }
 
+// TestFilterCategoriesForMedia_OtherBucket pins #3169: a category the user
+// typed in the Newznab Other bucket (8xxx) is searched as given, instead of
+// being replaced by the standard 7020 or 3030 fallback.
+func TestFilterCategoriesForMedia_OtherBucket(t *testing.T) {
+	cases := []struct {
+		name      string
+		cats      []int
+		mediaType string
+		parent    bool
+		want      []int
+	}{
+		{"only 8000, ebook", []int{8000}, "ebook", false, []int{8000}},
+		{"only 8000, audiobook", []int{8000}, "audiobook", false, []int{8000}},
+		{"8000 and 8010", []int{8000, 8010}, "ebook", false, []int{8000, 8010}},
+		{"media match wins over 8000", []int{8000, 7020}, "ebook", false, []int{7020}},
+		{"8000 beside the wrong media only", []int{8000, 7020}, "audiobook", false, []int{8000}},
+		{"parent opt-in does not add 7000 to an Other only indexer", []int{8000}, "ebook", true, []int{8000}},
+		{"other standard buckets still fall back", []int{5000}, "ebook", false, []int{7020}},
+		{"non-standard taxonomy still passes through", []int{100001, 8000}, "ebook", false, []int{100001, 8000}},
+		{"empty still falls back", nil, "audiobook", false, []int{3030}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := filterCategoriesForMedia(tc.cats, tc.mediaType, tc.parent); !equalIntSlice(got, tc.want) {
+				t.Errorf("filterCategoriesForMedia(%v, %q, %v) = %v, want %v", tc.cats, tc.mediaType, tc.parent, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestScoreResultMediaTypePenalty(t *testing.T) {
 	audiobookResult := newznab.SearchResult{Title: "Dune.Herbert.m4b", GUID: "a"}
 	ebookResult := newznab.SearchResult{Title: "Dune.Herbert.epub", GUID: "e"}
@@ -630,7 +668,7 @@ func TestFilterUsenetJunk(t *testing.T) {
 		`Russell-The.Sparrow.EPUB`,
 	}
 	input := toResults(append(junk, keepers...)...)
-	out := filterUsenetJunk(input)
+	out := filterUsenetJunk(input, junkScope{})
 	if len(out) != len(keepers) {
 		t.Errorf("expected %d survivors, got %d: %v", len(keepers), len(out), resultTitles(out))
 	}
@@ -806,6 +844,80 @@ func TestReleaseLanguageMarkersDoNotFalsePositive(t *testing.T) {
 	}
 }
 
+// TestFilterByAllowedLanguagesSceneSuffixCodes covers #3271: scene audiobook
+// releases carry their language only as a short code in the metadata suffix
+// ("-AUDIOBOOK-POR-", "-WEB-MP3-DE-", "-WEB-SE-"), so releaseLanguageCodes found
+// nothing and an eng-only profile auto-grabbed them. The shapes are the ones
+// reported, with the author, title and group names made up.
+func TestFilterByAllowedLanguagesSceneSuffixCodes(t *testing.T) {
+	for _, tc := range []struct {
+		title string
+		code  string
+	}{
+		{"Kari_Nordmann-Fjellvinden_Unabridged-2021-AUDIOBOOK-POR-2023-GRP", "por"},
+		{"Kari_Nordmann-Die_Fjellvinden_Trilogie_2-Bergwind-Audiobook-WEB-MP3-DE-2022-GRP", "ger"},
+		{"Kari_Nordmann_-_Fjellvinden-AUDiOBOOK-WEB-SE-2022-GRP_iNT", "swe"},
+		{"Kari Nordmann-Fjellvinden-2016-AUDIOBOOK-NO-GRP", "nor"},
+		{"Kari Nordmann - Fjellvinden-AUDiOBOOK-WEB-DK-2022-GRP", "dan"},
+		{"Kari Nordmann--Fjellvinden (Abook)-4CD-DE-2010-GRP", "ger"},
+		{"Kari.Nordmann-Fjellvinden.M4B.EN.2026-grp", "eng"},
+		{"[MP3] Kari Nordmann-Fjellvinden-4CD-AUDiOBOOK-DE-2005-GRP iNT", "ger"},
+		{"Kari Nordmann-Fjellvinden-WEB-PL-ABOOK-PL-2019-GRP", "pol"},
+		{"Kari_Nordmann-Fjellvinden-WEB-AAC-DE-2023-GRP", "ger"},
+		// A trailing file extension or part counter is stripped, so the
+		// group is still the token skipped.
+		{"Kari_Nordmann-Fjellvinden-AUDIOBOOK-WEB-DE-2023-GRP.nzb", "ger"},
+		{`"Kari_Nordmann-Fjellvinden-AUDIOBOOK-WEB-DE-2023-GRP.nzb" (1/12)`, "ger"},
+	} {
+		codes := sceneLanguageCodes(tc.title)
+		if !slices.Equal(codes, []string{tc.code}) {
+			t.Errorf("%q: expected scene code [%s], got %v", tc.title, tc.code, codes)
+		}
+		kept := FilterByAllowedLanguages(toResults(tc.title), []string{"eng"})
+		if wantKept := tc.code == "eng"; (len(kept) == 1) != wantKept {
+			t.Errorf("%q: eng-only profile kept=%v, want %v", tc.title, len(kept) == 1, wantKept)
+		}
+		if kept := FilterByAllowedLanguages(toResults(tc.title), []string{tc.code}); len(kept) != 1 {
+			t.Errorf("%q: a %s-allowed profile must keep it", tc.title, tc.code)
+		}
+	}
+}
+
+// TestSceneSuffixCodesIgnoreTitleWords pins why the codes are only read after
+// a scene marker (#3271): as bare words most of them are common ("de", "no",
+// "it", "por"), and #2274 left them out for exactly that reason.
+func TestSceneSuffixCodesIgnoreTitleWords(t *testing.T) {
+	for _, title := range []string{
+		"Kari Nordmann - De Fjellvinden (Unabridged) [M4B]",
+		"Kari Nordmann - No Wind on the Fjell - Audiobook",
+		"Kari Nordmann - It Came from the Fjell",
+		"Kari Nordmann - Por la Noche",
+		"Kari Nordmann - Fjellvinden SE Edition.epub",
+		"Kari Nordmann - Fjellvinden-AUDIOBOOK-WEB-2023-GRP",
+		"Kari Nordmann - Fjellvinden-SE161-ABOOK-2023-GRP",
+		"Kari Nordmann-Fjellvinden-16BIT-WEB-FLAC-2026-TR",  // TR is the release group
+		"[MP3] Kari Nordmann - De Fjellvinden (Unabridged)", // a leading marker starts no suffix
+		"Kari Nordmann M4B - In the Forest - Audiobook",
+		// A suffix with spaces is prose, not scene metadata: a code only
+		// counts there when it is uppercase and right before a year or the
+		// group.
+		"Kari Nordmann - Fjellvinden (Audiobook) read by Ola De Vries",
+		"Kari Nordmann - Fjellvinden (Audiobook) (Narrated by Dan Hansen) 2019",
+		"Kari Nordmann - Fjellvinden Audiobook Pt 2 of 3",
+		"Kari Nordmann - Fjellvinden - MP3 - Hi Quality - 2010",
+		"Kari Nordmann - Audiobook - It - 2017 - Unabridged",
+		// The group is the last token once an extension or counter is gone.
+		"Kari_Nordmann-Fjellvinden-WEB-FLAC-2026-TR.nzb",
+		"Kari_Nordmann-Fjellvinden-WEB-FLAC-2026-TR.nzb (1/12)",
+		// Title words between two markers are not the suffix.
+		"Kari_Nordmann-AUDIOBOOK-De_Fjellvinden_No_Mer-MP3-2023-GRP",
+	} {
+		if codes := sceneLanguageCodes(title); len(codes) != 0 {
+			t.Errorf("%q must carry no scene language code, got %v", title, codes)
+		}
+	}
+}
+
 func TestFilterByAllowedLanguagesTwoLetterAliases(t *testing.T) {
 	results := toResults(
 		"Il.Libro.ITALIANO.epub",
@@ -857,15 +969,15 @@ func TestIsArticle(t *testing.T) {
 
 func TestTitleMatchesSingleKeyword(t *testing.T) {
 	// Single keyword without author tokens → accept (can't do better)
-	if !titleMatchesResult("dune", []string{"dune"}, nil, false) {
+	if !titleMatchesResult("dune", "dune", []string{"dune"}, nil, nil, false) {
 		t.Error("single keyword, no author → should accept")
 	}
 	// Single keyword with non-matching surname → reject
-	if titleMatchesResult("dune novel", []string{"dune"}, []string{"herbert"}, false) {
+	if titleMatchesResult("dune novel", "dune novel", []string{"dune"}, []string{"herbert"}, nil, false) {
 		t.Error("single keyword missing surname → should reject")
 	}
 	// Single keyword with matching surname → accept
-	if !titleMatchesResult("dune herbert", []string{"dune"}, []string{"herbert"}, false) {
+	if !titleMatchesResult("dune herbert", "dune herbert", []string{"dune"}, []string{"herbert"}, nil, false) {
 		t.Error("single keyword + matching surname → should accept")
 	}
 }
@@ -1776,53 +1888,61 @@ func TestFilterRelevantDebugEditionQualifierParity(t *testing.T) {
 	}
 }
 
-// TestSearchBook_AggregateTimeout verifies that SearchBook respects the outer
-// searchBookTimeout: when every indexer hangs indefinitely (by blocking until
-// the context is cancelled), the search still returns within a reasonable bound
-// rather than blocking for up to 4×30 s (Finding 2 — aggregate timeout).
-//
-// This test uses an already-cancelled context to avoid waiting for the real
-// 60 s timeout, while still verifying that the timeout is wired into each
-// goroutine so http.NewRequestWithContext sees it.
+// TestSearchBook_AggregateTimeout verifies the outer deadline (#1845): with
+// a live caller context and an indexer that never answers, SearchBook returns
+// empty once its timeout fires, and every request it sent is cancelled, so no
+// worker is left behind waiting on the hung server. Delete the WithTimeout in
+// SearchBook and this test fails instead of passing.
 func TestSearchBook_AggregateTimeout(t *testing.T) {
-	// Create a server that blocks until the request context is cancelled.
+	var started, cancelled atomic.Int32
+	release := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		<-r.Context().Done()
-		// The request was cancelled — this is the expected path.
+		started.Add(1)
+		select {
+		case <-r.Context().Done():
+			cancelled.Add(1)
+		case <-release:
+		}
 	}))
+	// Unblock any handler still waiting before Close, so a regression fails
+	// the assertions below rather than hanging in Close.
 	defer srv.Close()
+	defer close(release)
 
-	// Use an already-cancelled context so we don't wait for the real 60 s wall-clock.
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // cancel immediately
-
+	s := newTestSearcher()
+	s.timeout = 200 * time.Millisecond
 	idxs := []models.Indexer{
-		{ID: 1, Name: "slow-indexer", URL: srv.URL, Enabled: true, Categories: []int{7020}},
+		{ID: 1, Name: "hung-indexer", URL: srv.URL, Enabled: true, Categories: []int{7020}},
 	}
 
-	// SearchBook must return (possibly with zero results) rather than blocking.
-	// With the context already cancelled the goroutine aborts on first HTTP call.
-	results := NewSearcher().SearchBook(ctx, idxs, MatchCriteria{
-		Title:  "Dark Matter",
-		Author: "Blake Crouch",
-	})
-	// We don't assert on results (the indexer was never able to respond),
-	// only that the call returned at all. If the timeout isn't wired in,
-	// this test would hang until the Go test runner kills it.
-	_ = results
-}
+	type outcome struct{ results []newznab.SearchResult }
+	done := make(chan outcome, 1)
+	start := time.Now()
+	go func() {
+		done <- outcome{s.SearchBook(context.Background(), idxs, MatchCriteria{Title: "Fjellvinden", Author: "Kari Nordmann"})}
+	}()
 
-// TestSearchBook_TimeoutConstantExists ensures the searchBookTimeout constant
-// has a positive, sensible value (between 30 s and 300 s).
-func TestSearchBook_TimeoutConstantExists(t *testing.T) {
-	if searchBookTimeout <= 0 {
-		t.Fatalf("searchBookTimeout must be positive, got %v", searchBookTimeout)
+	select {
+	case got := <-done:
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Errorf("SearchBook took %v, want about its 200ms timeout", elapsed)
+		}
+		if len(got.results) != 0 {
+			t.Errorf("results = %d, want none from a hung indexer", len(got.results))
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("SearchBook did not return: the outer timeout is not applied")
 	}
-	if searchBookTimeout < 30*time.Second {
-		t.Errorf("searchBookTimeout %v is suspiciously short (< 30s)", searchBookTimeout)
+	if started.Load() == 0 {
+		t.Fatal("the indexer was never queried; the test exercised nothing")
 	}
-	if searchBookTimeout > 5*60*time.Second {
-		t.Errorf("searchBookTimeout %v is suspiciously long (> 5 min)", searchBookTimeout)
+	// The handler sees the cancellation shortly after the client gives up.
+	deadline := time.Now().Add(2 * time.Second)
+	for cancelled.Load() < started.Load() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if c, st := cancelled.Load(), started.Load(); c != st {
+		t.Errorf("%d of %d requests were cancelled; the rest were left hanging", c, st)
 	}
 }
 
@@ -1945,6 +2065,154 @@ func TestFilterRelevantSingleKeywordExtendedTitle(t *testing.T) {
 			got := filterRelevant(toResults(tc.release), title, author, nil)
 			if has := contains(got, tc.release); has != tc.want {
 				t.Errorf("filterRelevant(%q) kept=%v, want %v", tc.release, has, tc.want)
+			}
+		})
+	}
+}
+
+// TestFilterRelevantSingleKeywordAlternateTitle: a release naming the book's
+// alternate "or" title ("Frankenstein; or, The Modern Prometheus") is the same
+// book, not a longer one, so the #1731 rule must not read the "or" as running
+// the title on. A bare "or" into another word, and the other connectives,
+// still do.
+func TestFilterRelevantSingleKeywordAlternateTitle(t *testing.T) {
+	cases := []struct {
+		name                   string
+		title, author, release string
+		bc                     bookContext
+		want                   bool
+	}{
+		{
+			name:  "semicolon or comma",
+			title: "Frankenstein", author: "Mary Shelley",
+			release: "Mary Shelley - Frankenstein; or, The Modern Prometheus (epub)",
+			want:    true,
+		},
+		{
+			name:  "bare or before an article",
+			title: "Frankenstein", author: "Mary Shelley",
+			release: "Mary Shelley - Frankenstein or The Modern Prometheus (epub)",
+			want:    true,
+		},
+		{
+			name:  "scene style dots before an article",
+			title: "Frankenstein", author: "Mary Shelley",
+			release: "Mary.Shelley.-.Frankenstein.or.The.Modern.Prometheus.epub",
+			want:    true,
+		},
+		{
+			name:  "short title still kept",
+			title: "Frankenstein", author: "Mary Shelley",
+			release: "Mary Shelley - Frankenstein (epub)",
+			want:    true,
+		},
+		{
+			name:  "alternate title with another library title present",
+			title: "Frankenstein", author: "Mary Shelley",
+			release: "Mary Shelley - Frankenstein; or, The Modern Prometheus (epub)",
+			bc:      bookContext{otherTitles: []string{"The Last Man", "Mathilda"}},
+			want:    true,
+		},
+		{
+			name:  "comma or, no article",
+			title: "The Hobbit", author: "J.R.R. Tolkien",
+			release: "J.R.R. Tolkien - The Hobbit, or There and Back Again (epub)",
+			want:    true,
+		},
+		{
+			name:  "semicolon or, no article",
+			title: "Candide", author: "Voltaire",
+			release: "Voltaire - Candide; or Optimism (epub)",
+			want:    true,
+		},
+		{
+			name:  "two keyword title",
+			title: "Moby-Dick", author: "Herman Melville",
+			release: "Herman Melville - Moby-Dick; or, The Whale (epub)",
+			want:    true,
+		},
+		{
+			name:  "comma or into a library title is a different book",
+			title: "Fight", author: "Jane Doe",
+			release: "Jane Doe - Fight, or Flight (epub)",
+			bc:      bookContext{otherTitles: []string{"Fight or Flight"}},
+			want:    false,
+		},
+		{
+			name:  "comma or into a library title is kept when the library lacks it",
+			title: "Fight", author: "Jane Doe",
+			release: "Jane Doe - Fight, or Flight (epub)",
+			want:    true,
+		},
+		{
+			name:  "semicolon or the into a library title is a different book",
+			title: "Foundation", author: "Isaac Asimov",
+			release: "Isaac Asimov - Foundation; or the Empire (epub)",
+			bc:      bookContext{otherTitles: []string{"Foundation and Empire", "Foundation; or the Empire"}},
+			want:    false,
+		},
+		{
+			name:  "or the into a library title is a different book",
+			title: "Truth", author: "Jane Doe",
+			release: "Jane Doe - Truth or The Consequences (epub)",
+			bc:      bookContext{otherTitles: []string{"Truth or The Consequences"}},
+			want:    false,
+		},
+		{
+			name:  "or the into a library title is kept when the library lacks it",
+			title: "Truth", author: "Jane Doe",
+			release: "Jane Doe - Truth or The Consequences (epub)",
+			want:    true,
+		},
+		{
+			name:  "or the into a differently worded library title",
+			title: "Dune", author: "Frank Herbert",
+			release: "Frank Herbert - Dune or the Messiah (epub)",
+			bc:      bookContext{otherTitles: []string{"Dune Messiah"}},
+			want:    false,
+		},
+		{
+			name:  "series sibling that does not match the alternate title",
+			title: "Frankenstein", author: "Mary Shelley",
+			release: "Mary Shelley - Frankenstein; or, The Modern Prometheus (epub)",
+			bc:      bookContext{otherTitles: []string{"Frankenstein 2 - Bride", "Frankenstein Unbound"}},
+			want:    true,
+		},
+		{
+			// Pinned as the current outcome, not an endorsement: the series
+			// number rule reads what follows the wanted title, which here is
+			// the "or", so a number after the alternate title is not seen.
+			// Such a release is not a name any indexer is known to use.
+			name:  "alternate title followed by a sibling's number",
+			title: "Frankenstein", author: "Mary Shelley",
+			release: "Mary Shelley - Frankenstein; or, The Modern Prometheus 2 - Bride (epub)",
+			bc:      bookContext{seriesTitle: "Frankenstein", seriesPosition: "1", otherTitles: []string{"Frankenstein 2 - Bride"}},
+			want:    true,
+		},
+		{
+			name:  "bare or into another word is a longer title",
+			title: "Truth", author: "Jane Doe",
+			release: "Jane Doe - Truth or Dare (epub)",
+			want:    false,
+		},
+		{
+			name:  "comma before another connective is still a longer title",
+			title: "Treasure", author: "Clive Cussler",
+			release: "Clive Cussler - Treasure, of Khan (epub)",
+			want:    false,
+		},
+		{
+			name:  "and still runs on into a different book",
+			title: "Foundation", author: "Isaac Asimov",
+			release: "Isaac Asimov - Foundation and Empire (epub)",
+			want:    false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			kept, reason := relevanceVerdict(tc.title, tc.author, tc.release, tc.bc)
+			if kept != tc.want {
+				t.Errorf("relevance(%q, %q) kept=%v (%q), want %v", tc.title, tc.release, kept, reason, tc.want)
 			}
 		})
 	}
@@ -2217,5 +2485,46 @@ func TestRankResultsProfileIgnoredWithoutACriteriaMediaType(t *testing.T) {
 	})
 	if results[0].Title != "The.Sparrow.Russell.epub" {
 		t.Errorf("with no criteria media type QualityRank decides, so epub outranks pdf, got: %v", resultTitles(results))
+	}
+}
+
+// TestSearchBook_FindsDecomposedReleaseTitle runs #3137 end to end: a tracker
+// that stores the release title decomposed (NFD) and matches query bytes
+// literally answers only the decomposed retry, and the release must survive
+// the searcher's relevance filter and come back from SearchBook.
+func TestSearchBook_FindsDecomposedReleaseTitle(t *testing.T) {
+	nfdTitle := norm.NFD.String("Fjellåsen")
+	rssBody := `<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:newznab="http://www.newznab.com/DTD/2010/feeds/attributes/">
+  <channel>
+    <newznab:response offset="0" total="1"/>
+    <item>
+      <title>` + nfdTitle + ` - Kari Nordmann</title>
+      <guid isPermaLink="false">guid-nfd</guid>
+      <enclosure url="https://fake/dl/1" length="1000" type="application/x-bittorrent"/>
+    </item>
+  </channel>
+</rss>`
+	const emptyBody = `<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel></channel></rss>`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		q := r.URL.Query()
+		if strings.Contains(q.Get("title")+q.Get("q"), nfdTitle) {
+			w.Write([]byte(rssBody))
+			return
+		}
+		w.Write([]byte(emptyBody))
+	}))
+	defer srv.Close()
+
+	idxs := []models.Indexer{{ID: 1, Name: "test", URL: srv.URL, Enabled: true, Categories: []int{3030}}}
+	results := newTestSearcher().SearchBook(context.Background(), idxs, MatchCriteria{
+		Title:  "Fjellåsen",
+		Author: "Kari Nordmann",
+	})
+	if len(results) != 1 || results[0].GUID != "guid-nfd" {
+		t.Fatalf("SearchBook = %v, want the decomposed release", resultTitles(results))
 	}
 }

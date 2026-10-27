@@ -8,12 +8,12 @@ This page is the user-facing companion to the deployment notes in [`docs/DEPLOYM
 
 When enhanced Hardcover series data is enabled, Bindery can:
 
-- create, rename, shortlist, and delete local series from the Series page
+- create, rename, shortlist, delete and merge local series from the Series page
 - add existing Bindery books to a local series with a position number
 - search Hardcover for the matching catalog series
 - link or unlink a local series to a Hardcover series
 - compare the local series against the Hardcover catalog
-- show present, missing, local-only, and uncertain catalog entries
+- show present, missing, local-only, uncertain, and covered (split-edition) catalog entries
 - add one missing Hardcover book, or add all missing books for a linked series
 - create wanted and monitored book rows for missing catalog entries and queue searches for them
 
@@ -32,8 +32,18 @@ If either requirement is missing, Bindery hides the enhanced controls and the en
 
 Use **Search series...** at the top of the Series page to filter your local series by title instead of using browser Find in a large collection. Matching ignores case and accents; clear the field to show all series again. This local search is available without enhanced Hardcover data.
 
+Next to the search, the filter buttons narrow the list without changing anything:
+
+- **Missing books** shows series whose card has a missing badge. **Complete** shows series with at least one book and no missing badge. Both use exactly the count on the badge. Without enhanced Hardcover data that is the books in the series you have not imported, leaving out excluded books. With it, the badge can also count Hardcover catalog books that are not in your library: the linked series' book count until you open the card, then the exact catalog diff. Bindery never loads a diff per series just to filter, so opening a card can move it between the two; the open card stays listed until you pick another filter.
+- **Not linked to Hardcover** shows series with no Hardcover link. It appears only when enhanced Hardcover data is on.
+- **Shortlisted** shows series you added to your shortlist.
+
+A second row of buttons filters by how many books a series holds: **Any size**, **1 book** and **2+ books**. It uses the number of books the series already lists, so it needs no Hardcover data. It is a quick way to see the one book series in a large library. It combines with the status filter and the title search, and the "N of M series" count follows it.
+
+The filter combines with the title search and is kept in the page address (`?filter=missing`, and `?size=single` or `?size=multi` for the size), so reloading, going back or sharing the link keeps it. Filtering never marks books wanted, monitors them, runs searches or fills gaps.
+
 1. Open **Library → Series**.
-2. Create a series manually, or open an existing series populated from your library metadata.
+2. Create a series manually, or open an existing series populated from your library metadata. With enhanced Hardcover data on, **Add Series** also has a search box: type a title, press Enter or **Search**, and each result shows its author, book count and the first few book titles so you can tell near-identical series apart. **Add** creates the series already linked to that Hardcover series and opens it with its catalog diff, so the books you do not have yet are listed as missing. Nothing is added to your library until you choose to, one book at a time or with **Fill gaps**. If that Hardcover series is already in your library, Bindery opens the existing one instead of making a second. The name field is still there for a plain manual series.
 3. Use **Add Book** to attach existing Bindery books and set their series positions.
 4. Use **Search** to find a matching Hardcover series.
 5. Pick the correct Hardcover result, or remove a bad existing link. Each candidate carries a **View on Hardcover** link so you can open it before choosing, which matters most for light novels, where the novel, its manga adaptation and a spin-off all come back under near-identical names.
@@ -49,7 +59,7 @@ Most series rows are not created on the Series page at all. They arrive when Bin
 
 When Hardcover enriches an author whose works come from OpenLibrary, both providers can claim a series for the same book. Hardcover wins. Its series carry a stable catalog id and a position, while OpenLibrary parses a free text string, and keeping both would create two local series for one real one and put the book in each. Providers other than Hardcover only fill in a series when the work has none yet.
 
-Refreshing an author links the series of the books you already have, not only the ones the refresh creates. That is how an imported library gains its series: point the author at the metadata record you want and refresh, and each book the provider puts in a series is filed under it. A link that is already stored is left exactly as it is, position included, so a position you corrected by hand survives every later refresh. Nothing is unlinked, and a book already in a series keeps that series even when the provider now names the same one under a different catalog id. Matching those two up ignores case, spacing, apostrophes and a parenthetical suffix, but not an inverted article, so a stored "Expanse, The" and an incoming "The Expanse" still end up as two series.
+Refreshing an author links the series of the books you already have, not only the ones the refresh creates. That is how an imported library gains its series: point the author at the metadata record you want and refresh, and each book the provider puts in a series is filed under it. A link that is already stored is left exactly as it is, position included, so a position you corrected by hand survives every later refresh. Nothing is unlinked, and a book already in a series keeps that series even when the provider now names the same one under a different catalog id. Matching those two up ignores case, spacing, apostrophes, a parenthetical suffix and an inverted article, so a stored "Expanse, The" and an incoming "The Expanse" count as the same series.
 
 Two more limits are worth knowing:
 
@@ -65,6 +75,12 @@ When you click **Search** on an unlinked series, Bindery first attempts an autom
 
 If that evidence is missing, Bindery shows candidates for manual selection instead of linking automatically.
 
+## One Series Per Hardcover Series
+
+A Hardcover series is held by at most one series in your library. When an author sync, an Audiobookshelf import or a Hardcover list sync meets a Hardcover series you already linked to a series of your own, it files the books under your series instead of creating a second one. Choosing a Hardcover series for a series (or adding one) when another series already holds it is refused with a message naming that series, and automatic linking skips it. To combine two series, use merge on the Series page.
+
+Libraries that already hold two series for one Hardcover series are not changed. Bindery logs a warning at startup naming the Hardcover id and the series ids, so you can merge them.
+
 ## How the Catalog Diff Binds Local Books
 
 The diff pairs each local book in the series with at most one catalog entry, in two passes. A local book whose provider ID matches a catalog entry binds to it first, whatever the library order. Only then are the remaining local books matched by title, and a title match is never allowed across positions: a book the series files at position 4 cannot bind to catalog volume 9 however similar the titles are. Title matches are made in order of each book's best score, ties in library order. A book whose best entry is already taken moves on to its next best, unless a book with the same title holds an entry it matches better than that next best. The same title means the same numbers, and two titles at least as close to each other as the book is to that entry. The two rows are then copies of one book (a duplicate import, or an ebook and an audiobook row) and the second is listed as Local only, with or without stored positions: a second copy of The Way of Kings does not claim The Way of Kings Prime, which stays in Missing. That is logged at DEBUG as `series diff: local book is a second copy of a book already bound, left Local only`. A book whose best entry went to a different book, such as "He Who Fights with Monsters 4" losing the bare series title to volume 1, is not a copy and moves on to its own entry.
@@ -77,11 +93,37 @@ Every binding decision is logged at DEBUG as `series diff: local book bound to c
 
 Missing-book fill uses the linked Hardcover catalog as the source of truth for missing entries. Bindery skips catalog books that already exist locally as excluded titles, so excluded books are not silently re-added. That skip applies to the excluded title itself, not to other books whose titles it happens to contain, so an excluded box set does not stand in the way of the volume it is named after.
 
-Catalog entries whose titles name a box set rather than a book ("box set", "boxed set", "collection set", "3 Books Set") are never created by fill, the same way they are pruned from an author catalogue on ingestion. They are still listed in the diff, so clicking **add** on one does nothing and reports nothing queued.
+Catalog entries whose titles name a box set rather than a book ("box set", "boxed set", "collection set", "3 Books Set", a trailing "(Set)") are never created by fill, the same way they are pruned from an author catalogue on ingestion. They are still listed in the diff, so clicking **add** on one does nothing and reports nothing queued.
 
 The fill action may create new authors and books from Hardcover metadata when the catalog entry is not already in Bindery. Those books are linked back to the series with the catalog position.
 
+**Fill gaps** and **add all** apply the author's metadata profile to every book they would create, the same filters an author catalogue sync applies: skip part books, skip missing release date, minimum editions, allowed languages, minimum pages and skip missing ISBN. A book a filter rejects is not created, and the result line says how many the profile skipped. An author new to the library gets the default profile. The single row **add** is an explicit pick of one book, so it is not filtered, the same way adding one work from an author page is not. A book that is already in the library is linked to the series whatever the profile says.
+
+When fill re-queues the books already in the series, it also leaves out any that are unmonitored and not imported and that the profile's skip part books or skip missing release date filter rejects, so a fill no longer puts those back on Wanted. A book that is already monitored, for example one you added by hand, is queued as before. A book with no known language is not rejected by the language filter during a fill, whatever the profile does with unknown languages, because Hardcover series entries carry no language; it is resolved later. The other filters need a fresh provider lookup; use **More → Reconcile catalogue…** on the author to apply every filter to books already stored.
+
+Some catalogs list a novel's own split edition beside it, such as "The Way of Kings, Part 1" and "Part 2" at 1.1 and 1.2 under "The Way of Kings" at 1. A book counts as such a split part when both hold: its position is a fraction under the whole's position, and its title is the whole's title followed by "Part N" (a subtitle after the marker is ignored). Position alone is not enough: a real novella at a fractional position, such as "Edgedancer" at 2.5 beside "Words of Radiance" at 2, has no "Part N" marker and stays a normal book, and a catalog that represents a work only as its split parts, with no unsplit row at the integer position at all (Robert Jordan's Wheel of Time "Two Volume Edition" catalog is like this), never triggers the rule either, since there is nothing to cover the parts. On the Hardcover catalog diff a covered part is reported as covered, not missing: it is not counted, not offered an **add** button, and not created by fill, and appears in its own collapsed section on the Series page ("N split editions of books you own") linking to the whole that covers it. The same rule covers rows already stored locally: once the whole is imported, or monitored and not excluded, fill no longer re-queues a stored part and the scheduled wanted search no longer searches it, so a part of a book you already have is never downloaded. A stored part listed only in another series by the same author, such as a numbering where every part is its own volume ("The Eye of the World, Part 1 of 2" at 1 in "The Wheel of Time (Finnish Numbering)"), is matched by its title alone, because positions from two different series cannot be compared; a part that shares a series with the whole still needs both signals. Stored parts are marked **Split part** on the series card and are not counted as missing. If a fill from an older version left one monitored, **Unmonitor N split parts** on the series card unmonitors them in one click. Nothing is deleted, and an imported part is never touched.
+
 The format dropdown beside **add all** sets the media type of every book the fill creates. Pick **Ebook** and the created books are ebook only, even when Hardcover lists an audiobook edition of the same work, so only one search is queued per book. Pick **Audiobook** for audio only. Pick **Both** if you want Bindery to look for both formats. Books that are already in the series keep whatever media type they were added with, so change those on the book itself.
+
+## Merging Series
+
+One series can end up as several rows, when a provider names it in more than one way or a provider fix renames it. **Merge…** on the series you want to keep opens a dialog to pick the others and fold them into it:
+
+- Their books join it. A book already in it keeps its position there; a source fills a position it left empty.
+- The series becomes a book's primary series where a merged one was.
+- It keeps its own Hardcover link and genre override, and takes a merged series' only when it has none. It is monitored when any of them was.
+- Optionally, rename it in the same step, when none of the names was right.
+- The merged series are deleted. Their provider ids stay as aliases of the one you kept, so a later refresh that still reports an old id files the book there instead of recreating the old series.
+
+The dialog previews every change, including books whose positions differ, before anything is applied. Merging is for admins.
+
+Undoing an import (ABS, Calibre) made before a merge does not take the merged books back out of the series you kept.
+
+## Fixing One Book's Series
+
+When one book is filed under the wrong series, or is missing its number, fix it from the book: **Edit metadata** has a **Series** field with the author's series, a position, and **New series…** to create one. Picking a series makes it the book's primary series and takes the book out of the one it was filed under; **No series** takes it out of every series it is in. A position is optional.
+
+A refresh does not put a book back into a series you took it out of, here or from the series page, even when the provider still lists it there or the series was merged into another. The book page lists those series with **Restore**, and **Unlock all fields** in Edit metadata hands the book's series back to refresh. Changing series is for admins.
 
 ## Known Behavior
 
@@ -98,7 +140,7 @@ The format dropdown beside **add all** sets the media type of every book the fil
 - Enhanced controls are missing: save a Hardcover API token, then enable **Enhanced Hardcover series** in `Settings -> API Keys`. If your operator disabled the deployment-wide feature flag, they must remove `BINDERY_ENHANCED_HARDCOVER_API=false` and restart Bindery.
 - Hardcover test fails: verify the token at [Hardcover API settings](https://hardcover.app/account/api) and make sure Bindery can reach `hardcover.app`. Both `hc_pat_` personal access tokens and the older JWTs are accepted. The test tells you which side failed: `token rejected (HTTP 401: ...)` is a token to reissue, while `HTTP 500 (upstream returned a non-JSON response ...)` is a Hardcover outage to wait out. See [Troubleshooting](./Troubleshooting-Wiki.md#hardcover-fails-with-http-500-or-the-token-test-shows-a-hardcover-error-page).
 - Search finds the wrong series: choose a different result manually, or remove the link and search again with a more specific local series name.
-- Fill gaps adds nothing: check whether the missing books already exist locally, are excluded, or whether the linked Hardcover catalog has no missing entries relative to the local series.
+- Fill gaps adds nothing: check whether the missing books already exist locally, are excluded, are filtered out by the author's metadata profile (the result line counts those), or whether the linked Hardcover catalog has no missing entries relative to the local series.
 - Searches are not queued after fill: check the **Auto-grab** toggle in `Settings -> General` first, since it suppresses fill's searches deliberately, then verify your indexers and download-client search flow are working for normal wanted books.
 
 ## See Also

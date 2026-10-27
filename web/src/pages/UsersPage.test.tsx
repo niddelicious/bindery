@@ -51,6 +51,15 @@ describe('UsersPage roles', () => {
     vi.mocked(api.setUserAutoApprove).mockResolvedValue({ ok: true })
   })
 
+  // #3240: the add-user form's labels name their fields.
+  it('names the add-user fields by their labels', async () => {
+    render(<UsersPage />)
+    await screen.findByRole('combobox', { name: 'Role for reader' })
+    expect(screen.getByLabelText('users.fieldUsername').tagName).toBe('INPUT')
+    expect(screen.getByLabelText('users.fieldPassword').tagName).toBe('INPUT')
+    expect(screen.getByLabelText('Role').tagName).toBe('SELECT')
+  })
+
   it('offers all three roles and sets requester', async () => {
     render(<UsersPage />)
     const select = await screen.findByRole('combobox', { name: 'Role for reader' })
@@ -85,5 +94,25 @@ describe('UsersPage roles', () => {
     render(<UsersPage />)
     await screen.findByRole('combobox', { name: 'Role for admin' })
     expect(screen.queryByRole('checkbox', { name: 'Auto-approve requests for admin' })).not.toBeInTheDocument()
+  })
+})
+
+// The Auto-approve note belongs to that column, which only means something
+// for a requester; with none listed it read as the page's description.
+describe('UsersPage auto-approve note', () => {
+  it('shows the note only when a requester is listed', async () => {
+    vi.mocked(api.listUsers).mockResolvedValue([
+      { id: 1, username: 'admin', role: 'admin', createdAt: '2026-01-01T00:00:00Z', autoApproveRequests: false },
+    ])
+    const { unmount } = render(<UsersPage />)
+    await screen.findAllByText('admin')
+    expect(screen.queryByText('users.autoApproveHint')).toBeNull()
+    unmount()
+    vi.mocked(api.listUsers).mockResolvedValue([
+      { id: 1, username: 'admin', role: 'admin', createdAt: '2026-01-01T00:00:00Z', autoApproveRequests: false },
+      { id: 3, username: 'guest', role: 'requester', createdAt: '2026-01-01T00:00:00Z', autoApproveRequests: false },
+    ])
+    render(<UsersPage />)
+    expect(await screen.findByText('users.autoApproveHint')).toBeInTheDocument()
   })
 })

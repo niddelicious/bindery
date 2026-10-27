@@ -281,6 +281,12 @@ func TestCreateAuthorCore_DefaultParamsMatchHandler(t *testing.T) {
 	if err != nil {
 		t.Fatalf("core: %v", err)
 	}
+	// drain cancels the job context before waiting, and the aggregator's
+	// shared requests honour that cancellation before calling the provider,
+	// so wait for the sync to reach the works lookup first.
+	for deadline := time.Now().Add(5 * time.Second); provider.worksCalls.Load() == 0 && time.Now().Before(deadline); {
+		time.Sleep(5 * time.Millisecond)
+	}
 	viaCore.drain(t)
 	got := res.Author
 	if !res.Created || got == nil {
@@ -400,10 +406,16 @@ func TestWriteAddBookError_Statuses(t *testing.T) {
 			"existingBookId": existing.ID,
 			"existingBook":   existing,
 		}},
+		{"book in library, format widened", &bookInLibraryError{Book: existing, FormatWidened: true}, http.StatusConflict, map[string]any{
+			"error":          "book already in your library; change its format or monitoring from the book page",
+			"existingBookId": existing.ID,
+			"existingBook":   existing,
+			"formatWidened":  true,
+		}},
 		{"primary provider unavailable", &primaryProviderUnavailableError{Primary: "hardcover"}, http.StatusServiceUnavailable,
 			errorBody("The primary metadata provider (hardcover) did not answer, so no record from another provider was used. Please try again once it responds.")},
 		{"book lookup failed", &addBookLookupError{Err: errors.New("look up book metadata: boom")}, http.StatusBadGateway,
-			errorBody("look up book metadata: boom")},
+			errorBody("metadata provider unavailable")},
 		{"unknown error", errors.New("disk on fire"), http.StatusInternalServerError,
 			errorBody("internal server error")},
 	})
@@ -428,7 +440,7 @@ func TestWriteCreateAuthorError_Statuses(t *testing.T) {
 		{"invalid monitor option", &createAuthorOptionError{Err: errors.New("monitorMode must be one of: all, future, latest, none")}, http.StatusBadRequest,
 			errorBody("monitorMode must be one of: all, future, latest, none")},
 		{"upstream lookup failed", &createAuthorLookupError{Err: errors.New("openlibrary: upstream 502")}, http.StatusBadGateway,
-			errorBody("openlibrary: upstream 502")},
+			errorBody("metadata provider unavailable")},
 		{"conflict with canonical author", &authorConflictError{Canonical: canonical, Message: "author already exists"}, http.StatusConflict, map[string]any{
 			"error":             "author already exists",
 			"canonicalAuthorId": canonical.ID,

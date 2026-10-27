@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -52,7 +53,11 @@ func New(host string, port int, username, password, urlBase string, useSSL bool)
 	client := &Client{
 		username: username,
 		password: password,
-		http:     &http.Client{Timeout: 15 * time.Second},
+		// Control client: dialled directly (never via BINDERY_OUTBOUND_PROXY)
+		// with the dial checked so a rebound hostname cannot reach a
+		// link-local or metadata address. Redirects are pinned to the RPC
+		// target by checkRedirect below.
+		http: &http.Client{Timeout: 15 * time.Second, Transport: httpsec.DirectGuardedTransport(httpsec.PolicyService)},
 		// fetchHTTP pulls indexer-controlled .torrent URLs. The fetch loop
 		// already re-validates each redirect hop; the guarded transport adds a
 		// per-dial recheck so a DNS rebind between validate and connect can't
@@ -107,6 +112,7 @@ func (c *Client) Test(ctx context.Context) error {
 // -1 unlimited sentinel maps to seedRatioMode=2 (no ratio limit) because the
 // Transmission RPC rejects a negative seedRatioLimit float. A nil pointer
 // leaves both fields unset so the torrent keeps Transmission's global rule.
+// The ratio is applied by a torrent-set after the add; see AddTorrentWithLimits.
 func (c *Client) AddTorrent(ctx context.Context, magnetOrURL, downloadDir string, seedRatio *float64) (int64, error) {
 	added, err := c.AddTorrentDetailed(ctx, magnetOrURL, downloadDir, seedRatio)
 	if err != nil {
@@ -122,11 +128,93 @@ func (c *Client) AddTorrent(ctx context.Context, magnetOrURL, downloadDir string
 // torrent (or at nothing). Only hashString is stable for the life of the
 // torrent. See AddTorrent for the argument semantics.
 func (c *Client) AddTorrentDetailed(ctx context.Context, magnetOrURL, downloadDir string, seedRatio *float64) (Torrent, error) {
+	return c.AddTorrentWithLimits(ctx, magnetOrURL, downloadDir, SeedLimits{Ratio: seedRatio})
+}
+
+// SeedLimits is the set of per-torrent seeding overrides Transmission can
+// carry. A nil field leaves that rule on Transmission's global setting.
+type SeedLimits struct {
+	// Ratio is the per-indexer seed ratio override (#883), with -1 as the
+	// unlimited sentinel.
+	Ratio *float64
+	// IdleMinutes is the inactive seeding limit (#2206): stop seeding after
+	// this many minutes without activity. Transmission has no total seeding
+	// time limit, so there is no field for one.
+	IdleMinutes *int
+}
+
+func (l SeedLimits) isZero() bool { return l.Ratio == nil && l.IdleMinutes == nil }
+
+// AddTorrentWithLimits is AddTorrentDetailed with every seeding override
+// Transmission supports.
+//
+// The limits are applied with a torrent-set once the torrent exists, not as
+// torrent-add arguments. torrent-add reads none of seedRatioLimit,
+// seedRatioMode, seedIdleLimit or seedIdleMode (compare torrentAdd and
+// torrentSet in libtransmission/rpcimpl.cc; the RPC spec lists them under
+// torrent-set only), so until #2206 the ratio override was silently dropped.
+// The torrent is already added when torrent-set runs, so its failure is logged
+// rather than returned, the same as qBittorrent and Deluge.
+func (c *Client) AddTorrentWithLimits(ctx context.Context, magnetOrURL, downloadDir string, limits SeedLimits) (Torrent, error) {
+	added, err := c.addTorrent(ctx, magnetOrURL, downloadDir)
+	if err != nil {
+		return Torrent{}, err
+	}
+	if !limits.isZero() {
+		if err := c.SetSeedLimits(ctx, torrentRef(added), limits); err != nil {
+			slog.Warn("transmission: failed to set seed limits", "hash", added.HashString, "id", added.ID, "error", err)
+		}
+	}
+	return added, nil
+}
+
+// torrentRef is how a torrent-set addresses a torrent: its info hash, which
+// Transmission accepts anywhere an id is taken, or the session id when the
+// daemon reported no hash.
+func torrentRef(t Torrent) any {
+	if h := strings.ToLower(strings.TrimSpace(t.HashString)); h != "" {
+		return h
+	}
+	return t.ID
+}
+
+// SetSeedLimits applies seeding overrides to an existing torrent through
+// torrent-set. ref is an info hash or a numeric id. A zero SeedLimits sends
+// nothing.
+func (c *Client) SetSeedLimits(ctx context.Context, ref any, limits SeedLimits) error {
+	if limits.isZero() {
+		return nil
+	}
+	args := map[string]interface{}{"ids": []any{ref}}
+	applySeedRatioArgs(args, limits.Ratio)
+	applySeedIdleArgs(args, limits.IdleMinutes)
+	req, err := c.buildRequest(ctx, "torrent-set", args)
+	if err != nil {
+		return err
+	}
+	respBody, err := c.doRequest(req)
+	if err != nil {
+		return err
+	}
+	var resp struct {
+		Result string `json:"result"`
+	}
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return fmt.Errorf("decode torrent-set response: %w", err)
+	}
+	if resp.Result != "success" {
+		return fmt.Errorf("torrent-set failed: %s", resp.Result)
+	}
+	return nil
+}
+
+// addTorrent performs the torrent-add itself and returns the torrent
+// Transmission reported, new or duplicate.
+func (c *Client) addTorrent(ctx context.Context, magnetOrURL, downloadDir string) (Torrent, error) {
 	args := map[string]interface{}{}
 	if downloadDir != "" {
 		args["download-dir"] = downloadDir
 	}
-	applySeedRatioArgs(args, seedRatio)
 
 	if isMagnetLink(magnetOrURL) {
 		args["filename"] = magnetOrURL
@@ -186,8 +274,35 @@ const (
 	seedRatioModeUnlimited = 2
 )
 
+// Transmission seedIdleMode values (tr_idlelimit): 0 = use global limit,
+// 1 = use the per-torrent seedIdleLimit, 2 = no idle limit.
+const seedIdleModeSingle = 1
+
+// maxSeedIdleMinutes is the largest idle limit Transmission can hold: the
+// daemon stores it as a uint16 (tr_torrentSetIdleLimit), so anything above
+// would wrap around to a short limit rather than a long one.
+const maxSeedIdleMinutes = 65535
+
+// applySeedIdleArgs writes the seedIdleLimit/seedIdleMode pair into a
+// torrent-set argument map for an inactive seeding override (#2206). nil
+// leaves the map untouched (keep the global rule). The API only accepts a
+// value of one minute or more; one above what the daemon can store is clamped.
+func applySeedIdleArgs(args map[string]interface{}, idleMinutes *int) {
+	if idleMinutes == nil || *idleMinutes < 1 {
+		return
+	}
+	v := *idleMinutes
+	if v > maxSeedIdleMinutes {
+		slog.Debug("transmission: inactive seed time clamped to the daemon's maximum",
+			"requested_minutes", v, "applied_minutes", maxSeedIdleMinutes)
+		v = maxSeedIdleMinutes
+	}
+	args["seedIdleLimit"] = v
+	args["seedIdleMode"] = seedIdleModeSingle
+}
+
 // applySeedRatioArgs writes the seedRatioLimit/seedRatioMode pair into a
-// torrent-add (or torrent-set) argument map for the given override. nil leaves
+// torrent-set argument map for the given override. nil leaves
 // the map untouched (keep the global rule). A non-negative value sets a single
 // per-torrent ratio; the -1 unlimited sentinel becomes seedRatioMode=2 since
 // the RPC rejects a negative seedRatioLimit. Other negatives are treated as
@@ -211,7 +326,8 @@ func (c *Client) GetTorrents(ctx context.Context, downloadDir string) ([]Torrent
 	args := map[string]interface{}{
 		"fields": []string{"id", "hashString", "name", "totalSize", "downloadedEver",
 			"leftUntilDone", "status", "errorString", "rateDownload", "rateUpload", "eta",
-			"percentDone", "downloadDir", "labels", "addedDate"},
+			"percentDone", "metadataPercentComplete", "peersConnected", "downloadDir",
+			"labels", "addedDate"},
 	}
 
 	req, err := c.buildRequest(ctx, "torrent-get", args)
@@ -413,11 +529,11 @@ func (c *Client) fetchTorrentContent(ctx context.Context, torrentURL string) (*f
 	current := torrentURL
 	for redirects := 0; redirects <= 5; redirects++ {
 		if err := c.validateTorrentFetchURL(current); err != nil {
-			return nil, fmt.Errorf("fetch torrent: %w", err)
+			return nil, fmt.Errorf("fetch torrent: %w", httpsec.RedactURLError(err))
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, current, nil)
 		if err != nil {
-			return nil, fmt.Errorf("fetch torrent: %w", err)
+			return nil, fmt.Errorf("fetch torrent: %w", httpsec.RedactURLError(err))
 		}
 		req.Header.Set("Accept", "application/x-bittorrent")
 		// Some indexers fingerprint the User-Agent and serve an anti-bot 403
@@ -443,7 +559,7 @@ func (c *Client) fetchTorrentContent(ctx context.Context, torrentURL string) (*f
 			}
 			next, err := req.URL.Parse(location)
 			if err != nil {
-				return nil, fmt.Errorf("fetch torrent: invalid redirect location: %w", err)
+				return nil, fmt.Errorf("fetch torrent: invalid redirect location: %w", httpsec.RedactURLError(err))
 			}
 			if next.Scheme != "http" && next.Scheme != "https" {
 				return nil, fmt.Errorf("fetch torrent: unsupported redirect scheme %q", next.Scheme)
@@ -459,7 +575,7 @@ func (c *Client) fetchTorrentContent(ctx context.Context, torrentURL string) (*f
 		}
 		data, err := io.ReadAll(io.LimitReader(resp.Body, 50<<20)) // 50 MB cap
 		if err != nil {
-			return nil, fmt.Errorf("fetch torrent: %w", err)
+			return nil, fmt.Errorf("fetch torrent: %w", httpsec.RedactURLError(err))
 		}
 		return &fetchedTorrent{data: data}, nil
 	}

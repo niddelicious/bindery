@@ -18,12 +18,12 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/vavallee/bindery/internal/abs"
 	"github.com/vavallee/bindery/internal/api"
 	"github.com/vavallee/bindery/internal/auth"
 	oidcauth "github.com/vavallee/bindery/internal/auth/oidc"
+	"github.com/vavallee/bindery/internal/bookhydrate"
 	"github.com/vavallee/bindery/internal/calibre"
 	"github.com/vavallee/bindery/internal/config"
 	"github.com/vavallee/bindery/internal/covers"
@@ -38,7 +38,6 @@ import (
 	"github.com/vavallee/bindery/internal/logbuf"
 	"github.com/vavallee/bindery/internal/metadata"
 	"github.com/vavallee/bindery/internal/metadata/dnb"
-	"github.com/vavallee/bindery/internal/metadata/googlebooks"
 	"github.com/vavallee/bindery/internal/metadata/hardcover"
 	"github.com/vavallee/bindery/internal/metadata/openlibrary"
 	"github.com/vavallee/bindery/internal/metrics"
@@ -118,6 +117,10 @@ func main() {
 			"bypassLocal", cfg.OutboundProxyBypassLocal)
 	}
 
+	if httpsec.LinkLocalServicesEnabled() {
+		slog.Warn(httpsec.LinkLocalServicesEnvVar + " is on: the service URLs you type (indexers, Prowlarr, download clients, Audiobookshelf, Grimmory, Calibre plugin) may use link-local addresses. Cloud metadata addresses stay blocked.")
+	}
+
 	slog.Info("starting bindery",
 		"version", version,
 		"commit", commit,
@@ -189,6 +192,9 @@ func main() {
 	delayProfileRepo := db.NewDelayProfileRepo(database)
 	customFormatRepo := db.NewCustomFormatRepo(database)
 	userRepo := db.NewUserRepo(database)
+	// One denylist instance, shared by the logout handler and the auth
+	// middleware, so a logout is seen by the very next request.
+	sessionRevocations := db.NewSessionRevocations(database)
 
 	// Auth bootstrap: seed the API key and session secret on first boot if
 	// they're missing, so Bindery is never "open by default". If the user has
@@ -271,6 +277,12 @@ func main() {
 	// the TCP peer is then the proxy's own private address.
 	auth.WarnIfLocalOnlyWithoutTrustedProxy(bootAuthMode, trustedCIDRs)
 
+	// BINDERY_ALLOWED_HOSTS is read per request, so a bad entry would
+	// otherwise be ignored in silence, and a bare "*" (the Host check's
+	// opt out) deserves a line of its own whatever the boot mode: the mode
+	// can be switched to local-only or disabled at runtime.
+	auth.WarnAllowedHostsConfig()
+
 	// Same shape, different assumption: an operator who added a second account
 	// through Settings has no way to learn that the two accounts share one
 	// library until they look at it. A count read failure is not worth a line
@@ -287,64 +299,22 @@ func main() {
 	olClient := openlibrary.New()
 	dnbClient := dnb.New()
 
-	hcClient := hardcover.New().WithTokenSource(func(ctx context.Context) string {
+	dailyQuota := hardcover.NewDailyQuota(settingsRepo)
+	hcClient := hardcover.New().WithDailyQuota(dailyQuota).WithTokenSource(func(ctx context.Context) string {
 		return api.GetHardcoverAPIToken(ctx, settingsRepo)
 	})
 
-	// Determine primary provider from settings (default: openlibrary). The
-	// primary decides what an author's catalogue looks like; every other
-	// provider is added as an enricher so metadata is still cross-checked.
-	//
-	// - "dnb" is the recommended choice for German/Austrian/Swiss catalogues,
-	//   where OpenLibrary coverage is too thin for German-language books.
-	// - "hardcover" trades breadth for a cleaner, editorially curated
-	//   catalogue: no translation editions masquerading as separate works, no
-	//   omnibus bundles, no non-book merchandise rows (#2040).
-	configuredPrimary := ""
-	if s, _ := settingsRepo.Get(ctxBoot, api.SettingMetadataPrimaryProvider); s != nil {
-		configuredPrimary = s.Value
-	}
-	primaryName := resolveMetadataPrimaryProvider(configuredPrimary, api.GetHardcoverAPIToken(ctxBoot, settingsRepo) != "")
-	var primaryProvider metadata.Provider
-	switch primaryName {
-	case "dnb":
-		primaryProvider = dnbClient
-	case "hardcover":
-		primaryProvider = hcClient
-	default:
-		primaryProvider = olClient
-	}
-	slog.Info("metadata primary provider", "provider", primaryName)
-
-	var enrichers []metadata.Provider
-	if apiKey := googleBooksAPIKey(ctxBoot, settingsRepo); apiKey != "" {
-		enrichers = append(enrichers, googlebooks.New(apiKey))
-		slog.Info("google books enrichment enabled")
-	}
-	// Every provider that isn't primary becomes an enricher.
-	if primaryName != "hardcover" {
-		// The enricher is registered whether or not a token is set: the token
-		// is read live per request through WithTokenSource, so configuring one
-		// later takes effect without a restart. Only the log line is
-		// conditional, so it no longer claims enrichment is running when every
-		// call will short-circuit as unconfigured (#2075).
-		enrichers = append(enrichers, hcClient)
-		if api.GetHardcoverAPIToken(ctxBoot, settingsRepo) != "" {
-			slog.Info("hardcover enrichment enabled")
-		} else {
-			slog.Info("hardcover enrichment idle: no api token configured")
-		}
-	}
-	if primaryName != "openlibrary" {
-		enrichers = append(enrichers, olClient)
-		slog.Info("openlibrary enrichment enabled")
-	}
-	if primaryName != "dnb" {
-		enrichers = append(enrichers, dnbClient)
-		slog.Info("dnb enrichment enabled")
-	}
-
-	metaAgg := metadata.NewAggregator(primaryProvider, enrichers...)
+	// The primary provider and the enrichers come from settings
+	// (metadata.primary_provider, the Google Books key, the Hardcover token).
+	// metaProviders builds them here and again whenever one of those settings
+	// is saved, so a change applies to the next lookup without a restart
+	// (#1771); see SettingsHandler.WithChangeHook below.
+	metaProviders := newMetadataProviders(settingsRepo, olClient, dnbClient, hcClient)
+	bootProviders := metaProviders.build(ctxBoot)
+	bootProviders.log("metadata providers configured")
+	metaAgg := metadata.NewAggregator(bootProviders.primary, bootProviders.enrichers...)
+	metaAgg.SetAuthorEnrichers(bootProviders.authorEnrichers...)
+	metaAgg.SetAudiobookSourcesDisabled(bootProviders.audibleOff, bootProviders.audnexOff)
 
 	// Optional CLI subcommand: `bindery migrate {csv,readarr} <path>`.
 	// Runs the import and exits; does not start the HTTP server. Useful
@@ -352,6 +322,17 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "migrate" {
 		runMigrate(cfg, authorRepo, indexerRepo, dlClientRepo, blocklistRepo, settingsRepo, metaAgg)
 		return
+	}
+
+	// Read-only report of Hardcover ids that more than one series holds, from
+	// before the guards in SeriesRepo (#3368). Merge them from the series page.
+	if dups, err := seriesRepo.ListHardcoverDuplicates(ctxBoot); err != nil {
+		slog.Warn("could not check for duplicate hardcover series", "error", err)
+	} else {
+		for _, d := range dups {
+			slog.Warn("several series share one hardcover id; merge them from the series page",
+				"hardcoverId", d.HardcoverSeriesID, "seriesIds", d.SeriesIDs)
+		}
 	}
 
 	// Optional CLI subcommand: `bindery reconcile-series`.
@@ -397,6 +378,15 @@ func main() {
 	// before importing it, and blocklist a release rejected that way so the
 	// next search does not grab it again (#1782).
 	importScanner.WithFormatEnforcement(qualityProfileRepo, blocklistRepo)
+	// Same for the file's declared language against the author's metadata
+	// profile: a downloaded EPUB in a language the profile does not allow is
+	// rejected and blocklisted instead of relabelling the book (#2998).
+	importScanner.WithLanguageEnforcement(metadataProfileRepo, blocklistRepo)
+	// And the file's own title and author against the book it was grabbed for,
+	// with the author's aliases standing in for the author, so a pen name such
+	// as "Franklin W. Dixon" is not read as a different writer (#3015).
+	importScanner.WithAuthorAliases(authorAliasRepo)
+	importScanner.WithClientHealth(downloadHealth)
 	importScanner.WithJobs(bgJobs) // drain manual scans on shutdown (#1458)
 
 	// Grimmory push pipeline (#826). Config is loaded live per push, so the
@@ -407,10 +397,9 @@ func main() {
 	}
 	grimmoryPusher := grimmory.NewPusher(grimmoryLoadPushCfg, grimmoryPushRepo)
 	importScanner.WithGrimmory(grimmoryPusher)
-	if cfg.AudiobookDownloadDir != "" {
-		importScanner.WithAudiobookDownloadDir(cfg.AudiobookDownloadDir)
-		slog.Info("audiobook download dir configured", "path", cfg.AudiobookDownloadDir)
-	}
+	// The library scan leaves the download folders out when a client saves
+	// inside a library root.
+	wireScanDownloadDirs(importScanner, cfg)
 
 	// Wire ABS post-import scan notification (Bug #10). The notifier reads ABS
 	// config from settings at call time so that config changes (URL, API key,
@@ -461,6 +450,7 @@ func main() {
 	// but outside it, because the image cache evicts by age and these have
 	// no upstream to refetch from.
 	coverStore := covers.NewStore(filepath.Join(cfg.DataDir, "covers"))
+	importScanner.WithCoverStore(coverStore)
 	calibreImporter := calibre.NewImporter(authorRepo, authorAliasRepo, bookRepo, editionRepo, settingsRepo).
 		WithRunTracking(calibreImportRunRepo, calibreSnapshotRepo, calibreProvenanceRepo).
 		WithSeries(seriesRepo).
@@ -477,6 +467,11 @@ func main() {
 	calibreDeliverer := calibre.NewDeliverer(calibreDeliveryRepo, bookRepo,
 		modeResolver, calibreLoadConfig, calibreAdders.For).
 		WithMetadata(authorRepo, editionRepo, seriesRepo).
+		// A book with no editions on record, as every list synced book is,
+		// gets its Hardcover editions fetched when it reaches Calibre (#1853).
+		WithEditionHydrator(bookhydrate.EditionsOnly(editionRepo, func(ctx context.Context, foreignID string) ([]models.Edition, error) {
+			return metaAgg.GetEditionsFromProvider(ctx, "hardcover", foreignID)
+		}), func(b *models.Book) bool { return bookhydrate.IsHardcoverBook(b, "") }).
 		WithCovers(calibreCovers).
 		WithJobs(bgJobs).
 		// In pull (#2833) the plugin fetches from /bridge/v1 and the
@@ -496,6 +491,7 @@ func main() {
 		WithVersion(version).
 		WithStoragePaths(cfg.LibraryDir, cfg.AudiobookDir, rootFolderRepo).
 		WithMetadata(metaAgg).
+		WithSeriesMatchState(db.NewABSSeriesMatchRepo(database)).
 		WithEnhancedHardcoverSeriesEnabled(func(ctx context.Context) bool {
 			return api.HardcoverFeatureStateFor(ctx, settingsRepo, cfg.EnhancedHardcoverAPI).EnhancedHardcoverAPI
 		}).
@@ -559,6 +555,7 @@ func main() {
 		authorRepo, bookRepo, indexerRepo, downloadRepo, dlClientRepo, settingsRepo, blocklistRepo)
 	sched.WithHistory(historyRepo)
 	sched.WithAliases(authorAliasRepo)
+	sched.WithSeries(seriesRepo)
 	sched.WithMetadataProfiles(metadataProfileRepo)
 	sched.WithQualityProfiles(qualityProfileRepo)
 	sched.WithEditions(editionRepo)
@@ -567,6 +564,10 @@ func main() {
 	sched.WithStoragePaths(cfg.DownloadDir, cfg.AudiobookDownloadDir)
 	sched.WithDownloadClientHealth(downloadHealth, cfg.DownloadPathRemap)
 	sched.WithNotifier(notif)
+	// One log behind GET /search/last-debug, written by both the interactive
+	// search handler and the scheduler's automatic searches (#2154).
+	searchDebugLog := indexer.NewDebugLog()
+	sched.WithSearchDebugLog(searchDebugLog)
 	// Register the Calibre importer as the 24-hour sync job. The scheduler
 	// only fires the job when the syncer is non-nil, so no guard needed here.
 	sched.WithCalibreSyncer(calibreImporter)
@@ -582,6 +583,7 @@ func main() {
 
 	// Register the Hardcover list syncer (24-hour job).
 	hcSyncer := hardcoverlistsyncer.New(importListRepo, authorRepo, bookRepo).
+		WithDailyQuota(dailyQuota).
 		WithSeriesRepo(seriesRepo).
 		WithTokenSource(func(ctx context.Context) string {
 			return api.GetHardcoverAPIToken(ctx, settingsRepo)
@@ -591,6 +593,7 @@ func main() {
 		WithJobs(bgJobs)     // drain a manual "Sync now" on shutdown (#1854)
 	sched.WithHardcoverSyncer(hcSyncer)
 	sched.WithLogRepo(logRepo, cfg.LogRetentionDays)
+	sched.WithDownloadRetention(cfg.DownloadRetentionDays)
 
 	// Anonymous install ping (opt-out via telemetry.enabled=false in settings).
 	// The gatherer captures repo handles by closure and runs at ping time. It
@@ -631,6 +634,7 @@ func main() {
 
 	// API handlers
 	authHandler := api.NewAuthHandler(userRepo, settingsRepo, loginLimiter).
+		WithSessionRevocations(sessionRevocations).
 		WithLocalAuthEnabled(cfg.LocalAuthEnabled)
 	oidcResolveBase := func(r *http.Request) string {
 		return api.ResolveOIDCRedirectBase(r, cfg.OIDCRedirectBaseURL, trustedCIDRs)
@@ -648,6 +652,7 @@ func main() {
 		WithLocalAuthEnabled(cfg.LocalAuthEnabled)
 	searchHandler := api.NewSearchHandler(metaAgg, bookRepo, authorRepo)
 	librarySearchHandler := api.NewLibrarySearchHandler(authorRepo, bookRepo, seriesRepo)
+	duplicateReviewHandler := api.NewDuplicateReviewHandler(bookRepo, seriesRepo)
 	// Library-root containment checker (Wave 1 / Bundle B): used by the book
 	// and author delete handlers to refuse on-disk removal of any path that
 	// isn't inside a configured root. Defaults to the legacy single-root env
@@ -661,7 +666,8 @@ func main() {
 		WithRoots(libraryRoots).
 		WithLifetimeCtx(appCtx).
 		WithNotifier(notif). // bookAnnounced when a refresh or discovery adds books (#2236)
-		WithJobs(bgJobs)     // drain an in-flight author catalogue sync on shutdown (#2371)
+		WithJobs(bgJobs).    // drain an in-flight author catalogue sync on shutdown (#2371)
+		WithCoverStore(coverStore)
 	authorAliasHandler := api.NewAuthorAliasHandler(authorRepo, authorAliasRepo)
 	bookHandler := api.NewBookHandler(bookRepo, metaAgg, historyRepo, sched).
 		WithSettings(settingsRepo).
@@ -670,19 +676,29 @@ func main() {
 		WithSeries(seriesRepo).
 		WithEditionHydration(editionRepo).
 		WithRoots(libraryRoots).
+		WithCoverStore(coverStore).
 		WithLifetimeCtx(appCtx)
+	// Interactive search records what it returns here, and a grab from a
+	// non-admin account is held to it: it can grab a search result, not make
+	// Bindery fetch a URL of its own choosing.
+	searchResults := api.NewSearchResultRegistry()
 	indexerHandler := api.NewIndexerHandler(indexerRepo, bookRepo, authorRepo, metadataProfileRepo, idxSearcher, settingsRepo, blocklistRepo).
 		WithAliases(authorAliasRepo).
+		WithSeries(seriesRepo).
 		WithQualityProfiles(qualityProfileRepo).
-		WithEditions(editionRepo)
+		WithEditions(editionRepo).
+		WithDownloadClients(dlClientRepo).
+		WithSearchResults(searchResults).
+		WithSearchDebugLog(searchDebugLog)
 	if clients, err := dlClientRepo.List(ctxBoot); err == nil {
 		downloader.RefreshDownloadClientHealthAsync(context.Background(), bgJobs, downloadHealth, clients, cfg.DownloadDir, cfg.AudiobookDownloadDir, cfg.DownloadPathRemap)
 	} else {
 		slog.Warn("download client startup health check skipped", "error", err)
 	}
-	setupStateHandler := api.NewSetupStateHandler(indexerRepo, dlClientRepo, authorRepo, settingsRepo)
+	setupStateHandler := api.NewSetupStateHandler(indexerRepo, dlClientRepo, authorRepo, settingsRepo).WithBlockedChecks(cfg, downloadHealth, historyRepo, rootFolderRepo)
 	dlClientHandler := api.NewDownloadClientHandler(dlClientRepo).
 		WithHealth(downloadHealth).
+		WithContentBreakerReset(importScanner.ResetContentBreaker).
 		WithStoragePaths(cfg.DownloadDir, cfg.AudiobookDownloadDir).
 		WithDownloadPathRemap(cfg.DownloadPathRemap).
 		WithRoots(libraryRoots).
@@ -692,7 +708,8 @@ func main() {
 		WithNotifier(notif).
 		WithStoragePaths(cfg.DownloadDir, cfg.AudiobookDownloadDir).
 		WithDownloadPathRemap(cfg.DownloadPathRemap).
-		WithIndexers(indexerRepo)
+		WithIndexers(indexerRepo).
+		WithSearchResults(searchResults)
 	// Manual/bulk import may read from the download dirs as well as the library
 	// roots — a Readarr/qBittorrent migrant's backlog sits in the download dir,
 	// not the library (#1373). These are trusted, configured source dirs the
@@ -701,6 +718,7 @@ func main() {
 	importRoots := api.NewLibraryRoots(rootFolderRepo, cfg.LibraryDir, cfg.AudiobookDir, cfg.DownloadDir, cfg.AudiobookDownloadDir)
 	manualImportHandler := api.NewManualImportHandler(importScanner, downloadRepo, bookRepo).
 		WithRoots(importRoots).
+		WithExcludedDirs(manualImportExcludedDirs(cfg)...).
 		WithJobs(bgJobs) // drain in-flight batch imports and reassigns on shutdown (#2371)
 	pendingHandler := api.NewPendingHandler(pendingReleaseRepo, queueHandler, downloadRepo, bookRepo)
 	reorganizeHandler := api.NewReorganizeHandler(importScanner)
@@ -709,18 +727,27 @@ func main() {
 	importScanner.WithSeriesRepo(seriesRepo)
 	importScanner.WithEditions(editionRepo)
 
-	// Startup check: warn if the configured default root folder no longer exists on disk.
-	if s, _ := settingsRepo.Get(ctxBoot, api.SettingDefaultLibraryRootFolderID); s != nil && s.Value != "" {
-		if id, err := strconv.ParseInt(s.Value, 10, 64); err == nil && id > 0 {
-			if rf, err := rootFolderRepo.GetByID(ctxBoot, id); err == nil && rf != nil {
-				if _, statErr := os.Stat(rf.Path); statErr != nil {
-					slog.Warn("default library root folder does not exist on disk — falling back to BINDERY_LIBRARY_DIR",
-						"path", rf.Path, "rootFolderId", id, "error", statErr)
-				}
-			} else {
-				slog.Warn("default library root folder ID not found in database — falling back to BINDERY_LIBRARY_DIR",
-					"rootFolderId", id)
+	// Startup check: warn if a configured default root folder no longer exists on disk.
+	for _, d := range []struct{ key, kind, fallback string }{
+		{api.SettingDefaultLibraryRootFolderID, "library", "BINDERY_LIBRARY_DIR"},
+		{api.SettingDefaultAudiobookRootFolderID, "audiobook", "BINDERY_AUDIOBOOK_DIR"},
+	} {
+		s, _ := settingsRepo.Get(ctxBoot, d.key)
+		if s == nil || s.Value == "" {
+			continue
+		}
+		id, err := strconv.ParseInt(s.Value, 10, 64)
+		if err != nil || id <= 0 {
+			continue
+		}
+		if rf, err := rootFolderRepo.GetByID(ctxBoot, id); err == nil && rf != nil {
+			if _, statErr := os.Stat(rf.Path); statErr != nil {
+				slog.Warn("default "+d.kind+" root folder does not exist on disk, falling back to "+d.fallback,
+					"path", rf.Path, "rootFolderId", id, "error", statErr)
 			}
+		} else {
+			slog.Warn("default "+d.kind+" root folder ID not found in database, falling back to "+d.fallback,
+				"rootFolderId", id)
 		}
 	}
 
@@ -743,13 +770,15 @@ func main() {
 	blocklistHandler := api.NewBlocklistHandler(blocklistRepo)
 	notificationHandler := api.NewNotificationHandler(notificationRepo, notif)
 	qualityProfileHandler := api.NewQualityProfileHandler(qualityProfileRepo)
-	settingsHandler := api.NewSettingsHandler(settingsRepo)
+	settingsHandler := api.NewSettingsHandler(settingsRepo).WithDailyQuota(dailyQuota).
+		WithChangeHook(metadataProvidersReconfigurer(metaProviders, metaAgg))
 	seriesHandler := api.NewSeriesHandler(seriesRepo, bookRepo, authorRepo, metaAgg, sched).
 		WithHardcoverFeatureSettings(settingsRepo, cfg.EnhancedHardcoverAPI).
 		WithFinder(importScanner).
 		WithEditionHydration(editionRepo).
+		WithMetadataProfiles(metadataProfileRepo).
 		WithLifetimeCtx(appCtx)
-	importListHandler := api.NewImportListHandler(importListRepo, settingsRepo, hcSyncer, userRepo)
+	importListHandler := api.NewImportListHandler(importListRepo, settingsRepo, hcSyncer, userRepo).WithDailyQuota(dailyQuota)
 	metadataProfileHandler := api.NewMetadataProfileHandler(metadataProfileRepo)
 	delayProfileHandler := api.NewDelayProfileHandler(delayProfileRepo)
 	customFormatHandler := api.NewCustomFormatHandler(customFormatRepo)
@@ -832,26 +861,7 @@ func main() {
 
 	// Router
 	r := chi.NewRouter()
-	r.Use(middleware.RequestID)
-	// BINDERY_TRUSTED_PROXY (optional): comma-separated IP/CIDR list of
-	// reverse proxies permitted to set X-Forwarded-For. When unset, XFF
-	// headers are ignored — required for local-only auth mode to be safe
-	// against on-network spoofing.
-	r.Use(trustedProxyMiddleware())
-	r.Use(middleware.Recoverer)
-	r.Use(middleware.Compress(5))
-	r.Use(api.SecurityHeaders(cfg.FrameAncestors))
-	// Cap JSON / form request bodies at 1 MiB by default so an authenticated
-	// client cannot pin the process by streaming a multi-gigabyte body into
-	// json.Decode. Routes that legitimately accept larger payloads opt in via
-	// api.WithMaxBody on the chi sub-route (see /migrate/* below).
-	// PreserveRawBody must run first so the per-route override can re-wrap
-	// the raw body with a higher cap; without it the override would chain a
-	// larger MaxBytesReader on top of the smaller default and the inner cap
-	// would silently win.
-	r.Use(api.PreserveRawBody)
-	r.Use(api.MaxRequestBody)
-	r.Use(metrics.HTTPMiddleware(routeTemplate))
+	useCoreMiddleware(r, cfg.FrameAncestors)
 
 	// Prometheus exposition. Mounted at the router root (no auth, no
 	// CSRF, no XRequestedWith) because Prometheus scrapes don't carry
@@ -872,6 +882,7 @@ func main() {
 		proxyHeader:    cfg.ProxyAuthHeader,
 		proxyProvision: cfg.ProxyAutoProvision,
 		proxyCIDRs:     trustedCIDRs,
+		revocations:    sessionRevocations,
 	}
 
 	// Keep the nightly recommendation batch and manual refreshes on one
@@ -883,12 +894,14 @@ func main() {
 
 	r.Route("/api", func(r chi.Router) {
 		useAPIAuth(r, authProvider)
+		registerAPIErrorHandlers(r)
 
 		r.Get("/queue", queueHandler.ListArrCompatible)
 	})
 
 	r.Route("/api/v1", func(r chi.Router) {
 		useAPIAuth(r, authProvider)
+		registerAPIErrorHandlers(r)
 
 		// System
 		r.Get("/health", func(w http.ResponseWriter, _ *http.Request) {
@@ -899,6 +912,7 @@ func main() {
 			w.Header().Set("Content-Type", "application/json")
 			cacheBytes, _ := imageProxyHandler.CacheSize()
 			hardcoverState := api.HardcoverFeatureStateFor(r.Context(), settingsRepo, cfg.EnhancedHardcoverAPI)
+			pausedUntil, tokenRejected := hardcoverHoldStatus(hcClient.CheckQuota(r.Context()))
 			_ = json.NewEncoder(w).Encode(struct {
 				Version   string `json:"version"`
 				Commit    string `json:"commit"`
@@ -911,7 +925,12 @@ func main() {
 				ImageCacheBytes                 int64  `json:"imageCacheBytes"`
 				EnhancedHardcoverAPI            bool   `json:"enhancedHardcoverApi"`
 				HardcoverTokenConfigured        bool   `json:"hardcoverTokenConfigured"`
+				HardcoverPausedUntil            string `json:"hardcoverPausedUntil,omitempty"`
+				HardcoverTokenRejected          bool   `json:"hardcoverTokenRejected,omitempty"`
 				EnhancedHardcoverDisabledReason string `json:"enhancedHardcoverDisabledReason,omitempty"`
+				// Features is optional API behaviour integrations detect
+				// before relying on it (requestsForUser: #3337).
+				Features api.SystemFeatures `json:"features"`
 			}{
 				Version:                         version,
 				Commit:                          commit,
@@ -920,7 +939,10 @@ func main() {
 				ImageCacheBytes:                 cacheBytes,
 				EnhancedHardcoverAPI:            hardcoverState.EnhancedHardcoverAPI,
 				HardcoverTokenConfigured:        hardcoverState.HardcoverTokenConfigured,
+				HardcoverPausedUntil:            pausedUntil,
+				HardcoverTokenRejected:          tokenRejected,
 				EnhancedHardcoverDisabledReason: hardcoverState.EnhancedHardcoverDisabledReason,
+				Features:                        api.CurrentSystemFeatures(),
 			})
 		})
 
@@ -939,7 +961,7 @@ func main() {
 		r.Post("/auth/password", authHandler.ChangePassword)
 		// OIDC — login/callback are unauthenticated; provider management requires auth.
 		r.Get("/auth/oidc/providers", oidcHandler.GetProviders)
-		r.Get("/auth/oidc/redirect-base", oidcHandler.GetRedirectBase)
+		registerOIDCRedirectBaseRoute(r, oidcHandler)
 		// The discovery probe is admin-only: it is an outbound fetch oracle
 		// against the container's own network (see registerOIDCDiscoveryRoutes).
 		registerOIDCDiscoveryRoutes(r, oidcHandler)
@@ -972,11 +994,16 @@ func main() {
 		r.Put("/author/{id}/genres", authorHandler.ApplyGenres)
 		r.Delete("/author/{id}", authorHandler.Delete)
 		r.Post("/author/{id}/refresh", authorHandler.Refresh)
+		registerAuthorPhotoRoutes(r, authorHandler)
 		r.Get("/author/{id}/catalogue-reconciliation", authorHandler.PreviewCatalogueReconciliation)
 		r.Post("/author/{id}/catalogue-reconciliation", authorHandler.ApplyCatalogueReconciliation)
 		r.Get("/author/{id}/relink-upstream/candidates", authorHandler.RelinkCandidates)
 		r.Post("/author/{id}/relink-upstream", authorHandler.RelinkUpstream)
 		r.Get("/author/{id}/duplicate-candidates", authorHandler.DuplicateCandidates)
+		// Library-wide duplicate review (#2999): the same detection as the
+		// per-author window, across every author the caller may see. Not admin
+		// only, matching the per-author route; owner scoped inside the handler.
+		r.Get("/library/duplicate-candidates", duplicateReviewHandler.List)
 		r.Get("/author/{id}/series", authorHandler.ListSeries)
 		r.Get("/author/{id}/aliases", authorAliasHandler.List)
 		r.Delete("/author/{id}/aliases/{aliasID}", authorAliasHandler.Delete)
@@ -990,8 +1017,10 @@ func main() {
 		r.Delete("/book/{id}", bookHandler.Delete)
 		r.Delete("/book/{id}/file", bookHandler.DeleteFile)
 		r.Put("/book/{id}/exclude", bookHandler.ToggleExcluded)
+		r.Get("/book/{id}/series-exclusions", bookHandler.SeriesExclusions)
 		r.Post("/book/{id}/rebind", bookHandler.Rebind)
 		r.Post("/book/{id}/enrich-audiobook", bookHandler.EnrichAudiobook)
+		registerBookCoverRoutes(r, bookHandler)
 		r.Post("/book/{id}/search", indexerHandler.SearchBook)
 		r.Get("/book/{id}/file", fileHandler.Download)
 
@@ -1014,6 +1043,7 @@ func main() {
 
 		// Queue
 		r.Get("/queue", queueHandler.List)
+		r.Get("/queue/failed-count", queueHandler.FailedCount)
 		r.Post("/queue/grab", queueHandler.Grab)
 		r.Post("/queue/{id}/retry-import", queueHandler.RetryImport)
 		// Retry the download itself: re-sends the release the row holds to the
@@ -1049,12 +1079,13 @@ func main() {
 		// History
 		r.Get("/history", historyHandler.List)
 		r.Delete("/history/{id}", historyHandler.Delete)
+		// Blocklisting a release from history stays open to every user: the
+		// handler 404s unless the caller owns the history event, so a user
+		// can only add entries for their own grabs.
 		r.Post("/history/{id}/blocklist", historyHandler.Blocklist)
 
-		// Blocklist
-		r.Get("/blocklist", blocklistHandler.List)
-		r.Delete("/blocklist/bulk", blocklistHandler.BulkDelete)
-		r.Delete("/blocklist/{id}", blocklistHandler.Delete)
+		// Blocklist, admin only (see registerBlocklistRoutes).
+		registerBlocklistRoutes(r, blocklistHandler)
 
 		// Notifications — Notification.Headers carries arbitrary HTTP
 		// headers (often auth tokens for ntfy / Gotify / webhook routing).
@@ -1070,17 +1101,13 @@ func main() {
 			r.Post("/notification/{id}/test", notificationHandler.Test)
 		})
 
-		// Quality Profiles — reads available to all; mutations admin-only.
-		r.Get("/qualityprofile", qualityProfileHandler.List)
-		r.Get("/qualityprofile/{id}", qualityProfileHandler.Get)
-		r.Group(func(r chi.Router) {
-			r.Use(auth.RequireAdmin)
-			r.Post("/qualityprofile", qualityProfileHandler.Create)
-			r.Put("/qualityprofile/{id}", qualityProfileHandler.Update)
-			r.Delete("/qualityprofile/{id}", qualityProfileHandler.Delete)
-		})
+		// Quality profiles: reads open, writes admin only (see
+		// registerQualityProfileRoutes).
+		registerQualityProfileRoutes(r, qualityProfileHandler)
 
-		// Settings — reads available to all; mutations admin-only.
+		// Settings: reads open to every role, but a non admin only gets the
+		// keys on the handler's allowlist (isAdminOnlySetting, #2361);
+		// mutations admin only.
 		r.Get("/setting", settingsHandler.List)
 		r.Get("/setting/{key}", settingsHandler.Get)
 		r.Group(func(r chi.Router) {
@@ -1164,14 +1191,9 @@ func main() {
 			r.Delete("/customformat/{id}", customFormatHandler.Delete)
 		})
 
-		// Metadata profiles — per-user (owner_user_id from migration 025).
-		// Reads stay available to all authenticated users; the cross-user
-		// Get/Update/Delete IDOR is closed by D1's env-gated handler check.
-		r.Get("/metadataprofile", metadataProfileHandler.List)
-		r.Post("/metadataprofile", metadataProfileHandler.Create)
-		r.Get("/metadataprofile/{id}", metadataProfileHandler.Get)
-		r.Put("/metadataprofile/{id}", metadataProfileHandler.Update)
-		r.Delete("/metadataprofile/{id}", metadataProfileHandler.Delete)
+		// Metadata profiles: reads open, writes admin only (see
+		// registerMetadataProfileRoutes).
+		registerMetadataProfileRoutes(r, metadataProfileHandler)
 
 		// Backups — Restore replaces the live database (staged now, swapped
 		// in by db.ApplyPendingRestore at the next start), Delete removes
@@ -1191,6 +1213,10 @@ func main() {
 
 		// Storage paths, admin-only (see registerStorageRoutes).
 		registerStorageRoutes(r, api.NewStorageHandler(cfg))
+
+		// Foreign key drift report, admin-only and on demand (see
+		// registerDBIntegrityRoutes).
+		registerDBIntegrityRoutes(r, api.NewDBIntegrityHandler(database, cfg.DBPath, backupHandler))
 
 		// Library. The scan status returns server filesystem paths, so it is
 		// admin only (#2361); see registerLibraryScanStatusRoute.
@@ -1259,6 +1285,8 @@ func main() {
 		r.Get("/series", opdsHandler.Series)
 		r.Get("/series/{id}", opdsHandler.OneSeries)
 		r.Get("/recent", opdsHandler.Recent)
+		r.Get("/opensearch.xml", opdsHandler.OpenSearch)
+		r.Get("/search", opdsHandler.Search)
 		r.Get("/book/{id}", opdsHandler.Book)
 		r.Get("/book/{id}/file", opdsHandler.DownloadFile)
 	})
@@ -1308,24 +1336,7 @@ func main() {
 		_, _ = w.Write(baseScript)
 	})
 
-	fileServer := http.FileServer(http.FS(distFS))
-	r.Get("/*", func(w http.ResponseWriter, r *http.Request) {
-		path := r.URL.Path[1:]
-		if path == "" || path == "index.html" {
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
-			_, _ = w.Write(indexHTML)
-			return
-		}
-		if _, err := fs.Stat(distFS, path); err == nil {
-			fileServer.ServeHTTP(w, r)
-			return
-		}
-		// SPA fallback — unknown paths render the app shell.
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
-		_, _ = w.Write(indexHTML)
-	})
+	r.Get("/*", spaHandler(distFS, indexHTML))
 
 	// If BINDERY_URL_BASE is set, mount the entire router under that prefix.
 	// chi.Mount strips the prefix before dispatching so all inner routes and
@@ -1521,6 +1532,8 @@ type dbAuthProvider struct {
 	proxyHeader    string
 	proxyProvision bool
 	proxyCIDRs     []*net.IPNet
+	// revocations is the logout denylist shared with the AuthHandler.
+	revocations *db.SessionRevocations
 }
 
 func (p *dbAuthProvider) Mode() auth.Mode {
@@ -1603,6 +1616,17 @@ func (p *dbAuthProvider) UserRole(ctx context.Context, userID int64) string {
 func (p *dbAuthProvider) UserSessionEpoch(ctx context.Context, userID int64) (int64, error) {
 	return p.users.GetSessionEpoch(ctx, userID)
 }
+
+// SessionRevoked reports whether the token was signed out via /auth/logout.
+// revocations is always set in production (main wires the same instance into
+// the AuthHandler); the nil branch serves route tests that build the provider
+// without a logout handler, where nothing can have been revoked.
+func (p *dbAuthProvider) SessionRevoked(ctx context.Context, tokenHash string) (bool, error) {
+	if p.revocations == nil {
+		return false, nil
+	}
+	return p.revocations.IsRevoked(ctx, tokenHash)
+}
 func (p *dbAuthProvider) UserProvisioner() auth.UserProvisioner {
 	return &dbUserProvisioner{users: p.users}
 }
@@ -1635,17 +1659,28 @@ func (p *dbUserProvisioner) ResolveOrProvisionUser(ctx context.Context, username
 // metric labels — using the raw URL would create unbounded label cardinality
 // because every distinct id becomes a separate time series.
 //
-// Falls back to the URL path before any handler has matched the route, which
-// happens for 404s. Strip query strings — they're already excluded by URL.Path
-// but the comment is here for the reader.
+// When chi matched nothing (an unknown method, or a known method with no route
+// for the path, both answered 405 by chi) it returns the fixed unmatchedRoute,
+// never the raw path. The metrics middleware runs before auth, so a raw path
+// label would let any anonymous client mint a permanent series per request.
+// Unknown GETs still report a template: "/*" for the SPA catch-all and
+// "/api/v1/*" for misses inside the API subrouter. With BINDERY_URL_BASE set,
+// the inner router shares the outer router's route context, so templates
+// carry the prefix and a root level 405 reports the mount pattern (e.g.
+// "/bindery/*") rather than unmatchedRoute; still one fixed value. Unknown
+// methods under a prefix are rejected by the outer router and never reach
+// the metrics middleware at all.
 func routeTemplate(r *http.Request) string {
 	if rc := chi.RouteContext(r.Context()); rc != nil {
 		if pat := rc.RoutePattern(); pat != "" {
 			return pat
 		}
 	}
-	return r.URL.Path
+	return unmatchedRoute
 }
+
+// unmatchedRoute is the route label for requests no chi pattern matched.
+const unmatchedRoute = "unmatched"
 
 // buildTelemetryGatherer returns a telemetry.Gatherer closure that reads the
 // current per-subsystem configuration counts directly from SQLite. Every

@@ -3,6 +3,7 @@ package metrics
 import (
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -102,6 +103,52 @@ func TestSetBuildInfo_PopulatesLabels(t *testing.T) {
 	}
 }
 
+// TestHTTPMiddleware_BoundsMethodLabel verifies an invented request method
+// cannot mint its own series. The middleware runs before auth, so every
+// distinct method string a client sends would otherwise become a permanent
+// counter and histogram series.
+func TestHTTPMiddleware_BoundsMethodLabel(t *testing.T) {
+	mw := HTTPMiddleware(func(_ *http.Request) string { return "/bounded-method-test" })
+	wrapped := mw(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	for i := 0; i < 50; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/bounded-method-test", nil)
+		req.Method = "INVENTED" + strconv.Itoa(i)
+		wrapped.ServeHTTP(httptest.NewRecorder(), req)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/bounded-method-test", nil)
+	req.Method = "get" // methods are case sensitive; lowercase is not GET
+	wrapped.ServeHTTP(httptest.NewRecorder(), req)
+
+	body := scrape(t)
+	if strings.Contains(body, `method="INVENTED`) || strings.Contains(body, `method="get"`) {
+		t.Errorf("raw request method leaked into a label")
+	}
+	want := `bindery_http_requests_total{method="OTHER",route="/bounded-method-test",status="405"} 51`
+	if !strings.Contains(body, want) {
+		t.Errorf("expected %q in metrics", want)
+	}
+}
+
+// TestNormalizeMethod covers the standard set passing through unchanged and
+// everything else collapsing onto OTHER.
+func TestNormalizeMethod(t *testing.T) {
+	for _, m := range []string{
+		http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodPatch,
+		http.MethodDelete, http.MethodOptions, http.MethodConnect, http.MethodTrace,
+	} {
+		if got := normalizeMethod(m); got != m {
+			t.Errorf("normalizeMethod(%q) = %q, want unchanged", m, got)
+		}
+	}
+	for _, m := range []string{"", "PROPFIND", "get", "FOO123"} {
+		if got := normalizeMethod(m); got != otherMethod {
+			t.Errorf("normalizeMethod(%q) = %q, want %q", m, got, otherMethod)
+		}
+	}
+}
+
 func scrape(t *testing.T) string {
 	t.Helper()
 	rec := httptest.NewRecorder()
@@ -110,4 +157,56 @@ func scrape(t *testing.T) string {
 		t.Fatalf("metrics handler status=%d", rec.Code)
 	}
 	return rec.Body.String()
+}
+
+// deadlineRecorder is a ResponseWriter that, like net/http's own, lets a
+// handler move the write deadline and flush.
+type deadlineRecorder struct {
+	*httptest.ResponseRecorder
+	deadline    time.Time
+	deadlineSet bool
+}
+
+func (d *deadlineRecorder) SetWriteDeadline(t time.Time) error {
+	d.deadline, d.deadlineSet = t, true
+	return nil
+}
+
+// The metrics middleware sits between the server and every handler, so a
+// handler that clears the server write deadline (large file downloads do) goes
+// through http.NewResponseController. Without Unwrap the controller stops at
+// the recorder and answers ErrNotSupported, and the download is cut off at
+// the server WriteTimeout.
+func TestHTTPMiddleware_ResponseControllerReachesServerWriter(t *testing.T) {
+	under := &deadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+	var deadlineErr, flushErr error
+	var plainFlusher bool
+	h := HTTPMiddleware(func(*http.Request) string { return "/x" })(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		rc := http.NewResponseController(w)
+		deadlineErr = rc.SetWriteDeadline(time.Time{})
+		_, _ = w.Write([]byte("hello"))
+		flushErr = rc.Flush()
+		// Handlers also flush with a plain assertion.
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+			plainFlusher = true
+		}
+	}))
+	h.ServeHTTP(under, httptest.NewRequest(http.MethodGet, "/x", nil))
+
+	if deadlineErr != nil {
+		t.Fatalf("SetWriteDeadline through the middleware: %v", deadlineErr)
+	}
+	if !under.deadlineSet || !under.deadline.IsZero() {
+		t.Fatalf("underlying writer deadline set=%v value=%v, want set to the zero time", under.deadlineSet, under.deadline)
+	}
+	if flushErr != nil {
+		t.Fatalf("Flush through the middleware: %v", flushErr)
+	}
+	if !plainFlusher {
+		t.Fatal("the middleware writer does not implement http.Flusher")
+	}
+	if !under.Flushed {
+		t.Fatal("underlying writer was not flushed")
+	}
 }

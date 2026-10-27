@@ -27,8 +27,12 @@ import (
 //     indexers use in release names. Apostrophes are deleted rather than split
 //     so "Ender's" meets "Enders". Every other non-alphanumeric run becomes a
 //     separator. Unicode letters survive so CJK/Cyrillic titles still tokenise.
-//     Used by indexer.NormalizeRelease, newznab.SigWords, importer title
-//     matching. Producers and consumers of a title comparison MUST share it.
+//     Used by indexer.NormalizeRelease and importer title matching. Producers
+//     and consumers of a title comparison MUST share it.
+//     The one deliberate variant is FoldForKeyword, used for the keyword side
+//     (newznab.SigWords, indexer.authorTokens): the same fold, but ä/ö/ü stay
+//     as themselves so indexer.keywordPattern knows which digraphs may match
+//     a compact "Muller" and which, like the ue in "Samuel", may not (#3123).
 //
 //  1a. EDITION DEDUP — indexer.CanonicalDedupKey / NormalizeTitleForDedup.
 //     Alphabet (1)'s sibling, and the one place the two deliberately DISAGREE:
@@ -119,6 +123,8 @@ func TransliterateUmlauts(s string) string {
 	return umlautExpander.Replace(s)
 }
 
+var eszettExpander = strings.NewReplacer("ß", "ss")
+
 var umlautExpander = strings.NewReplacer(
 	"ä", "ae",
 	"ö", "oe",
@@ -145,10 +151,42 @@ var umlautExpander = strings.NewReplacer(
 // decomposed while every metadata provider returns composed, so the two forms
 // meet constantly.
 func FoldForTitleMatch(s string) string {
+	return foldTitle(s, true)
+}
+
+// FoldForKeyword is FoldForTitleMatch for the KEYWORD side of a comparison:
+// identical in every respect except that ä, ö and ü are kept as themselves
+// instead of being expanded to ae, oe and ue. ß still expands, since nothing
+// reads ß as optional.
+//
+// The expansion is a one way door. A release name is folded with
+// FoldForTitleMatch, so its "Müller" and "Mueller" both read "mueller", and a
+// compact "Muller" reads "muller". Whether a keyword may be satisfied by the
+// compact form depends on whether its digraph began life as an umlaut, and
+// "michael" and "mueller" cannot be told apart once folded. Keeping the umlaut
+// on the keyword is how that fact survives until the regex is built
+// (indexer.keywordPattern, which turns ü into the optional-e form). A digraph
+// the source typed in ASCII stays ae, oe or ue and is matched literally
+// (#3123: "michael" must not accept "Michal").
+//
+// A keyword from this fold is therefore NOT in the release alphabet, and must
+// not be compared to a release string with Contains or ==. Run it through
+// TransliterateUmlauts first when a plain string comparison is unavoidable.
+func FoldForKeyword(s string) string {
+	return foldTitle(s, false)
+}
+
+// foldTitle is the shared body of FoldForTitleMatch and FoldForKeyword, so the
+// two cannot drift on anything but the one decision between them.
+func foldTitle(s string, expandUmlauts bool) string {
 	s = norm.NFC.String(s)
 	s = strings.ToLower(s)
 	s = apostropheStripper.Replace(s)
-	s = TransliterateUmlauts(s)
+	if expandUmlauts {
+		s = TransliterateUmlauts(s)
+	} else {
+		s = eszettExpander.Replace(s)
+	}
 	mapped := strings.Map(func(r rune) rune {
 		if unicode.IsLetter(r) || unicode.IsNumber(r) {
 			return r

@@ -184,3 +184,53 @@ func TestResolveOIDCRedirectBase_StripsTrailingSlashes(t *testing.T) {
 		t.Fatalf("trailing slash on X-Forwarded-Host should be stripped, got %q", got)
 	}
 }
+
+// #1640: a trusted proxy that forwards a client supplied X-Forwarded-Proto or
+// X-Forwarded-Host (a common nginx footgun) must not let the value shape the
+// OIDC redirect_uri. Anything that is not an http or https scheme plus a bare
+// host[:port] is ignored and the base falls back to the request's own Host.
+func TestResolveOIDCRedirectBase_ForwardedValuesValidated(t *testing.T) {
+	trusted := []*net.IPNet{mustCIDR(t, "10.0.0.0/8")}
+	cases := []struct {
+		name, proto, host, want string
+	}{
+		{"valid https host", "https", "bindery.example.com", "https://bindery.example.com"},
+		{"valid http host", "http", "bindery.example.com", "http://bindery.example.com"},
+		{"scheme is case folded", "HTTPS", "bindery.example.com", "https://bindery.example.com"},
+		{"host with port", "https", "bindery.example.com:8443", "https://bindery.example.com:8443"},
+		{"ipv4 with port", "http", "192.168.1.50:8787", "http://192.168.1.50:8787"},
+		{"bracketed ipv6 with port", "https", "[2001:db8::1]:8443", "https://[2001:db8::1]:8443"},
+		{"single label docker name", "http", "bindery", "http://bindery"},
+		{"trailing slash is stripped", "https", "bindery.example.com/", "https://bindery.example.com"},
+
+		{"javascript scheme", "javascript", "bindery.example.com", "http://internal.cluster.svc"},
+		{"ftp scheme", "ftp", "bindery.example.com", "http://internal.cluster.svc"},
+		{"scheme with separator", "https://", "bindery.example.com", "http://internal.cluster.svc"},
+		{"comma list scheme", "https,http", "bindery.example.com", "http://internal.cluster.svc"},
+		{"host with path", "https", "evil.example/phish", "http://internal.cluster.svc"},
+		{"host with userinfo", "https", "user@evil.example", "http://internal.cluster.svc"},
+		{"host with scheme", "https", "https://evil.example", "http://internal.cluster.svc"},
+		{"host with query", "https", "evil.example?x=1", "http://internal.cluster.svc"},
+		{"host with fragment", "https", "evil.example#x", "http://internal.cluster.svc"},
+		{"host with space", "https", "evil.example evil2.example", "http://internal.cluster.svc"},
+		{"host with backslash", "https", `evil.example\@good.example`, "http://internal.cluster.svc"},
+		{"comma list host", "https", "a.example,b.example", "http://internal.cluster.svc"},
+		{"host with control char", "https", "evil.example\r\nX-Injected: 1", "http://internal.cluster.svc"},
+		{"non numeric port", "https", "bindery.example.com:abc", "http://internal.cluster.svc"},
+		{"port out of range", "https", "bindery.example.com:99999", "http://internal.cluster.svc"},
+		{"empty port", "https", "bindery.example.com:", "http://internal.cluster.svc"},
+		{"only a slash", "https", "/", "http://internal.cluster.svc"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/api/v1/auth/oidc/x/login", nil)
+			r.Host = "internal.cluster.svc"
+			r.RemoteAddr = "10.0.0.5:54321"
+			r.Header.Set("X-Forwarded-Proto", c.proto)
+			r.Header.Set("X-Forwarded-Host", c.host)
+			if got := ResolveOIDCRedirectBase(r, "", trusted); got != c.want {
+				t.Errorf("proto=%q host=%q: base = %q, want %q", c.proto, c.host, got, c.want)
+			}
+		})
+	}
+}

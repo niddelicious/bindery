@@ -1,9 +1,11 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useId } from 'react'
 import { useTranslation } from 'react-i18next'
 import { api, NotificationConfig } from '../../api/client'
 import { inputCls } from './formStyles'
 import Toggle from './Toggle'
-import { dangerLink } from '../../components/buttons'
+import { dangerLink, primaryFill } from '../../components/buttons'
+import { urlInputAttrs } from '../../util/inputAttrs'
+import { errorText } from '../../util/errorText'
 
 // The seven trigger chips, in the order both forms render them, paired with the
 // hint that says what actually sends the event. Wording checked against the
@@ -12,12 +14,12 @@ import { dangerLink } from '../../components/buttons'
 // download client health checks, New book is internal/api/author_discovery.go,
 // and Request is internal/api/requests.go. Upgrade has no sender at all today,
 // and its hint says so rather than describing behaviour Bindery does not have.
-const TRIGGER_HINTS: Array<{ key: string; label: string; labelKey?: string }> = [
-  { key: 'grab', label: 'Grab' },
-  { key: 'import', label: 'Import' },
-  { key: 'failure', label: 'Failure' },
-  { key: 'upgrade', label: 'Upgrade' },
-  { key: 'health', label: 'Health' },
+const TRIGGER_HINTS: Array<{ key: string; label: string; labelKey: string }> = [
+  { key: 'grab', label: 'Grab', labelKey: 'settings.notifications.trigger.grab' },
+  { key: 'import', label: 'Import', labelKey: 'settings.notifications.trigger.import' },
+  { key: 'failure', label: 'Failure', labelKey: 'settings.notifications.trigger.failure' },
+  { key: 'upgrade', label: 'Upgrade', labelKey: 'settings.notifications.trigger.upgrade' },
+  { key: 'health', label: 'Health', labelKey: 'settings.notifications.trigger.health' },
   { key: 'bookAnnounced', label: 'New book', labelKey: 'settings.notifications.onBookAnnouncedToggle' },
   { key: 'requestCreated', label: 'Request', labelKey: 'settings.notifications.requestToggle' },
 ]
@@ -28,10 +30,10 @@ const TRIGGER_HINTS: Array<{ key: string; label: string; labelKey?: string }> = 
 function TriggerHints() {
   const { t } = useTranslation()
   return (
-    <ul className="mt-2 space-y-0.5 text-xs text-slate-500 dark:text-zinc-500" aria-label={t('settings.notifications.triggerHintsLabel')}>
+    <ul className="mt-2 space-y-0.5 text-xs text-fg-muted" aria-label={t('settings.notifications.triggerHintsLabel')}>
       {TRIGGER_HINTS.map(h => (
         <li key={h.key}>
-          <span className="font-medium text-slate-600 dark:text-zinc-400">{h.labelKey ? t(h.labelKey) : h.label}</span>
+          <span className="font-medium text-fg-muted">{t(h.labelKey, h.label)}</span>
           {': '}
           {t(`settings.notifications.eventHints.${h.key}`)}
         </li>
@@ -61,12 +63,12 @@ export default function NotificationsTab() {
     <div>
       <div className="flex flex-wrap gap-2 justify-between items-center mb-4">
         <h3 className="text-lg font-semibold">{t('settings.notifications.heading')}</h3>
-        <button onClick={() => setShowAddNotification(true)} className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 rounded text-xs font-medium">
+        <button onClick={() => setShowAddNotification(true)} className={`px-3 py-1.5 ${primaryFill} rounded text-xs font-medium`}>
           {t('settings.notifications.addButton')}
         </button>
       </div>
       {notifications.length === 0 ? (
-        <p className="text-slate-600 dark:text-zinc-500 text-sm">{t('settings.notifications.empty')}</p>
+        <p className="text-fg-muted text-sm">{t('settings.notifications.empty')}</p>
       ) : (
         <div className="space-y-2">
           {notifications.map(n => (
@@ -83,37 +85,37 @@ export default function NotificationsTab() {
                       title={n.enabled ? t('common.disable') : t('common.enable')}
                     />
                     <div className="min-w-0">
-                      <h4 className={`font-medium text-sm ${!n.enabled ? 'text-slate-600 dark:text-zinc-500' : ''}`}>{n.name}</h4>
-                      <p className="text-xs text-slate-600 dark:text-zinc-500 truncate mt-0.5">{n.url}</p>
+                      <h4 className={`font-medium text-sm ${!n.enabled ? 'text-fg-muted' : ''}`}>{n.name}</h4>
+                      <p className="text-xs text-fg-muted truncate mt-0.5">{n.url}</p>
                       <div className="flex flex-wrap gap-1 mt-2">
-                        {n.onGrab && <span className="text-[10px] px-1.5 py-0.5 bg-slate-200 dark:bg-zinc-800 text-slate-600 dark:text-zinc-400 rounded">{t('settings.notifications.onGrab')}</span>}
-                        {n.onImport && <span className="text-[10px] px-1.5 py-0.5 bg-slate-200 dark:bg-zinc-800 text-slate-600 dark:text-zinc-400 rounded">{t('settings.notifications.onImport')}</span>}
-                        {n.onUpgrade && <span className="text-[10px] px-1.5 py-0.5 bg-slate-200 dark:bg-zinc-800 text-slate-600 dark:text-zinc-400 rounded">{t('settings.notifications.onUpgrade')}</span>}
-                        {n.onFailure && <span className="text-[10px] px-1.5 py-0.5 bg-slate-200 dark:bg-zinc-800 text-slate-600 dark:text-zinc-400 rounded">{t('settings.notifications.onFailure')}</span>}
-                        {n.onHealth && <span className="text-[10px] px-1.5 py-0.5 bg-slate-200 dark:bg-zinc-800 text-slate-600 dark:text-zinc-400 rounded">{t('settings.notifications.onHealth')}</span>}
-                        {n.onBookAnnounced && <span className="text-[10px] px-1.5 py-0.5 bg-slate-200 dark:bg-zinc-800 text-slate-600 dark:text-zinc-400 rounded">{t('settings.notifications.onBookAnnounced')}</span>}
-                        {n.onRequestCreated && <span className="text-[10px] px-1.5 py-0.5 bg-slate-200 dark:bg-zinc-800 text-slate-600 dark:text-zinc-400 rounded">{t('settings.notifications.onRequestCreated')}</span>}
+                        {n.onGrab && <span className="text-[10px] px-1.5 py-0.5 bg-slate-200 dark:bg-zinc-800 text-fg-muted rounded">{t('settings.notifications.onGrab')}</span>}
+                        {n.onImport && <span className="text-[10px] px-1.5 py-0.5 bg-slate-200 dark:bg-zinc-800 text-fg-muted rounded">{t('settings.notifications.onImport')}</span>}
+                        {n.onUpgrade && <span className="text-[10px] px-1.5 py-0.5 bg-slate-200 dark:bg-zinc-800 text-fg-muted rounded">{t('settings.notifications.onUpgrade')}</span>}
+                        {n.onFailure && <span className="text-[10px] px-1.5 py-0.5 bg-slate-200 dark:bg-zinc-800 text-fg-muted rounded">{t('settings.notifications.onFailure')}</span>}
+                        {n.onHealth && <span className="text-[10px] px-1.5 py-0.5 bg-slate-200 dark:bg-zinc-800 text-fg-muted rounded">{t('settings.notifications.onHealth')}</span>}
+                        {n.onBookAnnounced && <span className="text-[10px] px-1.5 py-0.5 bg-slate-200 dark:bg-zinc-800 text-fg-muted rounded">{t('settings.notifications.onBookAnnounced')}</span>}
+                        {n.onRequestCreated && <span className="text-[10px] px-1.5 py-0.5 bg-slate-200 dark:bg-zinc-800 text-fg-muted rounded">{t('settings.notifications.onRequestCreated')}</span>}
                       </div>
                     </div>
                   </div>
                   <div className="flex items-center gap-3 flex-shrink-0">
-                    <button onClick={() => setEditingNotification(editingNotification === n.id ? null : n.id)} className="text-xs text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white">{t('common.edit')}</button>
+                    <button onClick={() => setEditingNotification(editingNotification === n.id ? null : n.id)} className="text-xs text-fg-muted hover:text-slate-900 dark:hover:text-white">{t('common.edit')}</button>
                     <button
                       onClick={async () => {
                         try {
                           await api.testNotification(n.id)
                           setNotificationTestResult(prev => ({ ...prev, [n.id]: { ok: true, msg: t('settings.notifications.testSent') } }))
                         } catch (err: unknown) {
-                          setNotificationTestResult(prev => ({ ...prev, [n.id]: { ok: false, msg: t('common.connFail', { error: err instanceof Error ? err.message : 'Unknown error' }) } }))
+                          setNotificationTestResult(prev => ({ ...prev, [n.id]: { ok: false, msg: t('common.connFail', { error: errorText(err, t('common.unknownError', 'Unknown error')) }) } }))
                         }
                       }}
-                      className="text-xs text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white"
+                      className="text-xs text-fg-muted hover:text-slate-900 dark:hover:text-white"
                     >
                       {t('common.test')}
                     </button>
                     {confirmDeleteNotification === n.id ? (
                       <span className="flex items-center gap-1.5">
-                        <span className="text-xs text-slate-500 dark:text-zinc-500">{t('common.delete')}?</span>
+                        <span className="text-xs text-fg-muted">{t('common.delete')}?</span>
                         <button
                           onClick={async () => {
                             await api.deleteNotification(n.id)
@@ -122,7 +124,7 @@ export default function NotificationsTab() {
                           }}
                           className={`text-xs font-medium ${dangerLink}`}
                         >{t('common.yes')}</button>
-                        <button onClick={() => setConfirmDeleteNotification(null)} className="text-xs text-slate-500 dark:text-zinc-500 hover:text-slate-700 dark:hover:text-zinc-300">{t('common.no')}</button>
+                        <button onClick={() => setConfirmDeleteNotification(null)} className="text-xs text-fg-muted hover:text-slate-700 dark:hover:text-zinc-300">{t('common.no')}</button>
                       </span>
                     ) : (
                       <button onClick={() => setConfirmDeleteNotification(n.id)} className={`text-xs ${dangerLink}`}>
@@ -160,6 +162,7 @@ export default function NotificationsTab() {
 }
 
 function EditNotificationForm({ notification, onClose, onSaved }: { notification: NotificationConfig; onClose: () => void; onSaved: (n: NotificationConfig) => void }) {
+  const fid = useId()
   const { t } = useTranslation()
   const [name, setName] = useState(notification.name)
   const [url, setUrl] = useState(notification.url)
@@ -186,7 +189,7 @@ function EditNotificationForm({ notification, onClose, onSaved }: { notification
     setSaveError('')
     const headersJSON = normalizeHeadersJSON(headers)
     if (headersJSON === null) {
-      setSaveError('Headers must be valid JSON object with string values, or empty.')
+      setSaveError(t('settings.notifications.headersInvalidEdit', 'Headers must be valid JSON object with string values, or empty.'))
       return
     }
     setSaving(true)
@@ -194,7 +197,7 @@ function EditNotificationForm({ notification, onClose, onSaved }: { notification
       const updated = await api.updateNotification(notification.id, { ...notification, name, url, topic, method, headers: headersJSON, onGrab, onImport, onFailure, onUpgrade, onHealth, onBookAnnounced, onRequestCreated })
       onSaved(updated)
     } catch (err: unknown) {
-      setSaveError(t('settings.notifications.saveFailed', { error: err instanceof Error ? err.message : 'Unknown error' }))
+      setSaveError(t('settings.notifications.saveFailed', { error: errorText(err, t('common.unknownError', 'Unknown error')) }))
     } finally {
       setSaving(false)
     }
@@ -203,45 +206,45 @@ function EditNotificationForm({ notification, onClose, onSaved }: { notification
   const toggleCls = (active: boolean) =>
     `px-3 py-1.5 rounded text-xs font-medium border transition-colors cursor-pointer select-none ${
       active
-        ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-400'
-        : 'bg-slate-200 dark:bg-zinc-800 border-slate-300 dark:border-zinc-700 text-slate-600 dark:text-zinc-400'
+        ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-800 dark:text-emerald-400'
+        : 'bg-slate-200 dark:bg-zinc-800 border-slate-300 dark:border-zinc-700 text-fg-muted'
     }`
 
   return (
     <div className="mt-1 p-4 border border-slate-300 dark:border-zinc-700 rounded-lg bg-slate-200/50 dark:bg-zinc-800/50 space-y-4">
       <div className="grid grid-cols-2 gap-3">
-        <input value={name} onChange={e => setName(e.target.value)} placeholder="Name" className={inputCls} />
+        <input value={name} onChange={e => setName(e.target.value)} placeholder={t('settings.notifications.name', 'Name')} className={inputCls} />
         <select value={method} onChange={e => setMethod(e.target.value)} className={inputCls}>
           <option value="POST">POST</option>
           <option value="PUT">PUT</option>
           <option value="GET">GET</option>
         </select>
       </div>
-      <input value={url} onChange={e => setUrl(e.target.value)} placeholder="Webhook URL" className={inputCls} />
+      <input {...urlInputAttrs} value={url} onChange={e => setUrl(e.target.value)} placeholder={t('settings.notifications.webhookUrl', 'Webhook URL')} className={inputCls} />
       <div>
-        <label className="block text-xs text-slate-600 dark:text-zinc-400 mb-1">ntfy topic (optional)</label>
-        <input value={topic} onChange={e => setTopic(e.target.value)} placeholder="my-topic" className={inputCls} />
-        <p className="text-xs text-slate-500 dark:text-zinc-500 mt-1">For ntfy: set the topic here and point the URL at the ntfy server root (e.g. https://ntfy.sh). Bindery then posts a JSON body ntfy renders natively, instead of printing raw JSON.</p>
+        <label htmlFor={`${fid}-1`} className="block text-xs text-fg-muted mb-1">{t('settings.notifications.topicLabel', 'ntfy topic (optional)')}</label>
+        <input id={`${fid}-1`} value={topic} onChange={e => setTopic(e.target.value)} placeholder="my-topic" className={inputCls} />
+        <p className="text-xs text-fg-muted mt-1">{t('settings.notifications.topicHint', 'For ntfy: set the topic here and point the URL at the ntfy server root (e.g. https://ntfy.sh). Bindery then posts a JSON body ntfy renders natively, instead of printing raw JSON.')}</p>
       </div>
       <div>
-        <label className="block text-xs text-slate-600 dark:text-zinc-400 mb-1">Custom headers (JSON, optional)</label>
-        <textarea
+        <label htmlFor={`${fid}-2`} className="block text-xs text-fg-muted mb-1">{t('settings.notifications.headersLabel', 'Custom headers (JSON, optional)')}</label>
+        <textarea id={`${fid}-2`}
           value={headers}
           onChange={e => setHeaders(e.target.value)}
           placeholder={'{"Authorization": "Bearer YOUR_NTFY_TOKEN"}'}
           rows={3}
           className={`${inputCls} font-mono text-xs`}
         />
-        <p className="text-xs text-slate-500 dark:text-zinc-500 mt-1">For ntfy auth, Discord routing, or any custom header. Leave blank to send none.</p>
+        <p className="text-xs text-fg-muted mt-1">{t('settings.notifications.headersHint', 'For ntfy auth, Discord routing, or any custom header. Leave blank to send none.')}</p>
       </div>
       <div>
-        <p className="text-xs text-slate-600 dark:text-zinc-400 mb-2">Trigger on:</p>
+        <p className="text-xs text-fg-muted mb-2">{t('settings.notifications.triggerOn', 'Trigger on:')}</p>
         <div className="flex flex-wrap gap-2">
-          <button type="button" onClick={() => setOnGrab(!onGrab)} title={triggerTitle(t, 'grab')} className={toggleCls(onGrab)}>Grab</button>
-          <button type="button" onClick={() => setOnImport(!onImport)} title={triggerTitle(t, 'import')} className={toggleCls(onImport)}>Import</button>
-          <button type="button" onClick={() => setOnFailure(!onFailure)} title={triggerTitle(t, 'failure')} className={toggleCls(onFailure)}>Failure</button>
-          <button type="button" onClick={() => setOnUpgrade(!onUpgrade)} title={triggerTitle(t, 'upgrade')} className={toggleCls(onUpgrade)}>Upgrade</button>
-          <button type="button" onClick={() => setOnHealth(!onHealth)} title={triggerTitle(t, 'health')} className={toggleCls(onHealth)}>Health</button>
+          <button type="button" onClick={() => setOnGrab(!onGrab)} title={triggerTitle(t, 'grab')} className={toggleCls(onGrab)}>{t('settings.notifications.trigger.grab', 'Grab')}</button>
+          <button type="button" onClick={() => setOnImport(!onImport)} title={triggerTitle(t, 'import')} className={toggleCls(onImport)}>{t('settings.notifications.trigger.import', 'Import')}</button>
+          <button type="button" onClick={() => setOnFailure(!onFailure)} title={triggerTitle(t, 'failure')} className={toggleCls(onFailure)}>{t('settings.notifications.trigger.failure', 'Failure')}</button>
+          <button type="button" onClick={() => setOnUpgrade(!onUpgrade)} title={triggerTitle(t, 'upgrade')} className={toggleCls(onUpgrade)}>{t('settings.notifications.trigger.upgrade', 'Upgrade')}</button>
+          <button type="button" onClick={() => setOnHealth(!onHealth)} title={triggerTitle(t, 'health')} className={toggleCls(onHealth)}>{t('settings.notifications.trigger.health', 'Health')}</button>
           <button type="button" aria-pressed={onBookAnnounced} onClick={() => setOnBookAnnounced(!onBookAnnounced)} title={triggerTitle(t, 'bookAnnounced')} className={toggleCls(onBookAnnounced)}>{t('settings.notifications.onBookAnnouncedToggle')}</button>
           <button type="button" aria-pressed={onRequestCreated} onClick={() => setOnRequestCreated(!onRequestCreated)} title={triggerTitle(t, 'requestCreated')} className={toggleCls(onRequestCreated)}>{t('settings.notifications.requestToggle')}</button>
         </div>
@@ -253,14 +256,15 @@ function EditNotificationForm({ notification, onClose, onSaved }: { notification
         </div>
       )}
       <div className="flex gap-2 justify-end">
-        <button onClick={onClose} className="px-3 py-1.5 text-sm text-slate-600 dark:text-zinc-400">Cancel</button>
-        <button onClick={submit} disabled={saving} className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 disabled:cursor-not-allowed rounded text-sm font-medium">Save</button>
+        <button onClick={onClose} className="px-3 py-1.5 text-sm text-fg-muted">{t('common.cancel', 'Cancel')}</button>
+        <button onClick={submit} disabled={saving} className={`px-3 py-1.5 ${primaryFill} disabled:opacity-60 disabled:cursor-not-allowed rounded text-sm font-medium`}>{t('common.save', 'Save')}</button>
       </div>
     </div>
   )
 }
 
 function AddNotificationForm({ onClose, onAdded }: { onClose: () => void; onAdded: (n: NotificationConfig) => void }) {
+  const fid = useId()
   const { t } = useTranslation()
   const [name, setName] = useState('')
   const [url, setUrl] = useState('')
@@ -281,7 +285,7 @@ function AddNotificationForm({ onClose, onAdded }: { onClose: () => void; onAdde
     setSaveError('')
     const headersJSON = normalizeHeadersJSON(headers)
     if (headersJSON === null) {
-      setSaveError('Headers must be valid JSON or empty.')
+      setSaveError(t('settings.notifications.headersInvalid', 'Headers must be valid JSON or empty.'))
       return
     }
     setSaving(true)
@@ -294,7 +298,7 @@ function AddNotificationForm({ onClose, onAdded }: { onClose: () => void; onAdde
       })
       onAdded(n)
     } catch (err: unknown) {
-      setSaveError(t('settings.notifications.saveFailed', { error: err instanceof Error ? err.message : 'Unknown error' }))
+      setSaveError(t('settings.notifications.saveFailed', { error: errorText(err, t('common.unknownError', 'Unknown error')) }))
     } finally {
       setSaving(false)
     }
@@ -303,45 +307,45 @@ function AddNotificationForm({ onClose, onAdded }: { onClose: () => void; onAdde
   const toggleCls = (active: boolean) =>
     `px-3 py-1.5 rounded text-xs font-medium border transition-colors cursor-pointer select-none ${
       active
-        ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-400'
-        : 'bg-slate-200 dark:bg-zinc-800 border-slate-300 dark:border-zinc-700 text-slate-600 dark:text-zinc-400'
+        ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-800 dark:text-emerald-400'
+        : 'bg-slate-200 dark:bg-zinc-800 border-slate-300 dark:border-zinc-700 text-fg-muted'
     }`
 
   return (
     <div className="mt-4 p-4 border border-slate-300 dark:border-zinc-700 rounded-lg bg-slate-200/50 dark:bg-zinc-800/50 space-y-4">
       <div className="grid grid-cols-2 gap-3">
-        <input value={name} onChange={e => setName(e.target.value)} placeholder="Name" className={inputCls} />
+        <input value={name} onChange={e => setName(e.target.value)} placeholder={t('settings.notifications.name', 'Name')} className={inputCls} />
         <select value={method} onChange={e => setMethod(e.target.value)} className={inputCls}>
           <option value="POST">POST</option>
           <option value="PUT">PUT</option>
           <option value="GET">GET</option>
         </select>
       </div>
-      <input value={url} onChange={e => setUrl(e.target.value)} placeholder="Webhook URL" className={inputCls} />
+      <input {...urlInputAttrs} value={url} onChange={e => setUrl(e.target.value)} placeholder={t('settings.notifications.webhookUrl', 'Webhook URL')} className={inputCls} />
       <div>
-        <label className="block text-xs text-slate-600 dark:text-zinc-400 mb-1">ntfy topic (optional)</label>
-        <input value={topic} onChange={e => setTopic(e.target.value)} placeholder="my-topic" className={inputCls} />
-        <p className="text-xs text-slate-500 dark:text-zinc-500 mt-1">For ntfy: set the topic here and point the URL at the ntfy server root (e.g. https://ntfy.sh). Bindery then posts a JSON body ntfy renders natively, instead of printing raw JSON.</p>
+        <label htmlFor={`${fid}-1`} className="block text-xs text-fg-muted mb-1">{t('settings.notifications.topicLabel', 'ntfy topic (optional)')}</label>
+        <input id={`${fid}-1`} value={topic} onChange={e => setTopic(e.target.value)} placeholder="my-topic" className={inputCls} />
+        <p className="text-xs text-fg-muted mt-1">{t('settings.notifications.topicHint', 'For ntfy: set the topic here and point the URL at the ntfy server root (e.g. https://ntfy.sh). Bindery then posts a JSON body ntfy renders natively, instead of printing raw JSON.')}</p>
       </div>
       <div>
-        <label className="block text-xs text-slate-600 dark:text-zinc-400 mb-1">Custom headers (JSON, optional)</label>
-        <textarea
+        <label htmlFor={`${fid}-2`} className="block text-xs text-fg-muted mb-1">{t('settings.notifications.headersLabel', 'Custom headers (JSON, optional)')}</label>
+        <textarea id={`${fid}-2`}
           value={headers}
           onChange={e => setHeaders(e.target.value)}
           placeholder={'{"Authorization": "Bearer YOUR_NTFY_TOKEN"}'}
           rows={3}
           className={`${inputCls} font-mono text-xs`}
         />
-        <p className="text-xs text-slate-500 dark:text-zinc-500 mt-1">For ntfy auth, Discord routing, or any custom header. Leave blank to send none.</p>
+        <p className="text-xs text-fg-muted mt-1">{t('settings.notifications.headersHint', 'For ntfy auth, Discord routing, or any custom header. Leave blank to send none.')}</p>
       </div>
       <div>
-        <p className="text-xs text-slate-600 dark:text-zinc-400 mb-2">Trigger on:</p>
+        <p className="text-xs text-fg-muted mb-2">{t('settings.notifications.triggerOn', 'Trigger on:')}</p>
         <div className="flex flex-wrap gap-2">
-          <button type="button" onClick={() => setOnGrab(!onGrab)} title={triggerTitle(t, 'grab')} className={toggleCls(onGrab)}>Grab</button>
-          <button type="button" onClick={() => setOnImport(!onImport)} title={triggerTitle(t, 'import')} className={toggleCls(onImport)}>Import</button>
-          <button type="button" onClick={() => setOnFailure(!onFailure)} title={triggerTitle(t, 'failure')} className={toggleCls(onFailure)}>Failure</button>
-          <button type="button" onClick={() => setOnUpgrade(!onUpgrade)} title={triggerTitle(t, 'upgrade')} className={toggleCls(onUpgrade)}>Upgrade</button>
-          <button type="button" onClick={() => setOnHealth(!onHealth)} title={triggerTitle(t, 'health')} className={toggleCls(onHealth)}>Health</button>
+          <button type="button" onClick={() => setOnGrab(!onGrab)} title={triggerTitle(t, 'grab')} className={toggleCls(onGrab)}>{t('settings.notifications.trigger.grab', 'Grab')}</button>
+          <button type="button" onClick={() => setOnImport(!onImport)} title={triggerTitle(t, 'import')} className={toggleCls(onImport)}>{t('settings.notifications.trigger.import', 'Import')}</button>
+          <button type="button" onClick={() => setOnFailure(!onFailure)} title={triggerTitle(t, 'failure')} className={toggleCls(onFailure)}>{t('settings.notifications.trigger.failure', 'Failure')}</button>
+          <button type="button" onClick={() => setOnUpgrade(!onUpgrade)} title={triggerTitle(t, 'upgrade')} className={toggleCls(onUpgrade)}>{t('settings.notifications.trigger.upgrade', 'Upgrade')}</button>
+          <button type="button" onClick={() => setOnHealth(!onHealth)} title={triggerTitle(t, 'health')} className={toggleCls(onHealth)}>{t('settings.notifications.trigger.health', 'Health')}</button>
           <button type="button" aria-pressed={onBookAnnounced} onClick={() => setOnBookAnnounced(!onBookAnnounced)} title={triggerTitle(t, 'bookAnnounced')} className={toggleCls(onBookAnnounced)}>{t('settings.notifications.onBookAnnouncedToggle')}</button>
           <button type="button" aria-pressed={onRequestCreated} onClick={() => setOnRequestCreated(!onRequestCreated)} title={triggerTitle(t, 'requestCreated')} className={toggleCls(onRequestCreated)}>{t('settings.notifications.requestToggle')}</button>
         </div>
@@ -353,8 +357,8 @@ function AddNotificationForm({ onClose, onAdded }: { onClose: () => void; onAdde
         </div>
       )}
       <div className="flex gap-2 justify-end">
-        <button onClick={onClose} className="px-3 py-1.5 text-sm text-slate-600 dark:text-zinc-400">Cancel</button>
-        <button onClick={submit} disabled={saving} className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 disabled:cursor-not-allowed rounded text-sm font-medium">Save</button>
+        <button onClick={onClose} className="px-3 py-1.5 text-sm text-fg-muted">{t('common.cancel', 'Cancel')}</button>
+        <button onClick={submit} disabled={saving} className={`px-3 py-1.5 ${primaryFill} disabled:opacity-60 disabled:cursor-not-allowed rounded text-sm font-medium`}>{t('common.save', 'Save')}</button>
       </div>
     </div>
   )

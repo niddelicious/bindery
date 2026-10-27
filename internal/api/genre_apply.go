@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"strconv"
 	"strings"
@@ -60,7 +59,11 @@ func (h *AuthorHandler) ApplyGenres(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	author, err := h.authors.GetByID(r.Context(), id)
-	if err != nil || author == nil {
+	if err != nil {
+		writeServerError(w, r, err)
+		return
+	}
+	if author == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "author not found"})
 		return
 	}
@@ -70,8 +73,7 @@ func (h *AuthorHandler) ApplyGenres(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req genreApplyRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	books, err := h.books.ListByAuthor(r.Context(), author.ID)
@@ -96,13 +98,16 @@ func (h *SeriesHandler) ApplyGenres(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	series, err := h.series.GetByID(r.Context(), id)
-	if err != nil || series == nil {
+	if err != nil {
+		writeServerError(w, r, err)
+		return
+	}
+	if series == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "series not found"})
 		return
 	}
 	var req genreApplyRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	books, err := h.series.ListBooksInSeries(r.Context(), series.ID)
@@ -138,7 +143,11 @@ func (h *SeriesHandler) ClearGenres(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	series, err := h.series.GetByID(r.Context(), id)
-	if err != nil || series == nil {
+	if err != nil {
+		writeServerError(w, r, err)
+		return
+	}
+	if series == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "series not found"})
 		return
 	}

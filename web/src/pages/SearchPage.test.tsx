@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { MemoryRouter } from 'react-router'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { MemoryRouter, useNavigate } from 'react-router'
 import SearchPage from './SearchPage'
 import { ApiError, api } from '../api/client'
 import type { Download, SearchResult } from '../api/client'
@@ -106,7 +106,7 @@ describe('SearchPage no-download-client nudge', () => {
   it('shows the contextual setup nudge when a grab fails with the no-client error', async () => {
     const grabButton = await searchAndGetGrabButton()
     vi.mocked(api.grab).mockRejectedValue(
-      new ApiError(400, { error: 'no enabled usenet download client configured — add a download client' }, 'Bad Request'),
+      new ApiError(400, { error: 'no enabled usenet download client configured — add a download client', code: 'no_download_client' }, 'Bad Request'),
     )
 
     fireEvent.click(grabButton)
@@ -195,5 +195,112 @@ describe('SearchPage grab forwards mediaType', () => {
     await waitFor(() => expect(api.grab).toHaveBeenCalledWith(
       expect.objectContaining({ guid: 'audio-guid', mediaType: 'audiobook' }),
     ))
+  })
+})
+// #2289: a release Bindery already imported is refused with forceAvailable,
+// and the page offers to grab it anyway instead of leaving the user stuck.
+describe('SearchPage forced re-grab (#2289)', () => {
+  const refusal = () => new ApiError(
+    409,
+    { error: 'already grabbed: this release has already been imported; grab it anyway to download it again', forceAvailable: true },
+    'Conflict',
+  )
+
+  // A queued once value a test did not consume must not leak into the next.
+  beforeEach(() => {
+    vi.mocked(api.grab).mockReset()
+  })
+
+  it('asks, and grabs again with force when the user confirms', async () => {
+    const grabButton = await searchAndGetGrabButton()
+    vi.mocked(api.grab)
+      .mockRejectedValueOnce(refusal())
+      .mockResolvedValueOnce(makeDownload())
+
+    fireEvent.click(grabButton)
+
+    expect(await screen.findByText(en.search.forceTitle)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: en.search.forceConfirm }))
+
+    await waitFor(() => expect(api.grab).toHaveBeenCalledTimes(2))
+    expect(vi.mocked(api.grab).mock.calls[0][0].force).toBeUndefined()
+    expect(vi.mocked(api.grab).mock.calls[1][0]).toMatchObject({ guid: 'g1', force: true })
+    expect(await screen.findByText(en.search.grabbed)).toBeInTheDocument()
+  })
+
+  it('does not grab again when the user cancels', async () => {
+    const grabButton = await searchAndGetGrabButton()
+    vi.mocked(api.grab).mockRejectedValueOnce(refusal())
+
+    fireEvent.click(grabButton)
+
+    expect(await screen.findByText(en.search.forceTitle)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: en.common.cancel }))
+
+    await waitFor(() => expect(screen.queryByText(en.search.forceTitle)).not.toBeInTheDocument())
+    expect(api.grab).toHaveBeenCalledTimes(1)
+  })
+
+  it('shows a refusal without forceAvailable as an error and offers nothing', async () => {
+    const grabButton = await searchAndGetGrabButton()
+    vi.mocked(api.grab).mockRejectedValueOnce(new ApiError(
+      409,
+      { error: 'already grabbed: it is already in the queue (downloading), see the Queue page', forceAvailable: false },
+      'Conflict',
+    ))
+
+    fireEvent.click(grabButton)
+
+    expect(await screen.findByText(/already in the queue/)).toBeInTheDocument()
+    expect(screen.queryByText(en.search.forceTitle)).not.toBeInTheDocument()
+    expect(api.grab).toHaveBeenCalledTimes(1)
+  })
+})
+
+// The header's "Search indexers for …" row lands here with ?q=.
+describe('SearchPage ?q=', () => {
+  beforeEach(() => { vi.mocked(api.searchIndexers).mockReset() })
+
+  it('runs the query it arrives with', async () => {
+    vi.mocked(api.searchIndexers).mockResolvedValue([makeResult({ guid: 'a', title: 'Dune release' })])
+    render(<MemoryRouter initialEntries={['/search?q=dune']}><SearchPage /></MemoryRouter>)
+    expect(await screen.findByText('Dune release')).toBeInTheDocument()
+    expect(api.searchIndexers).toHaveBeenCalledTimes(1)
+    expect(api.searchIndexers).toHaveBeenCalledWith('dune')
+    expect(screen.getByDisplayValue('dune')).toBeInTheDocument()
+  })
+
+  it('runs a new header query while the page is already open', async () => {
+    vi.mocked(api.searchIndexers)
+      .mockResolvedValueOnce([makeResult({ guid: 'a', title: 'Dune release' })])
+      .mockResolvedValueOnce([makeResult({ guid: 'b', title: 'Emma release' })])
+    // Stands in for the header: same route, new ?q=, page stays mounted.
+    function HeaderSearch() {
+      const navigate = useNavigate()
+      return <button type="button" onClick={() => navigate('/search?q=emma')}>header</button>
+    }
+    render(<MemoryRouter initialEntries={['/search?q=dune']}><HeaderSearch /><SearchPage /></MemoryRouter>)
+    await screen.findByText('Dune release')
+    fireEvent.click(screen.getByRole('button', { name: 'header' }))
+    expect(await screen.findByText('Emma release')).toBeInTheDocument()
+    expect(screen.queryByText('Dune release')).toBeNull()
+    expect(api.searchIndexers).toHaveBeenLastCalledWith('emma')
+  })
+
+  it('shows the latest query when an earlier, slower search answers last', async () => {
+    let answerDune: (r: SearchResult[]) => void = () => {}
+    vi.mocked(api.searchIndexers)
+      .mockImplementationOnce(() => new Promise(r => { answerDune = r }))
+      .mockResolvedValueOnce([makeResult({ guid: 'b', title: 'Emma release' })])
+    function HeaderSearch() {
+      const navigate = useNavigate()
+      return <button type="button" onClick={() => navigate('/search?q=emma')}>header</button>
+    }
+    render(<MemoryRouter initialEntries={['/search?q=dune']}><HeaderSearch /><SearchPage /></MemoryRouter>)
+    fireEvent.click(screen.getByRole('button', { name: 'header' }))
+    expect(await screen.findByText('Emma release')).toBeInTheDocument()
+    await act(async () => { answerDune([makeResult({ guid: 'a', title: 'Dune release' })]) })
+    expect(screen.queryByText('Dune release')).toBeNull()
+    expect(screen.getByText('Emma release')).toBeInTheDocument()
   })
 })

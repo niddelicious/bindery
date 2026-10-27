@@ -102,6 +102,20 @@ func TestArticleKey(t *testing.T) {
 		{"single-article-survives", "A", "a"},
 		{"single-article-die", "Die", "die"},
 		{"internal-untouched", "The Eye of the World", "eyeoftheworld"},
+		// The library filing form puts the article after a comma (#1691).
+		{"filing-form-a", "Trace of Death, A", "traceofdeath"},
+		{"filing-form-the", "Martian, The", "martian"},
+		{"filing-form-german", "Name des Windes, Der", "namedeswindes"},
+		// The tail is read through the title fold, so punctuation around the
+		// article does not hide it. The shared rule in textutil (#3122) must not
+		// narrow this.
+		{"filing-form-bang", "Martian, The!", "martian"},
+		{"filing-form-paren", "Martian, The)", "martian"},
+		{"filing-form-quoted", "Martian, \"The\"", "martian"},
+		{"filing-form-accent", "Aleph, Él", "aleph"},
+		{"comma-not-article", "Love, Actually", "loveactually"},
+		{"comma-phrase-kept", "Me, Myself and I", "memyselfandi"},
+		{"comma-only-article-survives", ", A", "a"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -294,6 +308,25 @@ func TestScanGrouping(t *testing.T) {
 	}
 	if !rulesContain(dune.Rules, RuleAlnumEqual) {
 		t.Errorf("dune group rules = %v, want alnum-equal", dune.Rules)
+	}
+}
+
+// TestScanGroupsFilingFormTitles is #1691's comma inverted pair: one source
+// files the title as "Trace of Death, A", another writes "A Trace of Death",
+// and the duplicate review must offer them as one group.
+func TestScanGroupsFilingFormTitles(t *testing.T) {
+	books := []models.Book{book("A Trace of Death"), book("Trace of Death, A"), book("The Martian"), book("Martian, The")}
+	for i := range books {
+		books[i].ID = int64(i + 1)
+	}
+	groups := Scan(books, nil)
+	if len(groups) != 2 {
+		t.Fatalf("Scan = %d groups, want 2 (each title with its filing form)", len(groups))
+	}
+	for _, g := range groups {
+		if len(g.Members) != 2 || !rulesContain(g.Rules, RuleArticleStrip) {
+			t.Errorf("group %q = %d members, rules %v; want a pair on the article rule", g.Key, len(g.Members), g.Rules)
+		}
 	}
 }
 
@@ -581,10 +614,74 @@ func TestScanScale(t *testing.T) {
 	groups := Scan(books, nil)
 	elapsed := time.Since(start)
 
-	if elapsed > 100*time.Millisecond {
-		t.Errorf("Scan(500 books) took %s, budget 100ms", elapsed)
+	// The race detector slows Scan several fold, so the budget scales with it;
+	// a fixed 100ms failed on a shared CI runner under -race.
+	budget := 100 * time.Millisecond
+	if raceEnabled {
+		budget *= 10
+	}
+	if elapsed > budget {
+		t.Errorf("Scan(500 books) took %s, budget %s", elapsed, budget)
 	}
 	if len(groups) != 2 {
 		t.Fatalf("Scan = %d groups, want 2", len(groups))
+	}
+}
+
+// TestScanBundleRowDoesNotBridgeBooks pins #3469: a bundle row whose segments
+// are two different books must not join them into one group.
+func TestScanBundleRowDoesNotBridgeBooks(t *testing.T) {
+	titles := func(g Group) []string {
+		var out []string
+		for _, m := range g.Members {
+			out = append(out, m.Title)
+		}
+		return out
+	}
+	cases := []struct {
+		name  string
+		books []string
+		want  [][]string
+	}{
+		{"carrie christine", []string{"Carrie", "Christine", "Carrie; Christine"}, nil},
+		{"chamber rainmaker bare", []string{"Chamber", "The Rainmaker", "Chamber; The Rainmaker"}, nil},
+		{"chamber rainmaker", []string{"The Chamber", "The Rainmaker", "The Chamber; The Rainmaker"}, nil},
+		{"real duplicates stay grouped",
+			[]string{"Carrie", "Carrie.", "Christine", "Christine!", "Carrie; Christine"},
+			[][]string{{"Carrie", "Carrie."}, {"Christine", "Christine!"}}},
+		{"colon subtitle stays one group", []string{"Mistborn", "The Final Empire", "Mistborn: The Final Empire"},
+			[][]string{{"Mistborn", "The Final Empire", "Mistborn: The Final Empire"}}},
+		{"colon subtitle with series title", []string{"Dragonlance Chronicles", "Dragons of Autumn Twilight", "Dragonlance Chronicles: Dragons of Autumn Twilight"},
+			[][]string{{"Dragonlance Chronicles", "Dragons of Autumn Twilight", "Dragonlance Chronicles: Dragons of Autumn Twilight"}}},
+		{"bracket series stays one group", []string{"Hogfather", "Discworld 20", "Hogfather (Discworld, #20)"},
+			[][]string{{"Hogfather", "Discworld 20", "Hogfather (Discworld, #20)"}}},
+		{"three part bundle is not a group", []string{"Book One", "Book Two", "Book Three", "Book One; Book Two"}, nil},
+		{"identical bundle rows still group", []string{"Carrie; Christine", "Carrie; Christine"},
+			[][]string{{"Carrie; Christine", "Carrie; Christine"}}},
+		// kennethp1015's follow-up on #3469: the first part has a colon subtitle.
+		{"colon subtitle bundle with bare main title",
+			[]string{"Mistborn", "The Well of Ascension", "Mistborn: The Final Empire; The Well of Ascension"}, nil},
+		{"colon subtitle bundle, second part first",
+			[]string{"The Well of Ascension", "Mistborn", "Mistborn: The Final Empire; The Well of Ascension"}, nil},
+		{"colon subtitle bundle twin still groups",
+			[]string{"Mistborn: The Final Empire; The Well of Ascension", "Mistborn: The Final Empire; The Well of Ascension."},
+			[][]string{{"Mistborn: The Final Empire; The Well of Ascension", "Mistborn: The Final Empire; The Well of Ascension."}}},
+		{"single part bundle still pairs", []string{"Hearts in Atlantis", "Hearts in Atlantis; Misery"},
+			[][]string{{"Hearts in Atlantis", "Hearts in Atlantis; Misery"}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var books []models.Book
+			for i, title := range tc.books {
+				books = append(books, models.Book{ID: int64(i + 1), Title: title})
+			}
+			var got [][]string
+			for _, g := range Scan(books, nil) {
+				got = append(got, titles(g))
+			}
+			if fmt.Sprint(got) != fmt.Sprint(tc.want) {
+				t.Fatalf("groups = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

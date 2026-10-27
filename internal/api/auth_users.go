@@ -216,8 +216,16 @@ func (h *UserManagementHandler) SetRole(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusBadRequest, "invalid body")
 		return
 	}
-	if err := h.users.SetRole(r.Context(), id, body.Role); err != nil {
+	switch err := h.users.SetRole(r.Context(), id, body.Role); {
+	case err == nil:
+	case errors.Is(err, db.ErrInvalidRole), errors.Is(err, db.ErrLastAdminDemote):
 		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	case errors.Is(err, db.ErrUserNotFound):
+		writeErr(w, http.StatusNotFound, "No user with that id.")
+		return
+	default:
+		writeServerError(w, r, err)
 		return
 	}
 	writeOK(w, map[string]any{"ok": true})

@@ -28,3 +28,258 @@
   --color-fg-muted: var(--fg-muted);
   --color-accent-text: var(--accent-text);
 }
+
+/* Modal sizing on phones. `vh` is measured with the mobile browser toolbar
+   collapsed, so a panel capped at 90vh outgrows the visible area whenever the
+   toolbar is showing and its footer buttons end up at (or under) the screen
+   edge. `dvh` tracks the visible area. On narrow screens the cap also keeps a
+   3.5rem gap above and below the centred panel: iOS Safari treats a tap near
+   the bottom edge as "show the toolbar" instead of delivering it, so footer
+   buttons must not sit there. */
+@utility modal-max-h {
+  max-height: 90dvh;
+  @media (width < 40rem) {
+    max-height: calc(100dvh - 7rem);
+  }
+}
+
+@utility modal-overlay {
+  overscroll-behavior: contain;
+}
+
+/* On touch devices, stop the page behind an open modal from scrolling: the
+   scroll collapses and expands the browser toolbar, which resizes the modal
+   mid-interaction. Scoped to coarse pointers so desktop keeps its scrollbar
+   (hiding it there shifts the page sideways). */
+@media (pointer: coarse) {
+  html:has(.modal-overlay, dialog[open]) {
+    overflow: hidden;
+  }
+}
+
+/* A phone in landscape leaves well under 500px of height. A modal's header
+   and footer then take most of it, and its scrolling list shrank to a sliver
+   (27px in Reconcile catalogue; Edit author scrolled a 717px form through a
+   156px window). Below that height the whole panel scrolls as one area: its
+   sections keep their natural height and inner lists drop their caps.
+   Unlayered, so it wins over the max-h-* and flex-1 utilities. */
+@media (max-height: 500px) {
+  .modal-max-h {
+    overflow-y: auto;
+  }
+  .modal-max-h > * {
+    flex: none;
+  }
+  .modal-max-h [class*='max-h-'] {
+    max-height: none;
+  }
+}
+
+/* useModal focuses the panel itself when nothing inside asked for focus, so
+   a screen reader starts in the dialog and Tab continues from there. The
+   panel is not a control, so it gets no focus ring. */
+[data-modal-panel]:focus {
+  outline: none;
+}
+
+/* iOS Safari zooms the page in when a text field with a font size under 16px
+   takes focus, and leaves it zoomed. Unlayered so it beats the text-sm
+   utilities on individual controls. Selects are left at their own size: they
+   open a native picker instead of taking the keyboard, and at 16px the
+   compact ones (Wanted format, book media type) dwarfed the rows they sit
+   in. */
+@media (hover: none) and (pointer: coarse) {
+  input,
+  textarea {
+    font-size: 16px;
+  }
+}
+
+/* The forms plugin draws a select's arrow as a background image, 1.5em wide
+   and 0.5rem from the edge. The px-* utility every select carries left 8-12px
+   of right padding, so a select as wide as its longest option drew the arrow
+   over the end of it, on touch screens (#3070, #3081) and on desktop alike
+   (#3148). Reserve the arrow's width plus a small gap, in em so it stays
+   right for an 11px select as for a 16px one. Unlayered so it beats the px-*
+   utilities; the left padding is still theirs. A select drawn without the
+   arrow (bg-none, as the pager's "…" is) needs no room for it. */
+select:not([multiple]):not([size]):not(.bg-none) {
+  padding-right: calc(1.5em + 0.75rem);
+}
+
+/* A select is as wide as its longest option, and room is also kept for the
+   arrow, so a long one ran past a 320px screen (Default
+   monitor mode in Settings, Metadata, made the page 349px wide). Capping it
+   at its container lets the value truncate instead. In the base layer so a
+   max-w-* utility still wins, and it changes nothing for a select that
+   already fits. */
+@layer base {
+  select {
+    max-width: 100%;
+  }
+}
+
+/* One focus and colour style for every form control (#3085). The forms plugin
+   draws a field's focus as a 1px ring plus the border, and a checkbox or radio
+   in currentColor, both in its default blue; the per-element focus:border-*,
+   focus:ring-* and text-emerald-* overrides had drifted into five versions,
+   and the accent-* ones did nothing (the plugin sets appearance: none). This
+   recolours the plugin's own ring and fill to emerald-600 on light and
+   emerald-500 on dark, the pair Settings → Indexers already used, which keeps
+   3:1 against every surface (WCAG 1.4.11). A field's ring is 2px, since the
+   border keeps its colour (a border utility outranks the base layer). Specific
+   enough to beat the plugin's :where() selectors; a utility on an element still
+   wins, so a control that means something else (a red destructive checkbox)
+   keeps its own colour. */
+@layer base {
+  :is(input:not([type='checkbox'], [type='radio']), select, textarea):focus {
+    --tw-ring-color: var(--color-emerald-600);
+    --tw-ring-shadow: var(--tw-ring-inset) 0 0 0 calc(2px + var(--tw-ring-offset-width)) var(--tw-ring-color);
+  }
+  html.dark :is(input:not([type='checkbox'], [type='radio']), select, textarea):focus {
+    --tw-ring-color: var(--color-emerald-500);
+  }
+  input:is([type='checkbox'], [type='radio']) {
+    color: var(--color-emerald-600);
+  }
+  /* An outline with a gap, not the plugin's ring: the ring's offset is
+     painted white, a halo on the dark theme, and without the offset an
+     emerald ring merges into a checked box's emerald fill. */
+  input:is([type='checkbox'], [type='radio']):focus {
+    --tw-ring-shadow: 0 0 #0000;
+    --tw-ring-offset-shadow: 0 0 #0000;
+  }
+  input:is([type='checkbox'], [type='radio']):focus-visible {
+    outline: 2px solid var(--color-emerald-600);
+    outline-offset: 2px;
+  }
+  html.dark input:is([type='checkbox'], [type='radio']) {
+    color: var(--color-emerald-500);
+  }
+  html.dark input:is([type='checkbox'], [type='radio']):focus-visible {
+    outline-color: var(--color-emerald-500);
+  }
+  :disabled {
+    cursor: not-allowed;
+  }
+}
+
+/* A card whose link fills it and clips its overflow (the author page's book
+   cards, #3237): the link's own ring would be cut off by the card, or, drawn
+   inside, painted over by the cover. So the card carries the ring while its
+   link has keyboard focus, in the same colours as the rule below. */
+@layer base {
+  [data-focus-card]:has(> a:focus-visible) {
+    outline: 2px solid var(--color-emerald-600);
+    outline-offset: 2px;
+  }
+  html.dark [data-focus-card]:has(> a:focus-visible) {
+    outline-color: var(--color-emerald-500);
+  }
+}
+
+/* One keyboard focus style for buttons and links (#3228), the other half of
+   #3085. Without it most of them got each browser's default outline: auto,
+   whose look changed from control to control and browser to browser, and
+   which in WebKit's dark theme was close to the page colour. Same emerald
+   pair as the form controls; the 2px offset puts the ring on the surface
+   behind the control, where that pair keeps 3:1 (WCAG 1.4.11), so it also
+   shows around an emerald button. :focus-visible, so a mouse click draws
+   nothing. A control with its own focus utility (buttons.ts, Switch, the
+   library tabs) keeps it: utilities beat the base layer. */
+@layer base {
+  :is(button, a[href], [role='button'], [role='tab'], summary):focus-visible {
+    outline: 2px solid var(--color-emerald-600);
+    outline-offset: 2px;
+  }
+  html.dark :is(button, a[href], [role='button'], [role='tab'], summary):focus-visible {
+    outline-color: var(--color-emerald-500);
+  }
+}
+
+/* Placeholder text in the secondary-text token (#3084). The forms plugin
+   gives every input and textarea a gray-500 placeholder, 3.9:1 on the light
+   fields and 3.1:1 on the dark ones, and a few search boxes overrode it with
+   slate-400 / zinc-600 (2.1:1 and 1.9:1). Placeholders here carry hints and
+   example values, so they are text that needs 4.5:1: fg-muted (slate-600 /
+   zinc-400) is the AA shade the app already uses for secondary text. html
+   in the selector outranks the plugin's input::placeholder. */
+@layer base {
+  html :is(input, textarea)::placeholder {
+    color: var(--fg-muted);
+    opacity: 1;
+  }
+}
+
+/* Native controls (select popups, date pickers, scrollbars) follow
+   color-scheme, not the page colours, so the dark theme still opened white
+   pickers. Tracks the .dark class rather than the OS setting because the
+   theme can be overridden in the app. */
+@layer base {
+  html:not(.dark) { color-scheme: light; }
+  html.dark { color-scheme: dark; }
+}
+
+/* A 44px hit area for small controls on touch screens without changing how
+   they look: the invisible ::before is centred on the control, and a tap on
+   it lands on the control. In the components layer so a positioning utility
+   such as `absolute` on the same element wins over the relative here. Not for
+   controls inside a scroll container, which would scroll to the overhang;
+   those get pointer-coarse padding instead. */
+@layer components {
+  @media (pointer: coarse) {
+    .touch-target {
+      position: relative;
+    }
+    .touch-target::before {
+      content: '';
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      width: max(100%, 44px);
+      height: max(100%, 44px);
+      transform: translate(-50%, -50%);
+    }
+  }
+}
+
+/* Safe area insets. index.html sets viewport-fit=cover (paired with these,
+   never without them) so an installed, standalone Bindery can paint edge to
+   edge; these keep content clear of the notch, the status bar and the home
+   indicator. Where a device has no insets each utility reduces to its plain
+   spacing value, so pb-safe-3 is pb-3. Insets are not only a standalone
+   matter: in landscape on a notched iPhone, Safari reports non-zero side and
+   bottom insets in an ordinary tab too. With viewport-fit=cover Safari stops
+   insetting the page itself, so the body side padding below reproduces the
+   inset it used to apply, and the bottom bars clear the home indicator. */
+@layer base {
+  body {
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
+  }
+}
+
+@utility pt-safe {
+  padding-top: env(safe-area-inset-top);
+}
+
+@utility pb-safe-* {
+  padding-bottom: calc(--spacing(--value(number)) + env(safe-area-inset-bottom));
+}
+
+@utility px-safe-* {
+  padding-left: calc(--spacing(--value(number)) + env(safe-area-inset-left));
+  padding-right: calc(--spacing(--value(number)) + env(safe-area-inset-right));
+}
+
+@utility bottom-safe-* {
+  bottom: calc(--spacing(--value(number)) + env(safe-area-inset-bottom));
+}
+
+@utility right-safe-* {
+  right: calc(--spacing(--value(number)) + env(safe-area-inset-right));
+}
+
+@utility left-safe-* {
+  left: calc(--spacing(--value(number)) + env(safe-area-inset-left));
+}

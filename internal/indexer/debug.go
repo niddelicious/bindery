@@ -3,6 +3,7 @@ package indexer
 import (
 	"context"
 	"log/slog"
+	"sort"
 	"sync"
 	"time"
 
@@ -21,6 +22,69 @@ type SearchDebug struct {
 	Filters    []FilterDebug    `json:"filters"`
 	StartedAt  time.Time        `json:"startedAt"`
 	DurationMs int64            `json:"durationMs"`
+
+	// The fields below say WHICH search this is, for GET /search/last-debug,
+	// which more than one path now writes to (#2154). The searcher leaves them
+	// empty; whoever records the trail fills them in.
+
+	// Origin is DebugOriginInteractive for the book page's Search button, or
+	// the SearchOrigin of an automatic search ("scheduled", "bulk", ...).
+	Origin string `json:"origin,omitempty"`
+	// BookID is the book searched for.
+	BookID int64 `json:"bookId,omitempty"`
+	// UserID is the signed in user who ran an interactive search. Zero for
+	// an automatic search and for a caller with no user identity.
+	UserID int64 `json:"userId,omitempty"`
+	// Outcome is what an automatic search did with what it found, using the
+	// same words as the "book search finished" log line ("grabbed",
+	// "no results", "nothing approved", ...). Empty for an interactive
+	// search, which only lists releases.
+	Outcome string `json:"outcome,omitempty"`
+
+	// Dropped holds the releases the relevance stage removed, whole, so the
+	// interactive search can offer them for a deliberate grab (#2334). It is a
+	// side field and never part of the results SearchBookWithDebug returns:
+	// auto-grab reads those, and a dropped release must never reach it.
+	//
+	// It is not serialized (json:"-"). It carries the raw download URL and GUID,
+	// credentials included, which the debug panel and GET /search/last-debug
+	// must never show; the interactive handler records them in the search
+	// result registry and redacts them for its own response. The handler also
+	// clears the field once it has used it, so the debug log does not hold the
+	// raw URLs.
+	Dropped []DroppedRelease `json:"-"`
+}
+
+// Filter stage names, as FilterDebug.Stage and DroppedRelease.Stage carry them.
+const (
+	StageUsenetJunk = "usenet-junk"
+	StageNonBook    = "non-book"
+	StageRelevance  = "relevance"
+	StageLanguage   = "language"
+)
+
+// DroppedRelease is a release a filter stage removed, kept whole with the stage
+// and the reason. Only the relevance and language stages produce releases that
+// may be offered for a grab: those are false positives that happen on real
+// books. Usenet junk and non-book content are not books, so those drops are
+// reported through FilterDebug alone.
+type DroppedRelease struct {
+	Result newznab.SearchResult
+	Stage  string
+	Reason string
+}
+
+// droppedFilterDebug summarises dropped releases for the Filter decisions
+// panel, which carries no GUID or URL.
+func droppedFilterDebug(dropped []DroppedRelease) []FilterDebug {
+	if len(dropped) == 0 {
+		return nil
+	}
+	out := make([]FilterDebug, len(dropped))
+	for i, d := range dropped {
+		out[i] = FilterDebug{Title: d.Result.Title, IndexerName: d.Result.IndexerName, Stage: d.Stage, Reason: d.Reason}
+	}
+	return out
 }
 
 // SearchQueryDebug is the effective criteria sent into the searcher.
@@ -47,6 +111,15 @@ type IndexerDebug struct {
 	ResultCount int    `json:"resultCount"`
 	DurationMs  int64  `json:"durationMs"`
 	Error       string `json:"error,omitempty"`
+	// NumberWordQuery is the digit form of the title ("... Book 1") when the
+	// search sent the one extra number word query for this indexer (#3476),
+	// and NumberWordResults how many results it returned. Both are empty on
+	// the common search, so the added query cost is visible per indexer.
+	NumberWordQuery   string `json:"numberWordQuery,omitempty"`
+	NumberWordResults int    `json:"numberWordResults,omitempty"`
+	// NumberWordError is why that extra query failed, if it did. The search
+	// itself is not failed by it.
+	NumberWordError string `json:"numberWordError,omitempty"`
 }
 
 // PipelineDebug counts how results flowed through each filter stage in the
@@ -150,7 +223,12 @@ func (s *Searcher) SearchBookWithDebug(ctx context.Context, indexers []models.In
 			entry.Categories = cats
 
 			qctx := newznab.WithQueryBudget(ctx, s.quotaBudget(idx))
-			hits, err := client.BookSearch(qctx, c.Title, c.Author, cats)
+			hits, trace, err := client.BookSearchTraced(qctx, c.Title, c.Author, cats)
+			entry.NumberWordQuery, entry.NumberWordResults = trace.NumberWordQuery, trace.NumberWordResults
+			entry.NumberWordError = trace.NumberWordError
+			if trace.BudgetExhausted {
+				s.flushQuota(ctx, idx, true)
+			}
 			entry.DurationMs = time.Since(start).Milliseconds()
 			if err != nil {
 				// Running out of budget part way through the tier cascade is
@@ -212,7 +290,7 @@ func (s *Searcher) SearchBookWithDebug(ctx context.Context, indexers []models.In
 	results = dedupe(results)
 	dbg.Pipeline.AfterDedupe = len(results)
 
-	results, junkFilters := filterUsenetJunkDebug(results)
+	results, junkFilters := filterUsenetJunkDebug(results, junkScope{MediaType: c.MediaType, WantedTitle: c.Title})
 	dbg.Filters = append(dbg.Filters, junkFilters...)
 	dbg.Pipeline.AfterUsenetJunk = len(results)
 
@@ -222,14 +300,19 @@ func (s *Searcher) SearchBookWithDebug(ctx context.Context, indexers []models.In
 	// while the scheduler had it (#1644). Ranking stays in lockstep by
 	// construction: the quality profile rides on MatchCriteria, so the same
 	// rankResults call below reads it (#2733).
-	results = filterNonBookContent(results)
+	results, nonBook := filterNonBookContentDetailed(results)
+	dbg.Filters = append(dbg.Filters, droppedFilterDebug(nonBook)...)
 	dbg.Pipeline.AfterNonBookContent = len(results)
 
-	results, relFilters := filterRelevantDebug(results, c.Title, c.Author, c.AuthorAliases)
-	dbg.Filters = append(dbg.Filters, relFilters...)
+	results, relDropped := filterRelevantKeepDropped(results, c.Title, c.Author, c.AuthorAliases, c.context())
+	dbg.Filters = append(dbg.Filters, droppedFilterDebug(relDropped)...)
 	dbg.Pipeline.AfterRelevance = len(results)
 
 	rankResults(results, c)
+	// Most plausible first, so a cap on how many the interactive search shows
+	// keeps the best ones. Side field only: results above is untouched.
+	rankDropped(relDropped, c)
+	dbg.Dropped = relDropped
 
 	dbg.DurationMs = time.Since(dbg.StartedAt).Milliseconds()
 	return results, dbg
@@ -237,16 +320,16 @@ func (s *Searcher) SearchBookWithDebug(ctx context.Context, indexers []models.In
 
 // filterUsenetJunkDebug is filterUsenetJunk instrumented to record which
 // results were dropped and why.
-func filterUsenetJunkDebug(results []newznab.SearchResult) ([]newznab.SearchResult, []FilterDebug) {
+func filterUsenetJunkDebug(results []newznab.SearchResult, sc junkScope) ([]newznab.SearchResult, []FilterDebug) {
 	out := make([]newznab.SearchResult, 0, len(results))
 	var dropped []FilterDebug
 	for _, r := range results {
-		if usenetJunkRe.MatchString(r.Title) {
+		if reason := usenetJunkReason(r.Title, sc); reason != "" {
 			dropped = append(dropped, FilterDebug{
 				Title:       r.Title,
 				IndexerName: r.IndexerName,
-				Stage:       "usenet-junk",
-				Reason:      "looks like a raw per-article posting (RAR/PAR2/SFV/yEnc/[N/M])",
+				Stage:       StageUsenetJunk,
+				Reason:      reason,
 			})
 			continue
 		}
@@ -255,75 +338,12 @@ func filterUsenetJunkDebug(results []newznab.SearchResult) ([]newznab.SearchResu
 	return out, dropped
 }
 
-// filterRelevantDebug is filterRelevant instrumented to record each drop with
-// the keyword set that failed to match.
+// filterRelevantDebug returns the relevance filter's kept results together with
+// a record of every drop and its reason, for the interactive search panel and
+// for the automatic search that projects it (SearchBookWithOutcomes). It shares
+// its implementation with filterRelevant; see filterRelevantDetailed.
 func filterRelevantDebug(results []newznab.SearchResult, title, author string, aliases []string) ([]newznab.SearchResult, []FilterDebug) {
-	// Strip edition qualifiers ("(German Edition)" etc.) and normalize smart
-	// quotes before tokenizing — mirrors the first step of filterRelevant so
-	// both paths produce identical keyword sets.
-	title = newznab.NormalizeQueryTitle(title)
-	// Strip possessive author prefix before keyword extraction (mirrors filterRelevant).
-	title = stripPossessivePrefix(title, author)
-	fullKws := newznab.SigWords(title)
-	primaryKws := newznab.SigWords(primaryTitle(title))
-	authorKws := newznab.SigWords(author)
-	// Elision fallback, identical to filterRelevant: this path serves the
-	// interactive search AND auto-grab (SearchBookWithOutcomes projects
-	// SearchBookWithDebug), so a fix applied to one filter and not the other
-	// is invisible here and live there. See newznab.SigWordsElided.
-	fullElided := newznab.SigWordsElided(title)
-	primaryElided := newznab.SigWordsElided(primaryTitle(title))
-
-	authorTokenSets := latinAliasTokenSets(author, aliases)
-
-	tryMatch := func(n string, kws []string) bool {
-		for _, toks := range authorTokenSets {
-			if titleMatchesResult(n, kws, toks, true) {
-				return true
-			}
-		}
-		return false
-	}
-
-	// tryMatchElided retries a FAILED strict match with the apostrophe-
-	// separated reading. Never tried first, skipped when the readings agree.
-	tryMatchElided := func(n string, elided, kws []string) bool {
-		if len(elided) == 0 || sameKws(elided, kws) {
-			return false
-		}
-		return tryMatch(n, elided)
-	}
-
-	if len(fullKws) == 0 && len(primaryKws) == 0 && len(authorKws) == 0 {
-		return results, nil
-	}
-
-	normTitles := make([]string, len(results))
-	for i, r := range results {
-		normTitles[i] = NormalizeRelease(r.Title)
-	}
-
-	filtered := make([]newznab.SearchResult, 0, len(results))
-	var dropped []FilterDebug
-	for i, r := range results {
-		n := normTitles[i]
-		fullOK := tryMatch(n, fullKws) || tryMatchElided(n, fullElided, fullKws)
-		primaryOK := false
-		if !fullOK && len(primaryKws) > 0 && !sameKws(primaryKws, fullKws) {
-			primaryOK = tryMatch(n, primaryKws) || tryMatchElided(n, primaryElided, primaryKws)
-		}
-		if fullOK || primaryOK {
-			filtered = append(filtered, r)
-			continue
-		}
-		dropped = append(dropped, FilterDebug{
-			Title:       r.Title,
-			IndexerName: r.IndexerName,
-			Stage:       "relevance",
-			Reason:      "title/author keywords did not match release name",
-		})
-	}
-	return filtered, dropped
+	return filterRelevantDetailed(results, title, author, aliases)
 }
 
 // SearchBookWithOutcomes is SearchBook plus a per-indexer account of what
@@ -367,4 +387,25 @@ func Attempted(outcomes []IndexerDebug) int {
 		}
 	}
 	return n
+}
+
+// rankDropped orders dropped releases by the same score the kept ones are
+// ranked by, best first.
+func rankDropped(dropped []DroppedRelease, c MatchCriteria) {
+	if len(dropped) < 2 {
+		return
+	}
+	ranks := newProfileRanks(c.Profile)
+	scores := make(map[int]float64, len(dropped))
+	idx := make([]int, len(dropped))
+	for i, d := range dropped {
+		idx[i] = i
+		scores[i] = scoreResult(d.Result, c, ranks)
+	}
+	sort.SliceStable(idx, func(a, b int) bool { return scores[idx[a]] > scores[idx[b]] })
+	ordered := make([]DroppedRelease, len(dropped))
+	for i, k := range idx {
+		ordered[i] = dropped[k]
+	}
+	copy(dropped, ordered)
 }

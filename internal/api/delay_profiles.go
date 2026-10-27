@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/json"
 	"net/http"
 	"strconv"
 
@@ -51,8 +50,7 @@ func (h *DelayProfileHandler) Get(w http.ResponseWriter, r *http.Request) {
 
 func (h *DelayProfileHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var p models.DelayProfile
-	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	if !decodeJSON(w, r, &p) {
 		return
 	}
 	if p.PreferredProtocol == "" {
@@ -72,13 +70,16 @@ func (h *DelayProfileHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	existing, err := h.repo.GetByID(r.Context(), id)
-	if err != nil || existing == nil {
+	if err != nil {
+		writeServerError(w, r, err)
+		return
+	}
+	if existing == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "delay profile not found"})
 		return
 	}
 	var p models.DelayProfile
-	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	if !decodeJSON(w, r, &p) {
 		return
 	}
 	p.ID = id

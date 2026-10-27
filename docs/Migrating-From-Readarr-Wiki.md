@@ -11,7 +11,9 @@ In **Settings → Import / Migrate**, upload your `readarr.db`. The import bring
 
 Each imported author's catalogue is populated from metadata. Nothing is auto-grabbed — grab from the **Wanted** page when you are ready.
 
-The import dedupes by metadata id, so re-running it is safe: authors that already exist are skipped.
+The catalogues are fetched in the background after the import itself finishes, at about 3 seconds per author. That pace is deliberate, it keeps OpenLibrary from rate limiting you. Expect roughly 25 minutes for 500 authors. The Import page shows a "Fetching catalogues: X of Y" line while it runs, and you can leave the page and come back to it. A restart of Bindery during the backfill stops it and clears the line, so if some authors have no books afterwards, refresh those authors from their pages. Running the import again will not do it, because it skips authors you already have.
+
+The import dedupes by name and by metadata id, so re-running it is safe: authors that already exist are skipped. An author already in your library under the same name counts as existing whichever provider it is linked to, so running the import again after a provider outage does not add a second copy of someone who was linked to a fallback provider the first time. Only the same name counts, however it is punctuated ("J.R.R. Tolkien" and "JRR Tolkien"), not a similar one. Skipping never changes the existing author. To combine two copies you already have, open the one to keep and use **Merge…**.
 
 Each author is matched against your primary metadata provider and its fallbacks, and linked to the provider whose record matched. If your primary metadata provider does not answer during the import, an author it did not match is listed as failed rather than linked to another provider, because the link decides for good which provider the author's catalogue syncs from. The reason says the primary did not answer. Nothing is wrong with the name, so run the import again once the provider responds. Once the primary has failed to answer three lookups in a row, the import stops asking it and lists the remaining authors as failed with the same reason straight away, so an outage costs a few timeouts rather than one per author. A name that no provider matched while they were all answering is listed with the providers that were asked. A pasted or uploaded author list (**Settings → Import / Migrate**) works the same way.
 
@@ -29,7 +31,11 @@ Bindery is a single instance. One author record covers ebook, audiobook, or both
 
 For files already on disk, use **Library Scan**. It takes the author from your folder layout: a file under `{Author}/{Book}/` — Readarr's and Calibre's default structure — is matched on the author folder, so the filename convention (`Author - Title` vs `Title - Author`) does not matter for the author. An ebook's title is read from the file's own name first and from the book folder only when the filename matches nothing, so a `Series/01 - Title.epub` layout matches the book the file names. An audiobook's title comes from its folder, where the files are its tracks. Loose files with no author/book folders fall back to filename parsing, which can still be ambiguous, so keep an organised folder structure for the most reliable scan. **Bulk folder import** reads the same author folders when you point it at the folder that holds them.
 
-One difference to know about before you start correcting matches: Readarr's fix-match only changes which record a file is linked to, while Bindery's **Fix match** re-runs the import, so it moves the file into the target book's folder and renames it from your naming template. The confirmation step names the destination path before anything happens, so you can back out if you would rather keep your existing layout. Reassigning without relocating is not available yet (#2055).
+Correcting matches works the way you are used to: Bindery's **Fix match** defaults to **Correct the match only**, which, like Readarr's fix match, only changes which book a file is linked to and leaves the file where it is (#2055). If you would rather have Bindery tidy the file into its own layout at the same time, pick **Also move and rename the file**; the confirmation step then names the destination path before anything moves.
+
+## If you ran unpackerr for Readarr
+
+Bindery does not talk to unpackerr the way Readarr did. Point an unpackerr **folder** watch at your torrent download folder instead, with `move_back = true` and `delete_original = false` (the torrent only keeps seeding in copy or hardlink mode); see [RAR-packed torrent releases](Storage-And-Hardlinks-Wiki.md#rar-packed-torrent-releases).
 
 ## Importing your Goodreads library (CSV)
 

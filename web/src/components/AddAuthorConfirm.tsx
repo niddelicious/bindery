@@ -8,6 +8,7 @@ import { AuthorAddDefaults, DEFAULT_MONITOR_LATEST_COUNT, DEFAULT_MONITOR_MODE }
 import { useNeedsSetup } from './useNeedsSetup'
 import { authorProviderKey } from '../util/authorMetadata'
 import { providerDisplayName } from '../util/metadataSource'
+import { primaryFill } from './buttons'
 
 // The confirm step for an author picked in AddToLibraryModal: monitoring
 // controls, the outcome sentence and the add call. Renders the dialog body and
@@ -85,6 +86,7 @@ function AddAuthorForm({ author, defaults, primaryProvider, onBack, onClose, onA
   const rootFolders = defaults?.rootFolders ?? []
   const [profileId, setProfileId] = useState<number | null>(null)
   const [rootFolderId, setRootFolderId] = useState<number | null>(null)
+  const [audiobookRootFolderId, setAudiobookRootFolderId] = useState<number | null>(null)
   const [searchOnAdd, setSearchOnAdd] = useState(loadAutoGrabDefault)
   // Preempt the silent auto-search failure: backend auto-search-on-add runs
   // async, so a missing indexer/client fails with no visible error anywhere.
@@ -113,6 +115,7 @@ function AddAuthorForm({ author, defaults, primaryProvider, onBack, onClose, onA
     // having to pick one.
     setProfileId(defaults.profiles.length > 0 ? defaults.profiles[0].id : null)
     setRootFolderId(defaults.rootFolderId)
+    setAudiobookRootFolderId(defaults.audiobookRootFolderId)
     setMediaType(defaults.mediaType)
     setMonitorMode(defaults.monitorMode)
     setMonitorLatestCount(defaults.monitorLatestCount)
@@ -140,6 +143,13 @@ function AddAuthorForm({ author, defaults, primaryProvider, onBack, onClose, onA
         rootFolderId: rootFolderId,
         mediaType,
       }
+      // Only when the author will have audiobooks, which is also when the
+      // picker shows: a choice the user never saw is not posted. Explicit for
+      // the same reason as rootFolderId, so changing the default later does not
+      // split an author's audiobooks across two folders.
+      if (mediaType !== 'ebook' && audiobookRootFolderId !== null) {
+        request.audiobookRootFolderId = audiobookRootFolderId
+      }
       if (monitorOptionsChanged) {
         request.monitorMode = monitorMode
         request.monitorLatestCount = monitorLatestCount
@@ -162,13 +172,13 @@ function AddAuthorForm({ author, defaults, primaryProvider, onBack, onClose, onA
     }
   }
 
-  const selectClass = 'w-full bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-emerald-500'
+  const selectClass = 'w-full bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded-md px-3 py-2 text-sm'
 
   return (
     <>
       <div className="p-4 flex-1 overflow-y-auto">
         <div className="rounded-md border border-slate-300 dark:border-zinc-700 bg-slate-200/50 dark:bg-zinc-800/50 p-3">
-          <div ref={headingRef} tabIndex={-1} className="font-medium rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500">{author.authorName}</div>
+          <div ref={headingRef} tabIndex={-1} className="font-medium rounded-sm focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-emerald-500">{author.authorName}</div>
           {author.disambiguation && <div className="mt-0.5 text-sm text-fg-muted">{author.disambiguation}</div>}
         </div>
 
@@ -221,6 +231,15 @@ function AddAuthorForm({ author, defaults, primaryProvider, onBack, onClose, onA
                 <option value="both">{t('mediaType.both', 'Both')}</option>
               </select>
             </div>
+            {rootFolders.length > 0 && mediaType !== 'ebook' && (
+              <div>
+                <label htmlFor="add-author-audiobook-root" className="block text-xs text-fg-muted mb-1">{t('addToLibrary.author.audiobookRootFolder')}</label>
+                <select id="add-author-audiobook-root" value={audiobookRootFolderId ?? ''} onChange={e => setAudiobookRootFolderId(e.target.value ? Number(e.target.value) : null)} className={selectClass}>
+                  <option value="">{t('addToLibrary.author.audiobookRootFolderDefault')}</option>
+                  {rootFolders.map(rf => <option key={rf.id} value={rf.id}>{rf.path}</option>)}
+                </select>
+              </div>
+            )}
             <div>
               <label htmlFor="add-author-monitor-mode" className="block text-xs text-fg-muted mb-1">{t('addToLibrary.author.monitorMode')}</label>
               <select id="add-author-monitor-mode" value={monitorMode} onChange={e => { setMonitorMode(e.target.value as AuthorMonitorMode); setMonitorOptionsChanged(true) }} className={selectClass}>
@@ -257,7 +276,7 @@ function AddAuthorForm({ author, defaults, primaryProvider, onBack, onClose, onA
               })()}
             </p>
             <label className="flex items-start gap-2 text-sm cursor-pointer select-none">
-              <input type="checkbox" checked={searchOnAdd} onChange={e => setSearchOnAdd(e.target.checked)} className="accent-emerald-500 mt-0.5 flex-shrink-0" />
+              <input type="checkbox" checked={searchOnAdd} onChange={e => setSearchOnAdd(e.target.checked)} className="mt-0.5 flex-shrink-0" />
               <span>
                 <span className="font-medium">{t('addToLibrary.author.autoGrabLabel')}</span>
                 <span className="block text-xs text-fg-muted mt-0.5">{t('addToLibrary.author.autoGrabHint')}</span>
@@ -291,8 +310,8 @@ function AddAuthorForm({ author, defaults, primaryProvider, onBack, onClose, onA
 
       <div className="p-4 border-t border-slate-200 dark:border-zinc-800 flex justify-end gap-2">
         <button type="button" onClick={onBack} disabled={adding} className="mr-auto px-4 py-2 text-sm text-fg-muted hover:text-slate-900 dark:hover:text-white disabled:opacity-50">{t('addToLibrary.backToResults')}</button>
-        <button type="button" onClick={onClose} className="px-4 py-2 text-sm text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white">{t('common.cancel')}</button>
-        <button type="button" onClick={addAuthor} disabled={adding || !defaults} className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed rounded-md text-sm font-medium text-white">{adding ? t('addToLibrary.adding') : t('addToLibrary.author.confirmAdd')}</button>
+        <button type="button" onClick={onClose} className="px-4 py-2 text-sm text-fg-muted hover:text-slate-900 dark:hover:text-white">{t('common.cancel')}</button>
+        <button type="button" onClick={addAuthor} disabled={adding || !defaults} className={`px-4 py-2 ${primaryFill} disabled:opacity-50 disabled:cursor-not-allowed rounded-md text-sm font-medium`}>{adding ? t('addToLibrary.adding') : t('addToLibrary.author.confirmAdd')}</button>
       </div>
     </>
   )

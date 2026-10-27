@@ -895,6 +895,97 @@ func TestListPageFiltered_PopulatesBookCount(t *testing.T) {
 	}
 }
 
+// TestListPageFiltered_PopulatesAvailableBookCount pins the "have" half of the
+// Authors list's Books column: imported books and partly owned wanted books count as held, and the
+// count stays inside the caller's tenancy like the total beside it.
+func TestListPageFiltered_PopulatesAvailableBookCount(t *testing.T) {
+	database, err := OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	ctx := context.Background()
+	users := NewUserRepo(database)
+	alice, err := users.Create(ctx, "alice", "h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := users.Create(ctx, "bob", "h")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	authors := NewAuthorRepo(database)
+	shared := &models.Author{ForeignID: "OL_SH", Name: "Shared", SortName: "Shared"}
+	if err := authors.Create(ctx, shared); err != nil {
+		t.Fatal(err)
+	}
+
+	insertBook := func(foreignID, status string, owner any) int64 {
+		t.Helper()
+		res, err := database.ExecContext(ctx,
+			`INSERT INTO books (foreign_id, author_id, title, sort_title, status, owner_user_id, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`,
+			foreignID, shared.ID, foreignID, foreignID, status, owner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, err := res.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	addFile := func(bookID int64, format string) {
+		t.Helper()
+		if _, err := database.ExecContext(ctx,
+			`INSERT INTO book_files (book_id, format, path) VALUES (?, ?, ?)`,
+			bookID, format, fmt.Sprintf("/lib/%d.%s", bookID, format)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insertBook("B_SHARED_HAVE", models.BookStatusImported, nil)
+	insertBook("B_SHARED_WANTED", models.BookStatusWanted, nil)
+	insertBook("B_SHARED_WANTED_2", models.BookStatusWanted, nil)
+	insertBook("B_SHARED_SKIPPED", models.BookStatusSkipped, nil)
+	// A dual format book with one format on disk is 'wanted' and still owned
+	// (#3132): it counts. A wanted book with no file does not, and a skipped
+	// book stays out even with a file, as on the Books page.
+	addFile(insertBook("B_SHARED_PARTIAL", models.BookStatusWanted, nil), models.MediaTypeEbook)
+	addFile(insertBook("B_SHARED_SKIPPED_FILE", models.BookStatusSkipped, nil), models.MediaTypeEbook)
+	insertBook("B_ALICE_HAVE", models.BookStatusImported, alice.ID)
+	insertBook("B_BOB_HAVE_1", models.BookStatusImported, bob.ID)
+	insertBook("B_BOB_HAVE_2", models.BookStatusImported, bob.ID)
+
+	statsFor := func(userID int64) models.AuthorStats {
+		t.Helper()
+		page, _, err := authors.ListPageFiltered(ctx, AuthorListFilter{UserID: userID}, 50, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(page) != 1 || page[0].Statistics == nil {
+			t.Fatalf("expected one author with statistics, got %d", len(page))
+		}
+		return *page[0].Statistics
+	}
+
+	for _, tc := range []struct {
+		name        string
+		userID      int64
+		have, total int
+	}{
+		{"alice", alice.ID, 3, 7},
+		{"bob", bob.ID, 4, 8},
+		{"unscoped", 0, 5, 9},
+	} {
+		got := statsFor(tc.userID)
+		if got.AvailableBooks != tc.have || got.BookCount != tc.total {
+			t.Errorf("%s: have %d of %d, want %d of %d", tc.name, got.AvailableBooks, got.BookCount, tc.have, tc.total)
+		}
+	}
+}
+
 // TestListPageFiltered_BookCountIsOwnerScoped keeps the derived count inside the
 // same tenancy boundary as the rows it decorates. An unscoped COUNT would let
 // one user infer how much another user's author holds — the same class of leak
@@ -998,6 +1089,7 @@ func TestListPageFiltered_ColumnHeaderSorts(t *testing.T) {
 	seed("Ann", 4.5, true, 1)
 	seed("Bea", 2.0, false, 3)
 	seed("Cal", 3.0, true, 2)
+	seed("Dee", 0, false, 0)
 
 	names := func(sort string) []string {
 		t.Helper()
@@ -1016,15 +1108,16 @@ func TestListPageFiltered_ColumnHeaderSorts(t *testing.T) {
 		sort string
 		want []string
 	}{
-		{"books-asc", []string{"Ann", "Cal", "Bea"}},
-		{"books-desc", []string{"Bea", "Cal", "Ann"}},
-		{"rating-asc", []string{"Bea", "Cal", "Ann"}},
-		{"rating-desc", []string{"Ann", "Cal", "Bea"}},
+		{"books-asc", []string{"Dee", "Ann", "Cal", "Bea"}},
+		{"books-desc", []string{"Bea", "Cal", "Ann", "Dee"}},
+		// Dee is unrated and goes last either way.
+		{"rating-asc", []string{"Bea", "Cal", "Ann", "Dee"}},
+		{"rating-desc", []string{"Ann", "Cal", "Bea", "Dee"}},
 		// Ties on the monitored flag fall back to sort_key, so Ann precedes Cal.
-		{"monitored-asc", []string{"Bea", "Ann", "Cal"}},
-		{"monitored-desc", []string{"Ann", "Cal", "Bea"}},
+		{"monitored-asc", []string{"Bea", "Dee", "Ann", "Cal"}},
+		{"monitored-desc", []string{"Ann", "Cal", "Bea", "Dee"}},
 		// Unknown keys must not error or reorder unpredictably.
-		{"nonsense", []string{"Ann", "Bea", "Cal"}},
+		{"nonsense", []string{"Ann", "Bea", "Cal", "Dee"}},
 	} {
 		if got := names(tc.sort); !slices.Equal(got, tc.want) {
 			t.Errorf("sort %q = %v, want %v", tc.sort, got, tc.want)
@@ -1285,5 +1378,80 @@ func TestMigration075_BackfillsAuthorsThatHaveBooks(t *testing.T) {
 	}
 	if got, err := authors.CataloguePopulatedAt(ctx, without.ID); err != nil || got != nil {
 		t.Errorf("author with no books must stay unmarked: got=%v err=%v", got, err)
+	}
+}
+
+// UpdateIfUnchanged guards an author write that follows a provider call
+// (#2926): it lands on an unchanged row, including one whose updated_at is in
+// a legacy shape, and loses to an edit without touching the identifier table.
+func TestAuthorRepoUpdateIfUnchanged(t *testing.T) {
+	database, err := OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	ctx := context.Background()
+	authors := NewAuthorRepo(database)
+	author := mkAuthor(t, authors, ctx, "OL-GUARDED-AUTHOR")
+	if author.UpdatedAtRaw == "" {
+		t.Fatal("Create must record the stored updated_at text")
+	}
+
+	if _, err := database.ExecContext(ctx, "UPDATE authors SET updated_at=? WHERE id=?", "2026-09-01 10:00:00", author.ID); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := authors.GetByID(ctx, author.ID)
+	if err != nil || snapshot == nil {
+		t.Fatalf("load snapshot: %v", err)
+	}
+	if snapshot.UpdatedAtRaw != "2026-09-01 10:00:00" {
+		t.Fatalf("UpdatedAtRaw = %q, want the stored text", snapshot.UpdatedAtRaw)
+	}
+	snapshot.Description = "Provider biography."
+	updated, err := authors.UpdateIfUnchanged(ctx, snapshot, snapshot.UpdatedAtRaw)
+	if err != nil || !updated {
+		t.Fatalf("unchanged row: updated=%v err=%v", updated, err)
+	}
+	stored, err := authors.GetByID(ctx, author.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Description != "Provider biography." || stored.UpdatedAtRaw != snapshot.UpdatedAtRaw {
+		t.Fatalf("guarded write not persisted: description=%q raw=%q caller raw=%q", stored.Description, stored.UpdatedAtRaw, snapshot.UpdatedAtRaw)
+	}
+
+	// A user edit after the snapshot wins; the stale write changes nothing,
+	// including the identifier row a relink would have added.
+	stale := *stored
+	edit := *stored
+	edit.Monitored = false
+	if err := authors.Update(ctx, &edit); err != nil {
+		t.Fatal(err)
+	}
+	stale.Description = "Stale biography."
+	stale.ForeignID = "OL-STALE-RELINK"
+	updated, err = authors.UpdateIfUnchanged(ctx, &stale, stored.UpdatedAtRaw)
+	if err != nil || updated {
+		t.Fatalf("stale write: updated=%v err=%v", updated, err)
+	}
+	if stale.UpdatedAtRaw != stored.UpdatedAtRaw {
+		t.Fatalf("a lost guard must not stamp the caller's row: raw=%q", stale.UpdatedAtRaw)
+	}
+	stored, err = authors.GetByID(ctx, author.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Monitored || stored.Description != "Provider biography." || stored.ForeignID != "OL-GUARDED-AUTHOR" {
+		t.Fatalf("concurrent edit overwritten: monitored=%v description=%q foreignID=%q", stored.Monitored, stored.Description, stored.ForeignID)
+	}
+	if owner, err := authors.GetAuthorIdentifier(ctx, "OL-STALE-RELINK"); err != nil || owner != nil {
+		t.Fatalf("a lost guard must not record the identifier: owner=%+v err=%v", owner, err)
+	}
+
+	if _, err := authors.UpdateIfUnchanged(ctx, nil, "x"); err == nil {
+		t.Fatal("nil snapshot should be rejected")
+	}
+	if _, err := authors.UpdateIfUnchanged(ctx, stored, ""); err == nil {
+		t.Fatal("snapshot without a stored updated_at should be rejected")
 	}
 }

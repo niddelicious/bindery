@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/vavallee/bindery/internal/covers"
+	"github.com/vavallee/bindery/internal/duplicates"
 	"github.com/vavallee/bindery/internal/httpsec"
 	"github.com/vavallee/bindery/internal/models"
 	"github.com/vavallee/bindery/internal/useragent"
@@ -99,36 +100,16 @@ func (h *ImageProxyHandler) WithLocalCovers(store *covers.Store) *ImageProxyHand
 	return h
 }
 
-// imageProxyTransport returns the RoundTripper for the image-proxy client.
+// imageProxyTransport returns the RoundTripper for the image-proxy client: a
+// clone of the shared proxy transport with a per-dial PolicyStrict SSRF
+// re-validation (httpsec.GuardedTransport), closing the DNS-rebind TOCTOU
+// window between the up-front URL validation and the actual dial.
 //
-// On the direct (no outbound proxy) path it installs a per-request
-// SSRF-revalidating DialContext, closing the DNS-rebind TOCTOU window between
-// the up-front URL validation and the actual dial. It starts from
-// httpsec.DefaultProxyTransport() and clones it so installing DialContext does
-// not mutate the shared transport.
-//
-// When an outbound proxy IS configured (#987) the transport dials the *proxy*,
-// not the upstream host, so a PolicyStrict DialContext would re-validate the
-// proxy's own address and reject a LAN/loopback proxy — breaking every cover
-// fetch. In that case we return the shared proxy transport unchanged and rely on
-// the up-front h.validateURL plus the CheckRedirect hook for upstream SSRF: the
-// proxy is operator-configured and trusted, and the rebind re-check cannot see
-// past it anyway (the dial only reaches the proxy address). The strict per-dial
-// re-check therefore applies only to the direct path, where it is both meaningful
-// and the place a rebind would actually land.
+// When an outbound proxy is configured (#987) the dial to the operator-trusted
+// proxy itself is exempt, so a LAN or loopback proxy keeps working; a request
+// that the proxy bypass rules send direct is checked like any direct dial.
 func imageProxyTransport() http.RoundTripper {
-	base := httpsec.DefaultProxyTransport()
-	if httpsec.ProxyFunc() != nil {
-		return base
-	}
-	if t, ok := base.(*http.Transport); ok {
-		c := t.Clone()
-		c.DialContext = httpsec.NewDialContext(httpsec.PolicyStrict)
-		return c
-	}
-	return &http.Transport{
-		DialContext: httpsec.NewDialContext(httpsec.PolicyStrict),
-	}
+	return httpsec.GuardedTransport(httpsec.PolicyStrict)
 }
 
 // allowedImageContentType reports whether a Content-Type may be proxied back
@@ -504,4 +485,111 @@ func proxyAuthorImages(a *models.Author) {
 // proxyBookImages rewrites ImageURL on a book.
 func proxyBookImages(b *models.Book) {
 	b.ImageURL = ProxyImageURL(b.ImageURL)
+}
+
+// writeBook answers with a book the library holds, its cover as a proxy URL.
+// Every handler that returns one book goes through here, the writes as well as
+// the reads: the web client swaps the answer to a PUT straight into its state,
+// and a raw bindery-cover: reference there turns a stored cover into "No
+// cover" until the next reload (#3146).
+//
+// The response is a copy. A handler may still hand the same struct to a
+// background search or sync, and that must keep the real reference.
+func writeBook(w http.ResponseWriter, status int, b *models.Book) {
+	if b == nil {
+		writeJSON(w, status, b)
+		return
+	}
+	writeJSON(w, status, proxiedBook(b))
+}
+
+// proxiedBook returns a copy of a book with its cover as a proxy URL, for a
+// response body that embeds one.
+func proxiedBook(b *models.Book) *models.Book {
+	if b == nil {
+		return nil
+	}
+	out := *b
+	proxyBookImages(&out)
+	return &out
+}
+
+// proxiedBooks is proxiedBook for a list. It keeps a nil list nil, so an
+// omitempty field stays out of the response.
+func proxiedBooks(books []models.Book) []models.Book {
+	if books == nil {
+		return nil
+	}
+	out := make([]models.Book, len(books))
+	for i := range books {
+		out[i] = books[i]
+		proxyBookImages(&out[i])
+	}
+	return out
+}
+
+// proxiedAuthor is proxiedBook for an author and its embedded books.
+func proxiedAuthor(a *models.Author) *models.Author {
+	if a == nil {
+		return nil
+	}
+	out := *a
+	out.Books = append([]models.Book(nil), a.Books...)
+	proxyAuthorImages(&out)
+	return &out
+}
+
+// writeAuthor is writeBook for an author: the photo and any embedded books.
+func writeAuthor(w http.ResponseWriter, status int, a *models.Author) {
+	if a == nil {
+		writeJSON(w, status, a)
+		return
+	}
+	writeJSON(w, status, proxiedAuthor(a))
+}
+
+// writeSeries is writeBook for one series and the books it embeds.
+func writeSeries(w http.ResponseWriter, status int, s *models.Series) {
+	if s == nil {
+		writeJSON(w, status, s)
+		return
+	}
+	one := []models.Series{*s}
+	one[0].Books = make([]models.SeriesBook, len(s.Books))
+	for i, sb := range s.Books {
+		if sb.Book != nil {
+			b := *sb.Book
+			sb.Book = &b
+		}
+		one[0].Books[i] = sb
+	}
+	proxySeriesImages(one)
+	writeJSON(w, status, &one[0])
+}
+
+// proxySeriesImages rewrites ImageURL on the books each series embeds. A
+// stored cover (bindery-cover:) only loads through the proxy, so a series
+// returned raw showed it as a broken image (#3146).
+func proxySeriesImages(series []models.Series) {
+	for i := range series {
+		// Book is a pointer, so the copy range hands out still reaches it.
+		for _, sb := range series[i].Books {
+			if sb.Book != nil {
+				proxyBookImages(sb.Book)
+			}
+		}
+	}
+}
+
+// proxyDuplicateGroups rewrites the cover of every member of a duplicate
+// review group. The members embed the whole book row, so a stored cover
+// (bindery-cover:) went out raw (#3146). The groups are the caller's own
+// copy: the library review hands in a page copied from its cached scan.
+func proxyDuplicateGroups(groups []duplicates.Group) {
+	for _, g := range groups {
+		members := g.Members
+		for mi := range members {
+			proxyBookImages(&members[mi].Book)
+		}
+	}
 }

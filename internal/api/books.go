@@ -9,12 +9,14 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/vavallee/bindery/internal/auth"
 	"github.com/vavallee/bindery/internal/bookhydrate"
+	"github.com/vavallee/bindery/internal/covers"
 	"github.com/vavallee/bindery/internal/db"
 	"github.com/vavallee/bindery/internal/importer"
 	"github.com/vavallee/bindery/internal/indexer"
@@ -35,6 +37,8 @@ type BookHandler struct {
 	series    *db.SeriesRepo
 	editions  *db.EditionRepo
 	roots     *LibraryRoots // optional: library-root containment for delete
+
+	coverStore *covers.Store // optional: enables POST /book/{id}/cover
 
 	editionFetcher bookhydrate.EditionFetcher
 
@@ -155,67 +159,109 @@ func (h *BookHandler) hydrateHardcoverEditions(ctx context.Context, book *models
 	})
 }
 
+// conflictReasonChanged marks a 409 caused by a concurrent edit to the book
+// (#2926), so the UI can tell it apart from a duplicate foreign ID 409.
+const conflictReasonChanged = "changed"
+
 // EnrichAudiobook fetches audnex data for the book's ASIN and updates
 // narrator, duration, cover, and description on the record. Requires the
 // book to be media_type=audiobook with an ASIN already set.
+//
+// The write is guarded on the row as read before the Audnex call, so an edit
+// made during the call is not overwritten (#2926). On a lost guard the
+// handler retries once from a fresh read; Audnex answers are cached, so the
+// retry normally costs no second request. A second loss returns 409.
 func (h *BookHandler) EnrichAudiobook(w http.ResponseWriter, r *http.Request) {
 	book, ok := h.loadOwnedBook(w, r)
 	if !ok {
 		return
 	}
-	if book.MediaType != models.MediaTypeAudiobook && book.MediaType != models.MediaTypeBoth {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "book is not an audiobook"})
-		return
+	ctx := r.Context()
+	for attempt := 0; ; attempt++ {
+		if book.MediaType != models.MediaTypeAudiobook && book.MediaType != models.MediaTypeBoth {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "book is not an audiobook"})
+			return
+		}
+		if book.ASIN == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "set ASIN before enriching"})
+			return
+		}
+		if h.meta == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "metadata provider unavailable"})
+			return
+		}
+		expectedUpdatedAt := book.UpdatedAtRaw
+		if err := h.meta.EnrichAudiobook(ctx, book); err != nil {
+			slog.Warn("audnex enrich failed", "bookId", book.ID, "error", err)
+			writeUpstreamError(w, err)
+			return
+		}
+		var updated bool
+		var err error
+		if h.tryMapAudiobookMetadataByASIN(ctx, book) {
+			// The map rewrites the book's identity, not just the enrichment
+			// columns, so it needs the whole row; still guarded.
+			updated, err = h.books.UpdateIfUnchanged(ctx, book, expectedUpdatedAt)
+		} else {
+			updated, err = h.books.UpdateHydratedMetadata(ctx, book, expectedUpdatedAt)
+		}
+		if err != nil {
+			writeServerError(w, r, err)
+			return
+		}
+		if updated {
+			cleanBookDescription(book)
+			writeBook(w, http.StatusOK, book)
+			return
+		}
+		if attempt > 0 {
+			slog.Info("audnex enrich gave up after repeated concurrent book updates", "bookId", book.ID)
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "This book changed while it was being enriched. Try again.", "reason": conflictReasonChanged})
+			return
+		}
+		slog.Debug("audnex enrich retrying after concurrent book update", "bookId", book.ID)
+		fresh, err := h.books.GetByID(ctx, book.ID)
+		if err != nil {
+			writeServerError(w, r, err)
+			return
+		}
+		if fresh == nil || !auth.CheckOwnership(ctx, fresh.OwnerUserID) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "book not found"})
+			return
+		}
+		book = fresh
 	}
-	if book.ASIN == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "set ASIN before enriching"})
-		return
-	}
-	if h.meta == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "metadata provider unavailable"})
-		return
-	}
-	if err := h.meta.EnrichAudiobook(r.Context(), book); err != nil {
-		slog.Warn("audnex enrich failed", "bookId", book.ID, "error", err)
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
-		return
-	}
-	h.tryMapAudiobookMetadataByASIN(r.Context(), book)
-	if err := h.books.Update(r.Context(), book); err != nil {
-		writeServerError(w, r, err)
-		return
-	}
-	cleanBookDescription(book)
-	writeJSON(w, http.StatusOK, book)
 }
 
-func (h *BookHandler) tryMapAudiobookMetadataByASIN(ctx context.Context, book *models.Book) {
+// tryMapAudiobookMetadataByASIN maps the book onto the canonical work Audnex
+// names for its ASIN, and reports whether it changed the book.
+func (h *BookHandler) tryMapAudiobookMetadataByASIN(ctx context.Context, book *models.Book) bool {
 	if h == nil || h.meta == nil || h.authors == nil || book == nil || strings.TrimSpace(book.ASIN) == "" {
-		return
+		return false
 	}
 	target, err := h.meta.GetCanonicalBookByASIN(ctx, book.ASIN)
 	if err != nil {
 		slog.Debug("asin metadata map skipped", "bookId", book.ID, "asin", book.ASIN, "error", err)
-		return
+		return false
 	}
 	if target == nil || strings.TrimSpace(target.ForeignID) == "" {
-		return
+		return false
 	}
 	if existing, err := h.books.GetByForeignID(ctx, target.ForeignID); err != nil {
 		slog.Warn("asin metadata map conflict check failed", "bookId", book.ID, "foreignId", target.ForeignID, "error", err)
-		return
+		return false
 	} else if existing != nil && existing.ID != book.ID {
-		return
+		return false
 	}
 	currentAuthor, err := h.authors.GetByID(ctx, book.AuthorID)
 	if err != nil || currentAuthor == nil {
 		if err != nil {
 			slog.Warn("asin metadata map author lookup failed", "bookId", book.ID, "authorId", book.AuthorID, "error", err)
 		}
-		return
+		return false
 	}
 	if !bookMapAuthorMatches(currentAuthor, target.Author) {
-		return
+		return false
 	}
 	fallbackDescription := book.Description
 	fallbackImageURL := book.ImageURL
@@ -226,6 +272,7 @@ func (h *BookHandler) tryMapAudiobookMetadataByASIN(ctx context.Context, book *m
 	if book.ImageURL == "" {
 		book.ImageURL = fallbackImageURL
 	}
+	return true
 }
 
 // bookListResponse is the paginated wrapper returned by List. Replaces the
@@ -363,11 +410,35 @@ func (h *BookHandler) Get(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	proxyBookImages(book)
+	h.prepareBookDetail(r.Context(), book)
+	writeBook(w, http.StatusOK, book)
+}
+
+// prepareBookDetail shapes a book as the book page expects it: description
+// cleaned, tracked files, provider identifiers and the import flag attached.
+// GET /book/{id} and every response the page swaps in for its book use it, so
+// a mutation cannot answer with less than the page already had.
+func (h *BookHandler) prepareBookDetail(ctx context.Context, book *models.Book) {
 	cleanBookDescription(book)
-	h.attachBookFiles(r.Context(), book)
-	h.attachBookIdentifiers(r.Context(), book)
-	writeJSON(w, http.StatusOK, book)
+	h.attachBookFiles(ctx, book)
+	h.attachBookIdentifiers(ctx, book)
+	h.attachImportInFlight(ctx, book)
+}
+
+// attachImportInFlight marks a book whose download is still on its way into
+// the library, which is what the book page's live refresh arms on (#2423).
+// Best effort like the other attachments: a failed lookup only means the page
+// does not refresh itself.
+func (h *BookHandler) attachImportInFlight(ctx context.Context, book *models.Book) {
+	if h.downloads == nil {
+		return
+	}
+	inFlight, err := h.downloads.HasImportInFlight(ctx, book.ID, auth.ListScopeUserID(ctx))
+	if err != nil {
+		slog.Debug("book get: import in flight lookup failed", "book_id", book.ID, "error", err)
+		return
+	}
+	book.ImportInFlight = inFlight
 }
 
 func cleanBookDescription(book *models.Book) {
@@ -426,8 +497,7 @@ func (h *BookHandler) Update(w http.ResponseWriter, r *http.Request) {
 		ReleaseDate  *string   `json:"releaseDate"`
 		LockedFields *[]string `json:"lockedFields"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.Monitored != nil {
@@ -485,7 +555,10 @@ func (h *BookHandler) Update(w http.ResponseWriter, r *http.Request) {
 		book.LockField(models.BookFieldGenres)
 	}
 	if req.Language != nil {
-		book.Language = strings.TrimSpace(*req.Language)
+		// Stored in the same ISO 639-2/B form the providers write (#3086).
+		// Anything NormalizeLanguageCode does not recognise passes through
+		// lowercased, so a hand-typed code is never rejected or dropped.
+		book.Language = models.NormalizeLanguageCode(*req.Language)
 		book.LockField(models.BookFieldLanguage)
 	}
 	if req.ReleaseDate != nil {
@@ -535,6 +608,16 @@ func (h *BookHandler) Update(w http.ResponseWriter, r *http.Request) {
 		writeServerError(w, r, err)
 		return
 	}
+	// Unlocking every field hands the book back to metadata refresh, and that
+	// includes its series: forget the series the user took it out of (#2554).
+	// Series changes are admin only, so another user's unlock leaves them be.
+	if req.LockedFields != nil && len(book.LockedFields) == 0 && h.series != nil &&
+		auth.UserRoleFromContext(r.Context()) == auth.RoleAdmin {
+		if err := h.series.ClearBookSeriesExclusions(r.Context(), book.ID); err != nil {
+			writeServerError(w, r, err)
+			return
+		}
+	}
 
 	// Fire an immediate indexer search when this write leaves the book wanted
 	// and monitored and it was not both before (e.g. "Delete file" flips
@@ -566,7 +649,7 @@ func (h *BookHandler) Update(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeJSON(w, http.StatusOK, book)
+	writeBook(w, http.StatusOK, book)
 }
 
 func (h *BookHandler) Delete(w http.ResponseWriter, r *http.Request) {
@@ -644,6 +727,10 @@ func (h *BookHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
 	id := existing.ID
 
 	if path := r.URL.Query().Get("path"); path != "" {
+		if r.URL.Query().Get("delete") == "true" {
+			h.deleteTrackedBookFile(w, r, id, path)
+			return
+		}
 		h.deregisterBookFile(w, r, id, path)
 		return
 	}
@@ -668,7 +755,11 @@ func (h *BookHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
 	// Fallback for books imported before the book_files migration.
 	if len(toDelete) == 0 {
 		book, err := h.books.GetByID(r.Context(), id)
-		if err != nil || book == nil {
+		if err != nil {
+			writeServerError(w, r, err)
+			return
+		}
+		if book == nil {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "book not found"})
 			return
 		}
@@ -719,7 +810,11 @@ func (h *BookHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
 
 	// Re-load the book to get the refreshed status and file paths.
 	book, err := h.books.GetByID(r.Context(), id)
-	if err != nil || book == nil {
+	if err != nil {
+		writeServerError(w, r, err)
+		return
+	}
+	if book == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "book not found"})
 		return
 	}
@@ -740,7 +835,76 @@ func (h *BookHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeJSON(w, http.StatusOK, book)
+	writeBook(w, http.StatusOK, book)
+}
+
+// deleteTrackedBookFile removes exactly one tracked book_files row and its
+// on-disk payload. Unlike the format-scoped delete, an ebook never sweeps
+// same-stem siblings. If the containment or ownership guard refuses the
+// on-disk removal, the request is refused (409) rather than dropping the row
+// for a file that is still there — see safeRemoveBookPathExact's skipped
+// return.
+func (h *BookHandler) deleteTrackedBookFile(w http.ResponseWriter, r *http.Request, id int64, requested string) {
+	files, err := h.books.ListFiles(r.Context(), id)
+	if err != nil {
+		writeServerError(w, r, err)
+		return
+	}
+	want := filepath.Clean(requested)
+	var target *models.BookFile
+	for i := range files {
+		if filepath.Clean(files[i].Path) == want {
+			target = &files[i]
+			break
+		}
+	}
+	if target == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "path is not tracked against this book"})
+		return
+	}
+
+	skipped, err := safeRemoveBookPathExact(r.Context(), h.roots, h.books, id, target.Path, target.Format, "id", id)
+	if err != nil {
+		slog.Error("failed to remove individual book file", "id", id, "path", target.Path, "error", err)
+		writeServerError(w, r, err)
+		return
+	}
+	// skipped means the containment or ownership guard refused the unlink —
+	// the file is still on disk. Dropping the book_files row and reporting
+	// 200 here would tell the caller a destructive action succeeded when it
+	// didn't, so refuse the request instead: the row and the file stay in
+	// sync, and the caller finds out immediately rather than from a history
+	// event nobody reads.
+	if skipped {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "file was not removed from disk because it is outside your library folders or another book owns it, including a folder another book tracks; refusing to drop the tracked row. To stop tracking it without touching the disk, remove it without delete=true."})
+		return
+	}
+	if _, err := h.books.RemoveBookFile(r.Context(), target.Path); err != nil {
+		writeServerError(w, r, err)
+		return
+	}
+
+	book, err := h.books.GetByID(r.Context(), id)
+	if err != nil {
+		writeServerError(w, r, err)
+		return
+	}
+	if book == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "book not found"})
+		return
+	}
+	h.attachBookFiles(r.Context(), book)
+	cleanBookDescription(book)
+	if h.history != nil {
+		data, marshalErr := json.Marshal(map[string]any{"paths": []string{target.Path}, "individual": true})
+		if marshalErr == nil {
+			_ = h.history.Create(r.Context(), &models.HistoryEvent{
+				BookID: &book.ID, EventType: models.HistoryEventBookFileDeleted,
+				SourceTitle: book.Title, Data: string(data),
+			})
+		}
+	}
+	writeBook(w, http.StatusOK, book)
 }
 
 // deregisterBookFile removes ONE book_files row by its tracked path and does
@@ -793,7 +957,11 @@ func (h *BookHandler) deregisterBookFile(w http.ResponseWriter, r *http.Request,
 	}
 
 	book, err := h.books.GetByID(r.Context(), id)
-	if err != nil || book == nil {
+	if err != nil {
+		writeServerError(w, r, err)
+		return
+	}
+	if book == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "book not found"})
 		return
 	}
@@ -817,7 +985,7 @@ func (h *BookHandler) deregisterBookFile(w http.ResponseWriter, r *http.Request,
 		}
 	}
 
-	writeJSON(w, http.StatusOK, book)
+	writeBook(w, http.StatusOK, book)
 }
 
 // removeBookPathScoped deletes a file or directory at p. Audiobooks are stored
@@ -1004,6 +1172,20 @@ func sweepMatchesFormat(name, format string) bool {
 	}
 }
 
+// ListWanted answers GET /wanted/missing.
+//
+// With no `limit` it returns the bare array of every wanted book, the shape
+// Arr-compatible clients read, unchanged. With `limit` it returns the
+// {items, total, limit, offset} envelope the Books list uses, one page at a
+// time, which is what the Wanted page asks for so a library with thousands of
+// wanted books is not serialised on every 5 second poll.
+//
+// `search`, `mediaType`, `sort` and `offset` apply to the paged form only.
+// `total` counts every wanted book the caller can see that matches the
+// filters (scope, includeExcluded, search, mediaType), ignoring limit and
+// offset, so a page count can be
+// drawn from it. The paged form is ordered like the bare one (sort title)
+// until a search is typed, which ranks by relevance as the Books list does.
 func (h *BookHandler) ListWanted(w http.ResponseWriter, r *http.Request) {
 	// Scope to the caller's own + unowned books under tenancy (0 = unscoped for
 	// admins / API-key / single-tenant), matching the main book list. Without
@@ -1011,9 +1193,14 @@ func (h *BookHandler) ListWanted(w http.ResponseWriter, r *http.Request) {
 	// tenancy: the scoped ListByStatusAndUser existed and was used by OPDS, but
 	// this handler still called the unscoped variant).
 	scope := auth.ListScopeUserID(r.Context())
+	includeExcluded := r.URL.Query().Get("includeExcluded") == "true"
+	if strings.TrimSpace(r.URL.Query().Get("limit")) != "" {
+		h.listWantedPage(w, r, scope, includeExcluded)
+		return
+	}
 	var books []models.Book
 	var err error
-	if r.URL.Query().Get("includeExcluded") == "true" {
+	if includeExcluded {
 		books, err = h.books.ListByStatusIncludingExcludedAndUser(r.Context(), models.BookStatusWanted, scope)
 	} else {
 		books, err = h.books.ListByStatusAndUser(r.Context(), models.BookStatusWanted, scope)
@@ -1027,9 +1214,42 @@ func (h *BookHandler) ListWanted(w http.ResponseWriter, r *http.Request) {
 	}
 	for i := range books {
 		cleanBookDescription(&books[i])
+		// Through the proxy like every other book list: a stored cover
+		// (bindery-cover:) does not load any other way (#3146).
+		proxyBookImages(&books[i])
 	}
 	h.markUnmonitoredAuthors(r.Context(), books)
 	writeJSON(w, http.StatusOK, books)
+}
+
+// listWantedPage is the paged form of ListWanted.
+func (h *BookHandler) listWantedPage(w http.ResponseWriter, r *http.Request, scope int64, includeExcluded bool) {
+	limit, offset := parseLimitOffset(r, bookListDefaultLimit, bookListMaxLimit)
+	// mediaType and sort are the Books list's own parameters, read and
+	// whitelisted by ListPageFiltered the same way, so the Wanted page can
+	// filter by format and order by date or author instead of offering
+	// thousands of rows in title order only.
+	books, total, err := h.books.ListPageFiltered(r.Context(), db.BookListFilter{
+		UserID:          scope,
+		Search:          strings.TrimSpace(r.URL.Query().Get("search")),
+		Status:          models.BookStatusWanted,
+		MediaType:       r.URL.Query().Get("mediaType"),
+		Sort:            r.URL.Query().Get("sort"),
+		IncludeExcluded: includeExcluded,
+	}, limit, offset)
+	if err != nil {
+		writeServerError(w, r, err)
+		return
+	}
+	if books == nil {
+		books = []models.Book{}
+	}
+	for i := range books {
+		cleanBookDescription(&books[i])
+		proxyBookImages(&books[i])
+	}
+	h.markUnmonitoredAuthors(r.Context(), books)
+	writeJSON(w, http.StatusOK, bookListResponse{Items: books, Total: total, Limit: limit, Offset: offset})
 }
 
 // markUnmonitoredAuthors flags the rows whose author is not monitored, so the
@@ -1074,14 +1294,14 @@ func (h *BookHandler) Rebind(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	expectedUpdatedAt := book.UpdatedAtRaw
 
 	var req struct {
 		Provider  string `json:"provider"`
 		ForeignID string `json:"foreign_id"`
 		Force     bool   `json:"force"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	req.Provider = strings.TrimSpace(strings.ToLower(req.Provider))
@@ -1106,7 +1326,7 @@ func (h *BookHandler) Rebind(w http.ResponseWriter, r *http.Request) {
 	upstream, err := h.lookup.GetBookFromProvider(r.Context(), req.Provider, req.ForeignID)
 	if err != nil {
 		slog.Warn("rebind: upstream fetch failed", "bookId", book.ID, "provider", req.Provider, "foreignId", req.ForeignID, "error", err)
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		writeUpstreamError(w, err)
 		return
 	}
 	if upstream == nil {
@@ -1133,6 +1353,9 @@ func (h *BookHandler) Rebind(w http.ResponseWriter, r *http.Request) {
 	// Snapshot old identifiers for the audit trail before mutating the book.
 	oldProvider := book.MetadataProvider
 	oldForeignID := book.ForeignID
+	// The locks decide what the clearing step below may erase, so keep them
+	// past the wholesale lock reset.
+	lockedBefore := slices.Clone(book.LockedFields)
 
 	// Update the book with the new foreign ID and refreshed metadata.
 	// Preserve fields managed by the user or the import pipeline (status,
@@ -1170,10 +1393,17 @@ func (h *BookHandler) Rebind(w http.ResponseWriter, r *http.Request) {
 	if upstream.Language != "" {
 		book.Language = upstream.Language
 	}
+	// A field the new record does not have must not keep the old record's
+	// value, or the book reads as if it came from the new one (#3104). Locked
+	// fields are the user's and stay.
+	cleared := book.ClearProviderFieldsMissingFrom(upstream, lockedBefore)
 	now := time.Now().UTC()
 	book.LastMetadataRefreshAt = &now
 
-	if err := h.books.Update(r.Context(), book); err != nil {
+	// Guarded on the row as loaded before the provider call: an edit or an
+	// import that landed meanwhile would otherwise be overwritten (#2926).
+	updated, err := h.books.UpdateIfUnchanged(r.Context(), book, expectedUpdatedAt)
+	if err != nil {
 		// A UNIQUE constraint means another book row already owns this foreign_id.
 		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": "a different book already uses that foreign ID"})
@@ -1181,6 +1411,25 @@ func (h *BookHandler) Rebind(w http.ResponseWriter, r *http.Request) {
 		}
 		writeServerError(w, r, err)
 		return
+	}
+	if !updated {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "This book changed while it was being rebound. Try again.", "reason": conflictReasonChanged})
+		return
+	}
+	if len(cleared) > 0 {
+		slog.Info("rebind: cleared fields the new record does not have", "bookId", book.ID, "fields", cleared)
+	}
+	book.Cleared = cleared
+	// The previous work's provider editions describe the wrong work: their
+	// ISBN would keep steering search, and their unique ids keep them from
+	// the book they belong to (#2781). Only when the identity actually
+	// changed, and never an imported, selected or referenced edition.
+	if h.editions != nil && (oldForeignID != book.ForeignID || oldProvider != book.MetadataProvider) {
+		if n, err := h.editions.DeleteProviderEditionsAfterRebind(r.Context(), book.ID, book.ForeignID, book.MetadataProvider); err != nil {
+			slog.Warn("rebind: failed to remove the previous work's editions", "bookId", book.ID, "error", err)
+		} else if n > 0 {
+			slog.Info("rebind: removed the previous work's provider editions", "bookId", book.ID, "removed", n, "oldForeignId", oldForeignID)
+		}
 	}
 	// MediaType is in the preserved-fields list above because it belongs to the
 	// user, so a rebind is exactly the case the pin exists for: hydration must
@@ -1215,12 +1464,13 @@ func (h *BookHandler) Rebind(w http.ResponseWriter, r *http.Request) {
 	// by hand and visible in the activity history.
 	if h.history != nil {
 		type rebindData struct {
-			OldProvider  string `json:"oldProvider"`
-			OldForeignID string `json:"oldForeignId"`
-			NewProvider  string `json:"newProvider"`
-			NewForeignID string `json:"newForeignId"`
+			OldProvider  string   `json:"oldProvider"`
+			OldForeignID string   `json:"oldForeignId"`
+			NewProvider  string   `json:"newProvider"`
+			NewForeignID string   `json:"newForeignId"`
+			Cleared      []string `json:"cleared,omitempty"`
 		}
-		if data, jerr := json.Marshal(rebindData{oldProvider, oldForeignID, req.Provider, req.ForeignID}); jerr == nil {
+		if data, jerr := json.Marshal(rebindData{oldProvider, oldForeignID, req.Provider, req.ForeignID, cleared}); jerr == nil {
 			bookID := book.ID
 			_ = h.history.Create(r.Context(), &models.HistoryEvent{
 				BookID:      &bookID,
@@ -1233,8 +1483,7 @@ func (h *BookHandler) Rebind(w http.ResponseWriter, r *http.Request) {
 
 	h.attachBookFiles(r.Context(), book)
 	cleanBookDescription(book)
-	proxyBookImages(book)
-	writeJSON(w, http.StatusOK, book)
+	writeBook(w, http.StatusOK, book)
 }
 
 func (h *BookHandler) ToggleExcluded(w http.ResponseWriter, r *http.Request) {
@@ -1251,7 +1500,7 @@ func (h *BookHandler) ToggleExcluded(w http.ResponseWriter, r *http.Request) {
 	}
 	book.Excluded = newVal
 	cleanBookDescription(book)
-	writeJSON(w, http.StatusOK, book)
+	writeBook(w, http.StatusOK, book)
 }
 
 // preserveBookStateForMetadataMap and bookMapAuthorMatches below are retained:
@@ -1284,7 +1533,11 @@ func preserveBookStateForMetadataMap(book *models.Book, target *models.Book) {
 	book.SortTitle = firstNonEmpty(target.SortTitle, target.Title)
 	book.OriginalTitle = target.OriginalTitle
 	book.Description = target.Description
-	book.ImageURL = target.ImageURL
+	// The new record's cover replaces the old one, except that a cover read
+	// from the user's own file survives a record that has none.
+	if target.ImageURL != "" || !covers.IsRef(book.ImageURL) {
+		book.ImageURL = target.ImageURL
+	}
 	book.ReleaseDate = target.ReleaseDate
 	book.Genres = target.Genres
 	if book.Genres == nil {
@@ -1334,8 +1587,9 @@ func bookMapAuthorMatches(current, target *models.Author) bool {
 }
 
 func authorNameAutoMatches(a, b string) bool {
-	match := textutil.MatchAuthorName(a, b)
-	return match.Kind == textutil.AuthorMatchExact || match.Kind == textutil.AuthorMatchFuzzyAuto
+	// The record was found by the book's own ASIN, so the work is settled and
+	// a pairing that only drops initials is enough (#2881).
+	return textutil.MatchAuthorName(a, b).ConfirmedByTitle()
 }
 
 // metadataProviderFromForeignID names the provider a book's foreign ID belongs

@@ -1,9 +1,10 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach, onTestFinished } from 'vitest'
 import { render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router'
 import AuthorsPage from './AuthorsPage'
 import { api } from '../api/client'
 import type { Series } from '../api/client'
+import { clickBulkAction } from '../test-utils'
 
 const { navigateMock } = vi.hoisted(() => ({
   navigateMock: vi.fn(),
@@ -34,8 +35,11 @@ vi.mock('../api/client', async importOriginal => {
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
-    t: (key: string, fallback?: string | Record<string, unknown>) => {
+    t: (key: string, fallback?: string | Record<string, unknown>, opts?: Record<string, unknown>) => {
       const labels: Record<string, string> = {
+        'authors.booksInLibrary': `${String(opts?.have ?? '')} of ${String(opts?.total ?? '')} in library`,
+        'dataTable.selectRow': `Select ${String(opts?.name ?? '')}`,
+        'dataTable.selectPage': 'Select all on this page',
         'authors.title': 'Authors',
         'authors.merge': 'Merge',
         'authors.addAuthor': 'Add Author',
@@ -74,6 +78,8 @@ vi.mock('react-i18next', () => ({
         'common.refresh': 'Refresh',
         'common.cancel': 'Cancel',
         'common.apply': 'Apply',
+        'series.addSeries': 'Add Series',
+        'series.nameModal.name': 'Name',
         'authors.bulkApplyMonitoringToExisting': 'Also apply to their existing books',
         'authors.bulkApplyMonitoringToExistingHint': 'Rewrites every book of the selected authors to match. Leave it off to change the authors only.',
         'bulkActionBar.clear': 'Clear',
@@ -102,6 +108,17 @@ vi.mock('../components/usePagination', () => ({
     paginationProps: { page: 1, totalPages: 1, pageSize: 50, totalItems: total, onPageChange: vi.fn(), onPageSizeChange: vi.fn() },
   }),
 }))
+
+// Series changes are admin only (#468); a test switches to another user.
+const authState = { isAdmin: true }
+vi.mock('../auth/AuthContext', async importOriginal => ({
+  ...await importOriginal<typeof import('../auth/AuthContext')>(),
+  useIsAdmin: () => authState.isAdmin,
+}))
+const asAnotherUser = () => {
+  authState.isAdmin = false
+  onTestFinished(() => { authState.isAdmin = true })
+}
 
 vi.mock('../components/Pagination', () => ({ default: () => null }))
 
@@ -171,6 +188,17 @@ describe('AuthorsPage', () => {
     expect(arg).toMatchObject({ limit: 50, offset: 0 })
   })
 
+  it('offers another user no Add Series', async () => {
+    asAnotherUser()
+    render(
+      <MemoryRouter>
+        <AuthorsPage />
+      </MemoryRouter>,
+    )
+    expect(await screen.findByRole('button', { name: 'Add Author' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Add Series' })).toBeNull()
+  })
+
   it('creates a series from the authors toolbar and opens it on the series page', async () => {
     const created: Series = {
       id: 44,
@@ -188,7 +216,9 @@ describe('AuthorsPage', () => {
       </MemoryRouter>,
     )
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Add Series' }))
+    // Add series is a rare action, so it sits in the header's More menu.
+    fireEvent.click(await screen.findByRole('button', { name: 'More author actions' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Add Series' }))
     const dialog = await screen.findByRole('dialog', { name: 'Add Series' })
     fireEvent.change(within(dialog).getByLabelText('Name'), { target: { value: 'Dune Chronicles' } })
     fireEvent.click(within(dialog).getByRole('button', { name: 'Add Series' }))
@@ -230,7 +260,7 @@ describe('AuthorsPage', () => {
     fireEvent.click(await screen.findByTitle('Select Andy Weir'))
 
     // The bulk bar appears; click the new "Refresh metadata" action.
-    fireEvent.click(await screen.findByRole('button', { name: 'Refresh metadata' }))
+    clickBulkAction('Refresh metadata')
 
     await waitFor(() =>
       expect(api.bulkActionAuthors).toHaveBeenCalledWith([7], 'refresh', undefined, false),
@@ -265,7 +295,7 @@ describe('AuthorsPage', () => {
     )
 
     fireEvent.click(await screen.findByTitle('Select Andy Weir'))
-    fireEvent.click(await screen.findByRole('button', { name: 'Set monitor mode' }))
+    clickBulkAction('Set monitor mode')
 
     expect(await screen.findByRole('dialog', { name: 'Set monitor mode' })).toBeInTheDocument()
     expect(screen.getByText('Selected authors: 1')).toBeInTheDocument()
@@ -301,7 +331,7 @@ describe('AuthorsPage', () => {
     )
 
     fireEvent.click(await screen.findByTitle('Select Andy Weir'))
-    fireEvent.click(await screen.findByRole('button', { name: 'Set monitor mode' }))
+    clickBulkAction('Set monitor mode')
     fireEvent.change(await screen.findByLabelText('Monitor mode'), { target: { value: 'latest' } })
     fireEvent.change(screen.getByLabelText('Latest book count'), { target: { value: '3' } })
     fireEvent.click(screen.getByRole('button', { name: 'Apply monitor mode' }))
@@ -343,7 +373,7 @@ describe('AuthorsPage', () => {
     )
 
     fireEvent.click(await screen.findByTitle('Select Andy Weir'))
-    fireEvent.click(await screen.findByRole('button', { name: 'Set monitor mode' }))
+    clickBulkAction('Set monitor mode')
     fireEvent.click(screen.getByRole('checkbox', { name: /apply monitor mode to existing books/i }))
     fireEvent.click(screen.getByRole('button', { name: 'Apply monitor mode' }))
 
@@ -384,7 +414,7 @@ describe('AuthorsPage', () => {
     )
 
     fireEvent.click(await screen.findByTitle('Select Andy Weir'))
-    fireEvent.click(await screen.findByRole('button', { name: 'Set monitor mode' }))
+    clickBulkAction('Set monitor mode')
     fireEvent.click(screen.getByRole('button', { name: 'Apply monitor mode' }))
 
     expect(await screen.findByRole('alert')).toHaveTextContent('author not found')
@@ -526,11 +556,15 @@ describe('AuthorsPage — filter and sort popovers', () => {
 
   // The column headers already sort in table view. Offering a sort control as
   // well invites the two to disagree about what is active.
-  it('drops the sort control in table view, where the headers do the job', async () => {
+  // The Sort control used to vanish in table view, which read as a page
+  // without sort. The headers and the control drive the same value, so they
+  // cannot disagree.
+  it('keeps the sort control in table view too', async () => {
     localStorage.setItem('bindery.view.authors', 'table')
     await renderPage()
 
-    expect(screen.queryByRole('button', { name: /Sort/ })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: /^Sort/ }))
+    expect(screen.getByRole('radio', { name: 'Recent' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /Filters/ })).toBeInTheDocument()
   })
 
@@ -697,12 +731,12 @@ describe('AuthorsPage — sortable column headers', () => {
     await waitFor(() => expect(sorts()).toContain('az'))
   })
 
-  it('renders the book count from the server instead of an em dash', async () => {
+  it('renders how many books we have and the total from the server instead of an em dash', async () => {
     vi.mocked(api.listAuthors).mockResolvedValue({
       items: [
         {
           id: 1, authorName: 'Prolific', foreignAuthorId: 'OL_P', monitored: true,
-          averageRating: 4, imageUrl: '', statistics: { bookCount: 12, availableBookCount: 0, wantedBookCount: 0 },
+          averageRating: 4, imageUrl: '', statistics: { bookCount: 12, availableBookCount: 5, wantedBookCount: 0 },
         },
       ] as never,
       total: 1, limit: 100, offset: 0,
@@ -717,7 +751,71 @@ describe('AuthorsPage — sortable column headers', () => {
     // Before the backend populated Statistics on the list path this cell was
     // always "—", because the field is `json:"statistics,omitempty"` and no
     // code ever set it on a row read back from SQLite.
-    expect(await screen.findByText('12')).toBeInTheDocument()
+    expect(await screen.findByText('5 / 12')).toBeInTheDocument()
+  })
+
+  it('shows a dash, not 0 / 0, for an author with no books', async () => {
+    vi.mocked(api.listAuthors).mockResolvedValue({
+      items: [
+        {
+          id: 1, authorName: 'Empty', foreignAuthorId: 'OL_E', monitored: true,
+          averageRating: 4, imageUrl: '', statistics: { bookCount: 0, availableBookCount: 0, wantedBookCount: 0 },
+        },
+      ] as never,
+      total: 1, limit: 100, offset: 0,
+    })
+
+    render(
+      <MemoryRouter>
+        <AuthorsPage />
+      </MemoryRouter>,
+    )
+
+    await screen.findByText('Empty')
+    expect(screen.queryByText('0 / 0')).not.toBeInTheDocument()
+  })
+
+  it('hides the in library line on a grid card for an author with no books', async () => {
+    localStorage.setItem('bindery.view.authors', 'grid')
+    vi.mocked(api.listAuthors).mockResolvedValue({
+      items: [
+        {
+          id: 1, authorName: 'Empty', foreignAuthorId: 'OL_E', monitored: true,
+          averageRating: 4, imageUrl: '', statistics: { bookCount: 0, availableBookCount: 0, wantedBookCount: 0 },
+        },
+      ] as never,
+      total: 1, limit: 100, offset: 0,
+    })
+
+    render(
+      <MemoryRouter>
+        <AuthorsPage />
+      </MemoryRouter>,
+    )
+
+    await screen.findByText('Empty')
+    expect(screen.queryByText(/in library/)).not.toBeInTheDocument()
+  })
+
+  it('shows have and total on each card in the grid view', async () => {
+    localStorage.setItem('bindery.view.authors', 'grid')
+    vi.mocked(api.listAuthors).mockResolvedValue({
+      items: [
+        {
+          id: 1, authorName: 'Prolific', foreignAuthorId: 'OL_P', monitored: true,
+          averageRating: 4, imageUrl: '', statistics: { bookCount: 12, availableBookCount: 5, wantedBookCount: 0 },
+        },
+      ] as never,
+      total: 1, limit: 100, offset: 0,
+    })
+
+    render(
+      <MemoryRouter>
+        <AuthorsPage />
+      </MemoryRouter>,
+    )
+
+    expect(await screen.findByText('5 of 12 in library')).toBeInTheDocument()
   })
 })
 

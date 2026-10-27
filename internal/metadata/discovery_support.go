@@ -69,7 +69,7 @@ func coverEnrichmentDeferred(ctx context.Context) bool {
 // EnrichMissingCovers runs the cover enrichment GetAuthorWorksForAuthor would
 // have run, over books only. It fills ImageURL in place on books that have
 // none.
-func (a *Aggregator) EnrichMissingCovers(ctx context.Context, books []models.Book) {
+func (a *aggregatorCore) EnrichMissingCovers(ctx context.Context, books []models.Book) {
 	if a == nil || len(books) == 0 {
 		return
 	}

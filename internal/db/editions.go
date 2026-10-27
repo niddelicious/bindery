@@ -105,6 +105,8 @@ func (r *EditionRepo) ListByBook(ctx context.Context, bookID int64) ([]models.Ed
 // publisher, num_pages, asin, monitored) are preserved on update so a
 // re-import never flattens metadata the user has curated in-UI.
 func (r *EditionRepo) Upsert(ctx context.Context, e *models.Edition) error {
+	// Canonicalised at the write so no provider's raw code survives (#3086).
+	e.Language = models.NormalizeLanguageCode(e.Language)
 	now := time.Now().UTC()
 	isEbook := 0
 	if e.IsEbook {
@@ -157,14 +159,17 @@ func (r *EditionRepo) Upsert(ctx context.Context, e *models.Edition) error {
 // successful insert or update, e is hydrated with the stored row so callers
 // that promote edition fields use the persisted values. It deliberately refuses
 // to re-parent a foreign edition ID that already belongs to another book;
-// callers can treat ok=false as a benign skipped conflict.
-func (r *EditionRepo) UpsertMetadata(ctx context.Context, e *models.Edition) (bool, error) {
+// callers can treat ok=false as a benign skipped conflict. The parent must
+// still have the foreign ID and provider observed before the metadata fetch;
+// this check is atomic with both inserts and conflict updates.
+func (r *EditionRepo) UpsertMetadata(ctx context.Context, e *models.Edition, expectedForeignID, expectedProvider string) (bool, error) {
 	if e == nil || strings.TrimSpace(e.ForeignID) == "" || e.BookID == 0 {
 		return false, nil
 	}
 	for _, value := range []*string{&e.Title, &e.Publisher, &e.Format, &e.Language, &e.ImageURL, &e.EditionInfo} {
 		*value = strings.TrimSpace(*value)
 	}
+	e.Language = models.NormalizeLanguageCode(e.Language)
 	if e.Title == "" {
 		e.Title = "Unknown Edition"
 	}
@@ -201,7 +206,8 @@ func (r *EditionRepo) UpsertMetadata(ctx context.Context, e *models.Edition) (bo
 		                      publisher, publish_date, format, num_pages, language,
 		                      image_url, is_ebook, edition_info, monitored,
 		                      created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+		WHERE EXISTS (SELECT 1 FROM books WHERE id = ? AND foreign_id = ? AND metadata_provider = ?)
 		ON CONFLICT(foreign_id) DO UPDATE SET
 		    title       = %s,
 		    isbn_13     = %s,
@@ -223,7 +229,7 @@ func (r *EditionRepo) UpsertMetadata(ctx context.Context, e *models.Edition) (bo
 		e.ForeignID, e.BookID, e.Title, e.ISBN13, e.ISBN10, e.ASIN,
 		e.Publisher, timeArg(e.PublishDate), e.Format, e.NumPages, e.Language,
 		e.ImageURL, isEbook, e.EditionInfo, monitored, timeValueArg(now), timeValueArg(now),
-		sql.Named("whitespace", metadataWhitespace))
+		e.BookID, expectedForeignID, expectedProvider, sql.Named("whitespace", metadataWhitespace))
 	if err != nil {
 		return false, fmt.Errorf("upsert metadata edition %s: %w", e.ForeignID, err)
 	}
@@ -275,6 +281,45 @@ func scanEditionFrom(s rowScanner) (models.Edition, error) {
 	e.IsEbook = isEbook == 1
 	e.Monitored = monitored == 1
 	return e, nil
+}
+
+// DeleteProviderEditionsAfterRebind removes the metadata provider editions a
+// book still carries from the work it was bound to before a rebind (#2781).
+// Those rows describe the wrong work: search used their ISBN for the corrected
+// book, and the unique foreign_id kept the old edition from being attached to
+// the book it does belong to.
+//
+// Only provider editions go. An edition the Calibre or Audiobookshelf importer
+// created ("calibre:" and "abs:" ids) records a file the user has, so it is
+// kept, and so is any edition something still points at: the book's selected
+// edition, which the user chose, and an edition a download or a Calibre
+// delivery recorded. Provider editions are cached provider data, refetched by
+// the next hydration of the new work, not anything the user entered.
+//
+// The book must already carry its new identity (foreignID, provider), checked
+// in the same statement. A metadata write for the old identity is refused by
+// UpsertMetadata's parent check once the identity has changed, so one that
+// landed earlier is removed here and one that comes later cannot land: the
+// two are consistent whichever order they run in. Returns the rows removed.
+func (r *EditionRepo) DeleteProviderEditionsAfterRebind(ctx context.Context, bookID int64, foreignID, provider string) (int64, error) {
+	res, err := r.exec.ExecContext(ctx, `
+		DELETE FROM editions
+		WHERE book_id = ?
+		  AND foreign_id NOT LIKE 'calibre:%'
+		  AND foreign_id NOT LIKE 'abs:%'
+		  AND EXISTS (SELECT 1 FROM books b WHERE b.id = editions.book_id AND b.foreign_id = ? AND b.metadata_provider = ?)
+		  AND NOT EXISTS (SELECT 1 FROM books b WHERE b.id = editions.book_id AND b.selected_edition_id = editions.id)
+		  AND NOT EXISTS (SELECT 1 FROM downloads d WHERE d.edition_id = editions.id)
+		  AND NOT EXISTS (SELECT 1 FROM calibre_deliveries cd WHERE cd.edition_id = editions.id)`,
+		bookID, foreignID, provider)
+	if err != nil {
+		return 0, fmt.Errorf("delete provider editions for rebound book %d: %w", bookID, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("provider editions removed for book %d: %w", bookID, err)
+	}
+	return n, nil
 }
 
 func (r *EditionRepo) Delete(ctx context.Context, id int64) error {

@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/vavallee/bindery/internal/covers"
@@ -358,22 +359,34 @@ func TestProxyBookImages(t *testing.T) {
 	}
 }
 
-// TestImageProxyTransport_NoStrictDialWhenProxied is the regression guard for
+// TestImageProxyTransport_LoopbackProxyStillWorks is the regression guard for
 // the cover-proxy 502 bug: when BINDERY_OUTBOUND_PROXY is configured the image
-// transport dials the proxy, not the upstream host, so installing a PolicyStrict
-// per-dial re-check would reject a LAN/loopback proxy and break every fetch.
-// In the proxy case the handler must return the shared proxy transport unchanged.
-func TestImageProxyTransport_NoStrictDialWhenProxied(t *testing.T) {
+// transport dials the proxy, not the upstream host, so a PolicyStrict per-dial
+// re-check of the proxy's own address would reject a LAN/loopback proxy and
+// break every fetch. The dial to the proxy is exempt; a request actually
+// carried by the proxy must still arrive.
+func TestImageProxyTransport_LoopbackProxyStillWorks(t *testing.T) {
 	t.Cleanup(func() { _, _ = httpsec.ConfigureOutboundProxy("", "", true) })
 
+	var hits int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer proxy.Close()
 	// A loopback proxy is exactly the case PolicyStrict would have rejected.
-	if _, err := httpsec.ConfigureOutboundProxy("http://127.0.0.1:0", "", true); err != nil {
+	if _, err := httpsec.ConfigureOutboundProxy(proxy.URL, "", false); err != nil {
 		t.Fatalf("ConfigureOutboundProxy: %v", err)
 	}
 
-	got := imageProxyTransport()
-	if got != httpsec.DefaultProxyTransport() {
-		t.Errorf("with a proxy configured, imageProxyTransport() must return the shared proxy transport unchanged; got a different transport (%T)", got)
+	client := &http.Client{Transport: imageProxyTransport()}
+	resp, err := client.Get("http://covers.example.test/a.jpg")
+	if err != nil {
+		t.Fatalf("request through the loopback proxy: %v", err)
+	}
+	_ = resp.Body.Close()
+	if atomic.LoadInt32(&hits) != 1 {
+		t.Errorf("proxy hits = %d; want 1", atomic.LoadInt32(&hits))
 	}
 }
 

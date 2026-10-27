@@ -40,7 +40,7 @@ func newAuthFixture(t *testing.T) (*AuthHandler, *db.UserRepo, *db.SettingsRepo,
 		t.Fatal(err)
 	}
 	lim := auth.NewLoginLimiter(5, 15*time.Minute)
-	return NewAuthHandler(users, settings, lim), users, settings, ctx
+	return NewAuthHandler(users, settings, lim).WithSessionRevocations(db.NewSessionRevocations(database)), users, settings, ctx
 }
 
 func jsonBody(t *testing.T, v any) *bytes.Buffer {
@@ -666,6 +666,8 @@ func TestStatus_LocalAuthEnabled_False(t *testing.T) {
 type epochProvider struct {
 	users  *db.UserRepo
 	secret []byte
+	// h, when set, supplies the logout denylist (SessionRevoked).
+	h *AuthHandler
 }
 
 func (p *epochProvider) Mode() auth.Mode                       { return auth.ModeEnabled }
@@ -694,6 +696,15 @@ func (p *epochProvider) UserRole(ctx context.Context, id int64) string {
 }
 func (p *epochProvider) UserSessionEpoch(ctx context.Context, id int64) (int64, error) {
 	return p.users.GetSessionEpoch(ctx, id)
+}
+
+// SessionRevoked consults the same denylist the fixture's AuthHandler writes
+// on logout, as main.go wires one instance into both.
+func (p *epochProvider) SessionRevoked(ctx context.Context, tokenHash string) (bool, error) {
+	if p.h == nil || p.h.revocations == nil {
+		return false, nil
+	}
+	return p.h.revocations.IsRevoked(ctx, tokenHash)
 }
 
 // extractSessionCookie returns the session cookie set on the response, or nil
@@ -909,4 +920,118 @@ func withChiURLParam(r *http.Request, key, value string) *http.Request {
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add(key, value)
 	return r.WithContext(context.WithValue(r.Context(), chi.RouteCtxKey, rctx))
+}
+
+// TestStatus_HostNotAllowedInLoginFreeModes pins /auth/status to the same
+// Host rule the middleware applies: under a name a public site could have,
+// disabled mode does not report an admin, and says why.
+func TestStatus_HostNotAllowedInLoginFreeModes(t *testing.T) {
+	h, users, settings, ctx := newAuthFixture(t)
+	if _, err := users.Create(ctx, "admin", "x"); err != nil {
+		t.Fatal(err)
+	}
+	if err := settings.Set(ctx, SettingAuthMode, string(auth.ModeDisabled)); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		host        string
+		wantAdmin   bool
+		wantRefused bool
+	}{
+		{"attacker.example", false, true},
+		{"bindery:8787", true, false},
+		{"192.168.1.10:8787", true, false},
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/auth/status", nil)
+		req.Host = c.host
+		rec := httptest.NewRecorder()
+		h.Status(rec, req)
+		var resp statusResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		if got := resp.Authenticated && resp.Role == "admin"; got != c.wantAdmin {
+			t.Errorf("%s: admin=%v, want %v", c.host, got, c.wantAdmin)
+		}
+		if resp.HostNotAllowed != c.wantRefused {
+			t.Errorf("%s: hostNotAllowed=%v, want %v", c.host, resp.HostNotAllowed, c.wantRefused)
+		}
+		if c.wantRefused && resp.RefusedHost != c.host {
+			t.Errorf("%s: refusedHost=%q", c.host, resp.RefusedHost)
+		}
+	}
+}
+
+// S5: ChangePassword verifies the current password, so it is a second oracle
+// for a stolen session cookie and must be throttled like Login. Six wrong
+// current passwords from one account give 429, a different account is not
+// affected, and the lockout holds even for the right password until it ages out.
+func TestChangePassword_WrongCurrentIsRateLimited(t *testing.T) {
+	h, users, _, ctx := newAuthFixture(t)
+	hashA, _ := auth.HashPassword("old-password-a")
+	first, err := users.Create(ctx, "first", hashA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hashB, _ := auth.HashPassword("old-password-b")
+	second, err := users.Create(ctx, "second", hashB)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	change := func(uid int64, current string) int {
+		req := httptest.NewRequest(http.MethodPost, "/auth/password",
+			jsonBody(t, changePasswordRequest{CurrentPassword: current, NewPassword: "new-password-2026"}))
+		req = req.WithContext(auth.WithUserID(req.Context(), uid))
+		rec := httptest.NewRecorder()
+		h.ChangePassword(rec, req)
+		return rec.Code
+	}
+
+	for i := 1; i <= 5; i++ {
+		if got := change(first.ID, "WRONG"); got != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: status = %d, want 401", i, got)
+		}
+	}
+	if got := change(first.ID, "WRONG"); got != http.StatusTooManyRequests {
+		t.Fatalf("attempt 6: status = %d, want 429", got)
+	}
+	if got := change(first.ID, "old-password-a"); got != http.StatusTooManyRequests {
+		t.Fatalf("right password while locked out: status = %d, want 429", got)
+	}
+	// Another account is unaffected.
+	if got := change(second.ID, "old-password-b"); got != http.StatusOK {
+		t.Fatalf("other account: status = %d, want 200", got)
+	}
+}
+
+// A successful change clears the failure count.
+func TestChangePassword_SuccessResetsLimiter(t *testing.T) {
+	h, users, _, ctx := newAuthFixture(t)
+	hash, _ := auth.HashPassword("old-password")
+	u, err := users.Create(ctx, "only", hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	change := func(current, next string) int {
+		req := httptest.NewRequest(http.MethodPost, "/auth/password",
+			jsonBody(t, changePasswordRequest{CurrentPassword: current, NewPassword: next}))
+		req = req.WithContext(auth.WithUserID(req.Context(), u.ID))
+		rec := httptest.NewRecorder()
+		h.ChangePassword(rec, req)
+		return rec.Code
+	}
+	for i := 0; i < 4; i++ {
+		if got := change("WRONG", "new-password-2026"); got != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401", got)
+		}
+	}
+	if got := change("old-password", "second-password-1"); got != http.StatusOK {
+		t.Fatalf("correct change: status = %d, want 200", got)
+	}
+	for i := 0; i < 4; i++ {
+		if got := change("WRONG", "x-password-12345"); got != http.StatusUnauthorized {
+			t.Fatalf("after reset, wrong attempt %d: status = %d, want 401", i+1, got)
+		}
+	}
 }

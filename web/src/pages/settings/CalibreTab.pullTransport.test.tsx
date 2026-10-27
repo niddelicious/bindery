@@ -4,7 +4,7 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     t: (key: string, opts?: Record<string, unknown>) =>
-      opts && typeof opts === 'object' ? `${key} ${JSON.stringify(opts)}` : key,
+      typeof opts === 'string' ? opts : opts && typeof opts === 'object' ? `${key} ${JSON.stringify(opts)}` : key,
   }),
 }))
 
@@ -80,7 +80,7 @@ describe('CalibreTab transport', () => {
     // Nothing probes a plugin URL in pull.
     expect(mocked.testCalibre).not.toHaveBeenCalled()
     // Push all works without a plugin URL.
-    expect(screen.getByRole('button', { name: 'Push all to Calibre' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'settings.calibre.pushAll.label' })).toBeEnabled()
     // The queue panel shows the check in rather than reachability.
     expect(await screen.findByTestId('calibre-delivery-reachability')).toHaveTextContent('settings.calibre.deliveries.lastCheckIn')
   })

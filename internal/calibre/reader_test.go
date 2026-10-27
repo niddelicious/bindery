@@ -613,3 +613,41 @@ func TestOpenReadOnlyWaitsOutABusyLock(t *testing.T) {
 		t.Errorf("the reader fell back while Calibre held a lock for 300ms: %s", logs.String())
 	}
 }
+
+// S9: the library path is spliced into a `file:` DSN. A directory whose name
+// carries "?", "#" or "%" used to cut the path at the "?" and let the rest of
+// the name act as URI parameters, so a library called "lib ?mode=rwc#x" opened
+// (and created) a different file read-write. The path must be taken literally.
+func TestOpenReader_PathWithURISyntaxIsTakenLiterally(t *testing.T) {
+	built := buildFixtureLibrary(t)
+	base := t.TempDir()
+	awkward := filepath.Join(base, "lib ?mode=rwc#1 %41 &x=y")
+	if err := os.Rename(built, awkward); err != nil {
+		t.Fatalf("move library into an awkward directory: %v", err)
+	}
+
+	r, err := OpenReader(awkward)
+	if err != nil {
+		t.Fatalf("OpenReader(%q): %v", awkward, err)
+	}
+	defer r.Close()
+	n, err := r.Count(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Errorf("Count = %d, want 3 (the library at the literal path)", n)
+	}
+
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(awkward) {
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("opening the library created files beside it: %q, want only %q", names, filepath.Base(awkward))
+	}
+}

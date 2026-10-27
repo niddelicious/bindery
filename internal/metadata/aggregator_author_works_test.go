@@ -111,7 +111,7 @@ func TestAggregator_GetAuthorWorks_WorksProvider(t *testing.T) {
 	primary := &mockWorksProvider{
 		mockProvider: mockProvider{name: "ol", authorWorks: books},
 	}
-	agg := &Aggregator{
+	agg := &aggregatorCore{requests: &requestCache{},
 		primary: primary,
 		cache:   newTTLCache(time.Minute),
 	}
@@ -136,7 +136,7 @@ func TestAggregator_GetAuthorWorks_CallerCannotPoisonCache(t *testing.T) {
 	primary := &mockWorksProvider{
 		mockProvider: mockProvider{name: "ol", authorWorks: books},
 	}
-	agg := &Aggregator{
+	agg := &aggregatorCore{requests: &requestCache{},
 		primary: primary,
 		cache:   newTTLCache(time.Minute),
 	}
@@ -162,7 +162,7 @@ func TestAggregator_GetAuthorWorks_Fallback(t *testing.T) {
 	// Primary does not implement worksProvider → falls back to SearchBooks.
 	books := []models.Book{{Title: "Foundation"}, {Title: "Foundation and Empire"}}
 	primary := &mockProvider{name: "gb", searchBooks: books}
-	agg := &Aggregator{
+	agg := &aggregatorCore{requests: &requestCache{},
 		primary: primary,
 		cache:   newTTLCache(time.Minute),
 	}
@@ -181,7 +181,7 @@ func TestAggregator_GetAuthorWorks_Cached(t *testing.T) {
 	primary := &mockWorksProvider{
 		mockProvider: mockProvider{name: "ol", authorWorks: books},
 	}
-	agg := &Aggregator{
+	agg := &aggregatorCore{requests: &requestCache{},
 		primary: primary,
 		cache:   newTTLCache(time.Minute),
 	}
@@ -219,7 +219,7 @@ func TestAggregator_GetAuthorWorksForAuthor_MergesSupplementalByTitle(t *testing
 			{ForeignID: "hc:children-of-dune", Title: "Children of Dune", MetadataProvider: "hardcover"},
 		},
 	}
-	agg := &Aggregator{
+	agg := &aggregatorCore{requests: &requestCache{},
 		primary:   primary,
 		enrichers: []Provider{hardcover},
 		cache:     newTTLCache(time.Minute),
@@ -387,7 +387,7 @@ func TestAggregator_GetAuthorWorksForAuthor_PrunesCompilations(t *testing.T) {
 			{ForeignID: "hc:dune-messiah", Title: "Dune Messiah", MetadataProvider: "hardcover"},
 		},
 	}
-	agg := &Aggregator{
+	agg := &aggregatorCore{requests: &requestCache{},
 		primary:   primary,
 		enrichers: []Provider{hardcover},
 		cache:     newTTLCache(time.Minute),
@@ -428,7 +428,7 @@ func TestAggregator_GetAuthorWorksForAuthor_PrunesTechnicalSameNameCollision(t *
 			}},
 		}},
 	}
-	agg := &Aggregator{
+	agg := &aggregatorCore{requests: &requestCache{},
 		primary: primary,
 		cache:   newTTLCache(time.Minute),
 	}
@@ -476,7 +476,7 @@ func TestAggregator_GetAuthorWorksForAuthor_PrunesSelfReferentialSubjectWorks(t 
 				Genres: []string{"Fiction, fantasy, general"}},
 		}},
 	}
-	agg := &Aggregator{
+	agg := &aggregatorCore{requests: &requestCache{},
 		primary: primary,
 		cache:   newTTLCache(time.Minute),
 	}
@@ -519,7 +519,7 @@ func TestAggregator_GetAuthorWorksForAuthor_SelfReferenceCheckDisabledWithoutSor
 				Genres: []string{"Tolkien, j, r. r. (john ronald ruel), 1892-1973"}},
 		}},
 	}
-	agg := &Aggregator{
+	agg := &aggregatorCore{requests: &requestCache{},
 		primary: primary,
 		cache:   newTTLCache(time.Minute),
 	}
@@ -552,7 +552,7 @@ func TestAggregator_GetAuthorWorksForAuthor_MergesSupplementalIntoFirstDuplicate
 			},
 		},
 	}
-	agg := &Aggregator{
+	agg := &aggregatorCore{requests: &requestCache{},
 		primary:   primary,
 		enrichers: []Provider{hardcover},
 		cache:     newTTLCache(time.Minute),
@@ -590,7 +590,7 @@ func TestAggregator_GetAuthorWorksForAuthor_EnrichesMissingCoversAfterSupplement
 		name:        "googlebooks",
 		searchBooks: []models.Book{{Title: "Heretics of Dune", ImageURL: "https://books.google.com/heretics.jpg"}},
 	}
-	agg := &Aggregator{
+	agg := &aggregatorCore{requests: &requestCache{},
 		primary:   primary,
 		enrichers: []Provider{hardcover, google},
 		cache:     newTTLCache(time.Minute),
@@ -619,7 +619,7 @@ func TestAggregator_GetAuthorWorksForAuthor_ContinuesWhenSupplementFails(t *test
 		mockProvider:         mockProvider{name: "hardcover"},
 		authorWorksByNameErr: errors.New("hardcover unavailable"),
 	}
-	agg := &Aggregator{
+	agg := &aggregatorCore{requests: &requestCache{},
 		primary:   primary,
 		enrichers: []Provider{hardcover},
 		cache:     newTTLCache(time.Minute),
@@ -687,7 +687,7 @@ func TestAggregator_GetAuthorWorksForAuthor_DoesNotCacheUnconfiguredSupplement(t
 		mockProvider:         mockProvider{name: "hardcover"},
 		authorWorksByNameErr: ErrProviderNotConfigured,
 	}
-	agg := &Aggregator{
+	agg := &aggregatorCore{requests: &requestCache{},
 		primary:   primary,
 		enrichers: []Provider{hardcover},
 		cache:     newTTLCache(time.Minute),
@@ -725,7 +725,7 @@ func TestAggregator_GetAuthorWorksForAuthor_DoesNotCacheFailedSupplement(t *test
 		mockProvider:         mockProvider{name: "hardcover"},
 		authorWorksByNameErr: errors.New("hardcover unavailable"),
 	}
-	agg := &Aggregator{
+	agg := &aggregatorCore{requests: &requestCache{},
 		primary:   primary,
 		enrichers: []Provider{hardcover},
 		cache:     newTTLCache(time.Minute),
@@ -765,7 +765,7 @@ func TestAggregator_GetAuthorWorksForAuthor_CachesSuccessfulSupplement(t *testin
 			{ForeignID: "hc:children-of-dune", Title: "Children of Dune", MetadataProvider: "hardcover"},
 		},
 	}
-	agg := &Aggregator{
+	agg := &aggregatorCore{requests: &requestCache{},
 		primary:   primary,
 		enrichers: []Provider{hardcover},
 		cache:     newTTLCache(time.Minute),
@@ -874,7 +874,7 @@ func TestAggregator_GetAuthorWorks_FillsMissingCoversFromPrimary(t *testing.T) {
 		},
 		byForeignID: map[string]string{"OLNOCOVERW": "https://covers.openlibrary.org/b/id/42-L.jpg"},
 	}
-	agg := &Aggregator{primary: primary, cache: newTTLCache(time.Minute)}
+	agg := &aggregatorCore{requests: &requestCache{}, primary: primary, cache: newTTLCache(time.Minute)}
 
 	got, err := agg.GetAuthorWorks(context.Background(), "OL123A")
 	if err != nil {

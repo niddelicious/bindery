@@ -64,6 +64,11 @@ type Book struct {
 	LastMetadataRefreshAt *time.Time `json:"lastMetadataRefreshAt"`
 	CreatedAt             time.Time  `json:"createdAt"`
 	UpdatedAt             time.Time  `json:"updatedAt"`
+	// UpdatedAtRaw is books.updated_at exactly as stored. The column holds
+	// several historical shapes (CURRENT_TIMESTAMP, the #914 time.String
+	// form), so reformatting UpdatedAt cannot reproduce it; guarded writes
+	// compare this text instead.
+	UpdatedAtRaw string `json:"-"`
 
 	// OwnerUserID is the per-user ownership column added in migration 025.
 	// See models.Author for the legacy zero-value semantics. Not surfaced
@@ -97,6 +102,10 @@ type Book struct {
 	Author    *Author    `json:"author,omitempty"`
 	Editions  []Edition  `json:"editions,omitempty"`
 	BookFiles []BookFile `json:"bookFiles,omitempty"`
+	// ImportInFlight is set on single-book responses while a download for the
+	// book is still on its way into the library, so the book page knows to
+	// refresh itself until the file lands (#2423). Not a column.
+	ImportInFlight bool `json:"importInFlight,omitempty"`
 	// Identifiers is the provider identity map from migration 078 (#1705),
 	// populated on the single-book GET so the detail page can show which
 	// record it is looking at and every other id the same book is known by
@@ -118,6 +127,17 @@ type Book struct {
 	// from the book's Editions (indexer.CriteriaISBN is the worked example, from
 	// the near-miss in #1724 that prompted the rename from ISBNs).
 	ProviderISBNs []string `json:"-"`
+
+	// Transport-only: the provider-owned fields (ProviderOwnedBookFields names)
+	// a single-book fetch could not determine, because a secondary call failed
+	// or the record never carries the field. A path that adopts the record must
+	// not read an empty value of one of these as "the record lacks it" (#3104).
+	// Never stored.
+	UnknownFields []string `json:"-"`
+
+	// Transport-only: the fields a rebind emptied because the new record had no
+	// value for them (#3104). Set on the Rebind response only; never stored.
+	Cleared []string `json:"cleared,omitempty"`
 
 	// Transport-only: the provider author keys credited on this work (e.g.
 	// OpenLibrary author IDs from the work's authors array). Used by the
@@ -316,6 +336,10 @@ func BookProviderFromForeignID(foreignID string) string {
 		return "hardcover"
 	case strings.HasPrefix(foreignID, "dnb:"):
 		return "dnb"
+	case strings.HasPrefix(foreignID, "nb:"):
+		return "nb"
+	case strings.HasPrefix(foreignID, "bnf:"):
+		return "bnf"
 	case strings.HasPrefix(foreignID, "calibre:"):
 		return "calibre"
 	case strings.HasPrefix(foreignID, "abs:"):

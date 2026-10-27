@@ -7,14 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
-	"math/rand"
 	"net/http"
 	"net/url"
 	"regexp"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,9 +21,9 @@ import (
 	"github.com/vavallee/bindery/internal/concurrency"
 	"github.com/vavallee/bindery/internal/httpsec"
 	"github.com/vavallee/bindery/internal/metadata/providererr"
+	"github.com/vavallee/bindery/internal/metadata/providerhttp"
 	"github.com/vavallee/bindery/internal/models"
 	"github.com/vavallee/bindery/internal/textutil"
-	"github.com/vavallee/bindery/internal/useragent"
 )
 
 // ErrNotFound signals a 404 from OpenLibrary. Callers use errors.Is to
@@ -36,28 +33,13 @@ var ErrNotFound = errors.New("not found")
 
 // ErrRateLimited is providererr.ErrRateLimited, re-exported so callers of this
 // package can name it here. getJSON marks an HTTP 429 that is still a 429
-// after its retries with it (#2236).
+// after its retries with it (#2236), and a request the client's refusal hold
+// would have kept past the caller's deadline.
 var ErrRateLimited = providererr.ErrRateLimited
-
-// rateLimitedError keeps the original status message while matching
-// ErrRateLimited through errors.Is.
-type rateLimitedError struct{ err error }
-
-func (e *rateLimitedError) Error() string        { return e.err.Error() }
-func (e *rateLimitedError) Unwrap() error        { return e.err }
-func (e *rateLimitedError) Is(target error) bool { return target == ErrRateLimited }
 
 // ErrUnavailable is providererr.ErrUnavailable: getJSON marks a server error
 // (HTTP 5xx) that is still one after its retries with it (#2236).
 var ErrUnavailable = providererr.ErrUnavailable
-
-// unavailableError keeps the original status message while matching
-// ErrUnavailable through errors.Is.
-type unavailableError struct{ err error }
-
-func (e *unavailableError) Error() string        { return e.err.Error() }
-func (e *unavailableError) Unwrap() error        { return e.err }
-func (e *unavailableError) Is(target error) bool { return target == ErrUnavailable }
 
 const (
 	baseURL  = "https://openlibrary.org"
@@ -76,7 +58,9 @@ const (
 // The cost of that is accuracy. OpenLibrary returns editions in no meaningful
 // order, so a handful of them is a sample rather than the leading editions, and
 // a work whose first few happen to be translations can be read as
-// foreign-language or pick up a foreign cover (#1779, still open on that half).
+// foreign-language or pick up a foreign cover. That is why the sample is now
+// the fallback: sampleWorkEditions asks the work's featured cover_edition
+// first and only samples for what it does not supply (#1779).
 //
 // The two derivations used to be separate samplers with separate caches, which
 // meant a work missing both language and cover cost TWO round trips to the
@@ -127,6 +111,9 @@ type workEditionSample struct {
 // Client implements the metadata.Provider interface for OpenLibrary.
 type Client struct {
 	http *http.Client
+	// gate holds every request this client makes while OpenLibrary is
+	// refusing. Nil (a zero value Client in tests) holds each call on its own.
+	gate *providerhttp.Gate
 
 	// workSampleCache memoizes the edition-derived (language, cover) pair keyed
 	// on work ID so a later refresh pass — or the second derivation in the same
@@ -135,12 +122,30 @@ type Client struct {
 	// don't retry it within the process lifetime.
 	workSampleMu    sync.Mutex
 	workSampleCache map[string]workEditionSample
+
+	// seriesNames caches the name of each structured series record by key
+	// ("/series/OL327402L"), "" for one OpenLibrary doesn't have, so an author
+	// sync asks about each series once per process however many works share it.
+	// seriesFailed remembers when a lookup last failed, so during an outage
+	// the works sharing a series don't each retry it (see seriesRetryAfter).
+	seriesNamesMu sync.Mutex
+	seriesNames   map[string]string
+	seriesFailed  map[string]time.Time
 }
+
+// seriesRetryAfter is how long a failed series lookup is remembered. A 5xx
+// costs a request and its retries, and holds the whole client, so an author
+// whose 200 works share one series must not ask about it 200 times.
+var seriesRetryAfter = 5 * time.Minute
+
+// maxSeriesNameRunes caps a series name read from a network record.
+const maxSeriesNameRunes = 255
 
 // New creates a new OpenLibrary client.
 func New() *Client {
 	return &Client{
-		http:            &http.Client{Timeout: 15 * time.Second, Transport: httpsec.DefaultProxyTransport()},
+		http:            &http.Client{Timeout: 15 * time.Second, Transport: httpsec.MetadataTransport()},
+		gate:            providerhttp.NewGate(),
 		workSampleCache: map[string]workEditionSample{},
 	}
 }
@@ -179,7 +184,7 @@ func (c *Client) SearchBooks(ctx context.Context, query string) ([]models.Book, 
 	// /search (without .json) is the HTML web-UI path (Solr-backed) and
 	// returns HTTP 500 "DEPRECATED ENDPOINT ACCESSED" for API consumers
 	// since their FastAPI rollout completed (see issue #462, follow-up to #408).
-	u := fmt.Sprintf("%s/search.json?q=%s&fields=key,title,author_name,author_key,first_publish_year,cover_i,isbn,subject,ratings_count&limit=20",
+	u := fmt.Sprintf("%s/search.json?q=%s&fields=key,title,author_name,author_key,first_publish_year,cover_i,isbn,subject,ratings_average,ratings_count&limit=20",
 		baseURL, url.QueryEscape(query))
 	var resp searchResponse
 	if err := c.getJSON(ctx, u, &resp); err != nil {
@@ -194,6 +199,7 @@ func (c *Client) SearchBooks(ctx context.Context, query string) ([]models.Book, 
 			Title:            doc.Title,
 			SortTitle:        doc.Title,
 			Genres:           truncateSlice(doc.Subject, 10),
+			AverageRating:    doc.RatingsAvg,
 			RatingsCount:     doc.RatingsCount,
 			ProviderISBNs:    doc.ISBN,
 			MetadataProvider: "openlibrary",
@@ -273,10 +279,22 @@ func (c *Client) GetBook(ctx context.Context, foreignID string) (*models.Book, e
 
 	if len(resp.Covers) > 0 && resp.Covers[0] > 0 {
 		b.ImageURL = fmt.Sprintf("%s/b/id/%d-L.jpg", coverURL, resp.Covers[0])
+	} else if resp.CoverEdition != nil {
+		// A work record often has no cover of its own while the edition its
+		// page features does (#1779). One request, only in that case, and
+		// best effort: a failure leaves the cover to the enrichers as before.
+		if key := strings.TrimPrefix(strings.TrimSpace(resp.CoverEdition.Key), "/books/"); key != "" {
+			var featured editionEntry
+			if err := c.getJSON(ctx, fmt.Sprintf("%s/books/%s.json", baseURL, key), &featured); err != nil {
+				slog.Debug("openlibrary: cover edition fetch failed", "work", foreignID, "edition", key, "error", err)
+			} else {
+				b.ImageURL = firstEditionCover([]editionEntry{featured})
+			}
+		}
 	}
 
 	// Parse series membership.
-	for _, s := range resp.Series {
+	for _, s := range c.resolveSeriesKeys(ctx, resp.Series) {
 		if s == "" {
 			continue
 		}
@@ -341,9 +359,11 @@ func (c *Client) enrichWorkFromSearch(ctx context.Context, foreignID string, b *
 	var resp searchResponse
 	if err := c.getJSON(ctx, baseURL+"/search.json?"+q.Encode(), &resp); err != nil {
 		slog.Debug("openlibrary: work search enrichment failed", "foreignId", foreignID, "error", err)
+		markDateAndLanguageUnknown(b)
 		return
 	}
 	if len(resp.Docs) == 0 {
+		markDateAndLanguageUnknown(b)
 		return
 	}
 	doc := resp.Docs[0]
@@ -352,6 +372,7 @@ func (c *Client) enrichWorkFromSearch(ctx context.Context, foreignID string, b *
 	if strings.TrimPrefix(doc.Key, "/works/") != foreignID {
 		slog.Debug("openlibrary: work search enrichment returned a different work",
 			"want", foreignID, "got", doc.Key)
+		markDateAndLanguageUnknown(b)
 		return
 	}
 	if b.ReleaseDate == nil && doc.FirstPublishYear > 0 {
@@ -360,6 +381,18 @@ func (c *Client) enrichWorkFromSearch(ctx context.Context, foreignID string, b *
 	}
 	if b.Language == "" {
 		b.Language = pickPreferredLanguage(doc.Language)
+	}
+}
+
+// markDateAndLanguageUnknown records that the search lookup did not answer, so
+// a still-empty release date or language means "not determined", not "the work
+// has none". A rebind reads it to avoid erasing the old values (#3104).
+func markDateAndLanguageUnknown(b *models.Book) {
+	if b.ReleaseDate == nil {
+		b.UnknownFields = append(b.UnknownFields, models.BookFieldReleaseDate)
+	}
+	if b.Language == "" {
+		b.UnknownFields = append(b.UnknownFields, models.BookFieldLanguage)
 	}
 }
 
@@ -471,7 +504,7 @@ func (c *Client) authorWorks(ctx context.Context, authorForeignID string) (books
 			SortTitle:        entry.Title,
 			Description:      extractText(entry.Description),
 			Genres:           truncateSlice(entry.Subjects, 10),
-			SeriesRefs:       seriesRefsFrom(entry.Series),
+			SeriesRefs:       seriesRefsFrom(c.resolveSeriesKeys(ctx, entry.Series)),
 			MetadataProvider: "openlibrary",
 			Monitored:        true,
 			Status:           models.BookStatusWanted,
@@ -671,6 +704,70 @@ func pickPreferredLanguage(langs []string) string {
 	return langs[0]
 }
 
+// resolveSeriesKeys replaces each structured series entry ("/series/OL…L #21",
+// see flexStringSlice) with its series name ("Vindserien #21"), so it reaches
+// parseSeriesRef like the plain string form and the same series gets the same
+// ol-series id either way. An entry whose name can't be found is dropped.
+func (c *Client) resolveSeriesKeys(ctx context.Context, series []string) []string {
+	out := series[:0:0]
+	for _, s := range series {
+		key, pos, _ := strings.Cut(s, " #")
+		if !seriesKeyRe.MatchString(key) {
+			out = append(out, s)
+			continue
+		}
+		name := c.seriesName(ctx, key)
+		if name == "" {
+			continue
+		}
+		if pos != "" {
+			name += " #" + pos
+		}
+		out = append(out, name)
+	}
+	return out
+}
+
+// seriesName returns the name of a structured series record, from the cache
+// or /series/<id>.json. A record OpenLibrary doesn't have is cached as "";
+// any other failure isn't cached, so a later sync asks again.
+func (c *Client) seriesName(ctx context.Context, key string) string {
+	c.seriesNamesMu.Lock()
+	name, ok := c.seriesNames[key]
+	failedAt, failed := c.seriesFailed[key]
+	c.seriesNamesMu.Unlock()
+	if ok {
+		return name
+	}
+	if failed && time.Since(failedAt) < seriesRetryAfter {
+		return ""
+	}
+	var rec struct {
+		Name string `json:"name"`
+	}
+	err := c.getJSON(ctx, baseURL+key+".json", &rec)
+	c.seriesNamesMu.Lock()
+	defer c.seriesNamesMu.Unlock()
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		slog.Debug("openlibrary: series lookup failed", "series", key, "error", err)
+		if c.seriesFailed == nil {
+			c.seriesFailed = map[string]time.Time{}
+		}
+		c.seriesFailed[key] = time.Now()
+		return ""
+	}
+	name = strings.TrimSpace(rec.Name)
+	if r := []rune(name); len(r) > maxSeriesNameRunes {
+		name = strings.TrimSpace(string(r[:maxSeriesNameRunes]))
+	}
+	if c.seriesNames == nil {
+		c.seriesNames = map[string]string{}
+	}
+	c.seriesNames[key] = name
+	delete(c.seriesFailed, key)
+	return name
+}
+
 // seriesRefsFrom parses the OL series strings attached to a works-endpoint
 // entry into SeriesRefs, flagging the first KEPT entry Primary. Entries whose
 // title yields no usable slug are dropped rather than sharing a ForeignID
@@ -868,7 +965,7 @@ func editionFromEntry(e editionEntry) models.Edition {
 func (c *Client) FillMissingWorkLanguages(ctx context.Context, books []models.Book) int {
 	targets := make([]int, 0, len(books))
 	for i := range books {
-		if books[i].Language != "" || books[i].ForeignID == "" {
+		if books[i].Language != "" || !ownsWork(books[i]) {
 			continue
 		}
 		targets = append(targets, i)
@@ -884,12 +981,74 @@ func (c *Client) FillMissingWorkLanguages(ctx context.Context, books []models.Bo
 	return int(filled.Load())
 }
 
-// sampleWorkEditions returns the language and cover derived from a work's first
-// editionSampleCap editions. Results (including the all-empty result) are cached
-// per work ID, so the language and cover derivations cost ONE round trip between
-// them rather than one each (#1888).
+// ownsWork reports whether book is an OpenLibrary work, the only kind with a
+// /works/{id}/editions.json to sample. A work merged in from another provider
+// (Hardcover "hc:", Audible "audible:", DNB "dnb:") is skipped: asking
+// OpenLibrary for it is a guaranteed "not found", one wasted request per work
+// on every pass (#3091). The provider prefix is the test, with the book's
+// MetadataProvider as a second one for a supplement that left the prefix off.
+func ownsWork(book models.Book) bool {
+	id := strings.TrimSpace(book.ForeignID)
+	if id == "" || strings.Contains(id, ":") {
+		return false
+	}
+	p := strings.TrimSpace(book.MetadataProvider)
+	return p == "" || strings.EqualFold(p, "openlibrary")
+}
+
+// sampleWorkEditions returns the language and cover derived for a work.
+// Results (including the all-empty result) are cached per work ID, so the
+// language and cover derivations share one derivation between them rather
+// than paying for one each (#1888).
+//
+// The work's cover_edition comes first (#1779). It is the edition
+// OpenLibrary's own work page features, so it is what a user comparing
+// Bindery with openlibrary.org expects, and unlike the editions endpoint,
+// whose order means nothing, it does not change with how many translations
+// a work has. The work record and that one edition are both plain document
+// fetches. Only what the cover edition does not supply is then taken from an
+// editionSampleCap sample of the editions list, as before: the majority
+// language, and a cover from an edition in that language where the sample has
+// one. A work-level cover, which the work record carries for free, is
+// preferred to a sampled one.
+//
+// Cost, against the single editions sample this used to make: up to two
+// extra requests per sampled work.
+//   - featured edition with both a language and a cover: work record and
+//     featured edition, two requests (the sample is skipped).
+//   - featured edition missing either one: work record, featured edition and
+//     the sample, three requests.
+//   - no featured edition, or the work record fails: work record and the
+//     sample, two requests.
+//
+// Each is made once per work per run and shared by both derivations.
 func (c *Client) sampleWorkEditions(ctx context.Context, workID string) workEditionSample {
 	if sample, ok := c.cachedWorkSample(workID); ok {
+		return sample
+	}
+
+	var sample workEditionSample
+	var work workResponse
+	if err := c.getJSON(ctx, fmt.Sprintf("%s/works/%s.json", baseURL, workID), &work); err != nil {
+		slog.Debug("openlibrary: work record fetch for edition sampling failed", "work", workID, "error", err)
+	} else {
+		if work.CoverEdition != nil {
+			if key := strings.TrimPrefix(strings.TrimSpace(work.CoverEdition.Key), "/books/"); key != "" {
+				var featured editionEntry
+				if err := c.getJSON(ctx, fmt.Sprintf("%s/books/%s.json", baseURL, key), &featured); err != nil {
+					slog.Debug("openlibrary: cover edition fetch failed", "work", workID, "edition", key, "error", err)
+				} else {
+					sample.language = majorityEditionLanguage([]editionEntry{featured})
+					sample.cover = firstEditionCover([]editionEntry{featured})
+				}
+			}
+		}
+		if sample.cover == "" && len(work.Covers) > 0 && work.Covers[0] > 0 {
+			sample.cover = fmt.Sprintf("%s/b/id/%d-L.jpg", coverURL, work.Covers[0])
+		}
+	}
+	if sample.language != "" && sample.cover != "" {
+		c.setCachedWorkSample(workID, sample)
 		return sample
 	}
 
@@ -897,17 +1056,58 @@ func (c *Client) sampleWorkEditions(ctx context.Context, workID string) workEdit
 	var resp editionsResponse
 	if err := c.getJSON(ctx, u, &resp); err != nil {
 		slog.Debug("openlibrary: edition sampling failed", "work", workID, "error", err)
-		// Cache the miss so we don't retry a flaky/expensive call this run.
-		c.setCachedWorkSample(workID, workEditionSample{})
-		return workEditionSample{}
+		// Cache what we have, a miss included, so a flaky or expensive call
+		// is not retried this run.
+		c.setCachedWorkSample(workID, sample)
+		return sample
 	}
 
-	sample := workEditionSample{
-		language: majorityEditionLanguage(resp.Entries),
-		cover:    firstEditionCover(resp.Entries),
+	if sample.language == "" {
+		sample.language = majorityEditionLanguage(resp.Entries)
+	}
+	if sample.cover == "" {
+		sample.cover = editionCoverInLanguage(resp.Entries, sample.language)
 	}
 	c.setCachedWorkSample(workID, sample)
 	return sample
+}
+
+// editionCoverInLanguage returns the cover of the first sampled edition in
+// language that has one, so a work read as English does not take the cover
+// of a translation that happened to come first (#1779). Failing that it takes
+// the first cover of an edition with no language recorded, and only then any
+// cover at all, as firstEditionCover always did.
+func editionCoverInLanguage(entries []editionEntry, language string) string {
+	if language != "" {
+		var inLanguage, unknown []editionEntry
+		for _, e := range entries {
+			switch langs := entryLanguages(e); {
+			case len(langs) == 0:
+				unknown = append(unknown, e)
+			case slices.Contains(langs, language):
+				inLanguage = append(inLanguage, e)
+			}
+		}
+		if cover := firstEditionCover(inLanguage); cover != "" {
+			return cover
+		}
+		if cover := firstEditionCover(unknown); cover != "" {
+			return cover
+		}
+	}
+	return firstEditionCover(entries)
+}
+
+// entryLanguages returns an edition's language codes ("eng"), without the
+// "/languages/" prefix.
+func entryLanguages(e editionEntry) []string {
+	out := make([]string, 0, len(e.Languages))
+	for _, l := range e.Languages {
+		if code := strings.TrimPrefix(l.Key, "/languages/"); code != "" {
+			out = append(out, code)
+		}
+	}
+	return out
 }
 
 // majorityEditionLanguage returns the most common language across the sampled
@@ -974,10 +1174,7 @@ func (c *Client) setCachedWorkSample(workID string, sample workEditionSample) {
 func (c *Client) FillMissingWorkCovers(ctx context.Context, books []models.Book) int {
 	targets := make([]int, 0, len(books))
 	for i := range books {
-		if books[i].ImageURL != "" || books[i].ForeignID == "" {
-			continue
-		}
-		if p := books[i].MetadataProvider; p != "" && p != "openlibrary" {
+		if books[i].ImageURL != "" || !ownsWork(books[i]) {
 			continue
 		}
 		targets = append(targets, i)
@@ -999,12 +1196,9 @@ func (c *Client) FillMissingWorkCovers(ctx context.Context, books []models.Book)
 // It used to say the entries arrive "most-held printings first". They do not:
 // /works/{id}/editions.json takes no sort parameter and its order is neither
 // publication nor popularity order, so which edition this lands on is not
-// meaningful (#1779). It is still a reasonable cover for a work that has none
-// of its own, which is the only situation it is consulted in, but a work whose
-// arbitrary first editions are a translation can pick up that translation's
-// cover. Making the choice deterministic is the open half of #1779 and needs a
-// wider sample than editionSampleCap, which is a cost decision rather than a
-// one-line change.
+// meaningful (#1779). sampleWorkEditions therefore asks the work's
+// cover_edition first and, failing that, prefers an edition in the sampled
+// language (editionCoverInLanguage); this is the last resort.
 func firstEditionCover(entries []editionEntry) string {
 	for _, e := range entries {
 		if len(e.Covers) > 0 && e.Covers[0] > 0 {
@@ -1114,183 +1308,34 @@ func (c *Client) GetBookByISBN(ctx context.Context, isbn string) (*models.Book, 
 	return b, nil
 }
 
-// getJSONMaxRetries bounds how many times a retryable failure (429, 502, 503,
-// 504, or a transport-level error) is retried before getJSON gives up.
-// OpenLibrary throttles per-UA (see editionSampleCap's comment) and a bulk
-// author import used to storm it with dozens of concurrent requests and no
-// backoff at all — #2075 reproduced 429s escalating into timeouts and
-// connection refusals with every request retried instantly forever.
-const getJSONMaxRetries = 3
-
-// getJSONBaseDelay and getJSONMaxDelay bound the exponential backoff applied
-// between retries when the response carries no Retry-After header.
-const (
-	getJSONBaseDelay = 500 * time.Millisecond
-	getJSONMaxDelay  = 8 * time.Second
-)
-
-// retryAfterCap bounds how long a single Retry-After value is honored for.
-// OpenLibrary is expected to send small values; capping defensively means a
-// malformed or unexpectedly large header can't stall a request indefinitely.
-const retryAfterCap = 30 * time.Second
-
-// maxDrainBytes bounds how much of a retryable error response's body gets
-// read (beyond the 512 bytes already sampled for the error message) purely
-// to let the connection be reused. OpenLibrary error bodies are small JSON
-// objects; this is generous headroom, not an expected size.
-const maxDrainBytes = 1 << 20 // 1 MiB
-
+// getJSON fetches rawURL and decodes it into target through the request loop
+// every HTTP metadata provider shares (package providerhttp): retries with
+// Retry-After and jittered backoff, a refusal that holds every request this
+// client makes rather than just the refused one, and the providererr marks on
+// what is left. OpenLibrary throttles per user agent, and a bulk author import
+// used to storm it until the 429s became timeouts and connection refusals
+// (#2075). A 404 is ErrNotFound.
+//
+// Transport errors keep their chain ("openlibrary request: %w"): callers and
+// tests rely on errors.Is(err, context.Canceled) and DeadlineExceeded to
+// classify them. OpenLibrary is keyless, so the URL a transport error embeds
+// carries no secret to redact (#1144 added redaction here, but it matched
+// nothing in OL URLs and only flattened the chain).
 func (c *Client) getJSON(ctx context.Context, rawURL string, target interface{}) error {
-	var lastErr error
-	var retryAfter time.Duration
-
-	for attempt := 0; attempt <= getJSONMaxRetries; attempt++ {
-		if attempt > 0 {
-			if err := sleepForRetry(ctx, backoffDelay(attempt, retryAfter)); err != nil {
-				return err
-			}
-		}
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-		if err != nil {
-			return err
-		}
-		req.Header.Set("User-Agent", useragent.Get())
-		req.Header.Set("Accept", "application/json")
-
-		resp, doErr := c.http.Do(req)
-		if doErr != nil {
-			// Wrap with %w so the error chain survives: callers (and tests) rely on
-			// errors.Is(err, context.Canceled)/context.DeadlineExceeded to classify
-			// cancellations and timeouts. OpenLibrary is a keyless API — every
-			// request URL is built from public path/query params (no key/token/auth),
-			// so the transport error's embedded URL carries no secret to redact.
-			// (#1144 added RedactSecrets here, but it matched nothing in OL URLs and
-			// only flattened the chain, breaking errors.Is classification.)
-			wrapped := fmt.Errorf("openlibrary request: %w", doErr)
-			// A canceled operation is never worth retrying, whatever canceled it.
-			// ctx.Err() != nil additionally means the CALLER's own deadline fired
-			// (as opposed to just this one request's timeout) — respect that
-			// budget too rather than retrying into a context that's already gone.
-			if errors.Is(doErr, context.Canceled) || ctx.Err() != nil || attempt == getJSONMaxRetries {
-				return wrapped
-			}
-			lastErr = wrapped
-			retryAfter = 0
-			continue
-		}
-
-		if resp.StatusCode == http.StatusNotFound {
-			_ = resp.Body.Close()
-			return ErrNotFound
-		}
-		if resp.StatusCode == http.StatusOK {
-			err := json.NewDecoder(resp.Body).Decode(target)
-			_ = resp.Body.Close()
-			return err
-		}
-
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		// Drain and discard whatever's left (bounded) before closing. Go's
-		// transport only returns a connection to its pool for reuse once the
-		// body has been read to EOF; closing after a partial read forces a
-		// fresh TCP connection on the very next retry — leaning into the
-		// exact "connection refused" symptom #2075 reported under a storm of
-		// retried requests.
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrainBytes))
-		_ = resp.Body.Close()
-		statusErr := fmt.Errorf("HTTP %d: %s", resp.StatusCode, httpsec.RedactSecrets(string(body)))
-
-		if !isRetryableStatus(resp.StatusCode) || attempt == getJSONMaxRetries {
-			if resp.StatusCode == http.StatusTooManyRequests {
-				return &rateLimitedError{err: statusErr}
-			}
-			if resp.StatusCode >= http.StatusInternalServerError {
-				return &unavailableError{err: statusErr}
-			}
-			return statusErr
-		}
-		lastErr = statusErr
-		retryAfter = parseRetryAfter(resp.Header.Get("Retry-After"))
+	resp, err := providerhttp.Do(ctx, c.http, c.gate, providerhttp.Request{
+		Provider: "openlibrary",
+		URL:      rawURL,
+		Header:   http.Header{"Accept": {"application/json"}},
+		Pass:     []int{http.StatusNotFound},
+	})
+	if err != nil {
+		return err
 	}
-	// Unreachable: every iteration above returns on its last attempt. Kept so
-	// the compiler doesn't need to prove that itself.
-	return lastErr
-}
-
-// isRetryableStatus reports whether status is a transient upstream failure
-// worth retrying rather than a real answer (a 4xx other than 429 means the
-// request itself is wrong, not that OpenLibrary is struggling).
-func isRetryableStatus(status int) bool {
-	switch status {
-	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
-		return true
-	default:
-		return false
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return ErrNotFound
 	}
-}
-
-// parseRetryAfter reads an HTTP Retry-After header, accepting either a
-// delay-in-seconds or an HTTP-date, and returns 0 when absent or unparsable
-// (the caller falls back to computed backoff in that case).
-func parseRetryAfter(v string) time.Duration {
-	if v == "" {
-		return 0
-	}
-	if secs, err := strconv.Atoi(v); err == nil {
-		if secs <= 0 {
-			return 0
-		}
-		d := time.Duration(secs) * time.Second
-		if d > retryAfterCap {
-			return retryAfterCap
-		}
-		return d
-	}
-	if t, err := http.ParseTime(v); err == nil {
-		if d := time.Until(t); d > 0 {
-			if d > retryAfterCap {
-				return retryAfterCap
-			}
-			return d
-		}
-	}
-	return 0
-}
-
-// backoffDelay picks how long to wait before the given retry attempt
-// (1-indexed: the first retry is attempt 1). retryAfter, when positive, wins
-// outright — the server told us exactly how long to wait. Otherwise this
-// backs off exponentially from getJSONBaseDelay, capped at getJSONMaxDelay,
-// with equal jitter (half the computed delay, plus a random amount up to the
-// other half) so a burst of requests that all failed together don't all
-// retry in lockstep and produce a second burst.
-func backoffDelay(attempt int, retryAfter time.Duration) time.Duration {
-	if retryAfter > 0 {
-		return retryAfter
-	}
-	d := getJSONBaseDelay << uint(attempt-1) //nolint:gosec // attempt is bounded by getJSONMaxRetries, no overflow risk
-	if d <= 0 || d > getJSONMaxDelay {
-		d = getJSONMaxDelay
-	}
-	half := d / 2
-	return half + time.Duration(rand.Int63n(int64(half)+1)) //nolint:gosec // backoff jitter, not security-sensitive
-}
-
-// sleepForRetry waits for d, returning early with a wrapped ctx error if the
-// context is canceled or expires first.
-func sleepForRetry(ctx context.Context, d time.Duration) error {
-	if d <= 0 {
-		return nil
-	}
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-timer.C:
-		return nil
-	case <-ctx.Done():
-		return fmt.Errorf("openlibrary request: %w", ctx.Err())
-	}
+	return json.NewDecoder(resp.Body).Decode(target)
 }
 
 // extractText handles OpenLibrary's description field which can be a string

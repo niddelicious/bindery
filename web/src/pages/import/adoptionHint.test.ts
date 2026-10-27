@@ -3,7 +3,7 @@ import type { TFunction } from 'i18next'
 import en from '../../i18n/locales/en.json'
 import type { AdoptionItem } from '../../api/client'
 import { adoptionHint, scorePercent } from './adoptionHint'
-import { STRONG_MATCH_SCORE, authorsMatch, matchStrength } from './adoptionMatch'
+import { STRONG_MATCH_SCORE, authorsMatch, inOtherFormatRoot, matchStrength, shortHint } from './adoptionMatch'
 
 const lookup = (key: string): unknown =>
   key.split('.').reduce<unknown>((n, p) => (n && typeof n === 'object' ? (n as Record<string, unknown>)[p] : undefined), en)
@@ -48,6 +48,15 @@ describe('adoptionHint', () => {
     expect(adoptionHint(strong, t).sentence).toBe('Strong match: The Martian by Andy Weir. Confirm it or choose another book.')
   })
 
+  // The row says "No good match" below WEAK_MATCH_SCORE and the editor folds
+  // the suggestion away; the sentence must not point at it as a match.
+  it('does not offer a suggestion below the weak score as a possible match', () => {
+    const faint = item({ parsedAuthor: 'Andy Weir', candidates: [{ book: martian, score: 0.12 }] })
+    const hint = adoptionHint(faint, t)
+    expect(hint.sentence).not.toContain('The Martian')
+    expect(hint.sentence).toBe('No book by Andy Weir has a title close to this one. Choose the book it is.')
+  })
+
   it('calls anything weaker a possible match, never a one click confirm', () => {
     // 0.82 is the "A Martyrs Tale" against "The Martian" case.
     const weak = item({ parsedAuthor: 'Andy Weir', candidates: [{ book: martian, score: 0.82 }] })
@@ -56,6 +65,37 @@ describe('adoptionHint', () => {
     // A near identical title by another author is still only possible.
     expect(matchStrength(item({ parsedAuthor: 'Ann Leckie', candidates: [{ book: martian, score: 0.99 }] }))).toBe('possible')
     expect(STRONG_MATCH_SCORE).toBe(0.92)
+  })
+
+  it('never offers a one click confirm into a book that already has its files or was skipped (#2879)', () => {
+    for (const status of ['imported', 'skipped']) {
+      const settled = item({ parsedAuthor: 'Andy Weir', candidates: [{ book: { ...martian, status }, score: 1 }] })
+      expect(matchStrength(settled)).toBe('possible')
+      expect(adoptionHint(settled, t).sentence).not.toContain('Confirm')
+    }
+  })
+
+  // #2944: a 1 KB .txt under the audiobooks root was offered as a strong
+  // match and adopted in one click as the book's ebook.
+  it('never offers a one click confirm for a row in the other format\'s folder', () => {
+    const misplaced = item({ format: 'ebook', rootFormat: 'audiobook', parsedAuthor: 'Andy Weir', candidates: [{ book: martian, score: 1 }] })
+    expect(matchStrength(misplaced)).toBe('possible')
+    expect(adoptionHint(misplaced, t).sentence).not.toContain('Confirm')
+    expect(inOtherFormatRoot(misplaced)).toBe(true)
+    expect(inOtherFormatRoot(item({ format: 'audiobook', rootFormat: 'ebook' }))).toBe(true)
+    // Same folder as its format, or one combined root: nothing to say.
+    expect(inOtherFormatRoot(item({ format: 'ebook', rootFormat: 'ebook' }))).toBe(false)
+    expect(inOtherFormatRoot(item({ format: 'ebook' }))).toBe(false)
+    expect(matchStrength(item({ format: 'ebook', parsedAuthor: 'Andy Weir', candidates: [{ book: martian, score: 1 }] }))).toBe('strong')
+  })
+
+  it('says a too small file is not a book, and offers no adoption', () => {
+    const tiny = item({ reason: 'too_small', sizeBytes: 1008, relPath: 'James Patterson/Die 6. Geisel ()/Die 6. Geisel.txt' })
+    const hint = adoptionHint(tiny, t)
+    expect(hint.sentence).toMatch(/too small to be a book/)
+    expect(hint.sentence).not.toMatch(/Choose the book|Confirm/)
+    expect(hint.tooltip).toContain('too_small')
+    expect(shortHint(tiny, t)).toBe('Too small to be a book')
   })
 
   it('matches authors by their words', () => {

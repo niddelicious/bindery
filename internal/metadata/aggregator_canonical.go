@@ -71,12 +71,12 @@ const (
 	canonicalPrimaryBookDirectISBNConfirmed
 )
 
-func (a *Aggregator) canonicalPrimaryBook(ctx context.Context, isbn string, source models.Book) (*models.Book, bool) {
+func (a *aggregatorCore) canonicalPrimaryBook(ctx context.Context, isbn string, source models.Book) (*models.Book, bool) {
 	canonical, status := a.lookupCanonicalPrimaryBook(ctx, isbn, source)
 	return canonical, status == canonicalPrimaryBookMatched
 }
 
-func (a *Aggregator) lookupCanonicalPrimaryBook(ctx context.Context, isbn string, source models.Book) (*models.Book, canonicalPrimaryBookStatus) {
+func (a *aggregatorCore) lookupCanonicalPrimaryBook(ctx context.Context, isbn string, source models.Book) (*models.Book, canonicalPrimaryBookStatus) {
 	if a == nil || a.primary == nil || source.Title == "" {
 		return nil, canonicalPrimaryBookNoMatch
 	}
@@ -555,8 +555,8 @@ func canonicalTitleDescriptorWord(word string) bool {
 	}
 }
 
-func (a *Aggregator) canonicalPrimaryBookSearch(ctx context.Context, query primaryBookCanonicalQuery, source models.Book, sourceAuthor string) (*canonicalPrimaryBookMatch, bool) {
-	results, err := a.primary.SearchBooks(ctx, query.query)
+func (a *aggregatorCore) canonicalPrimaryBookSearch(ctx context.Context, query primaryBookCanonicalQuery, source models.Book, sourceAuthor string) (*canonicalPrimaryBookMatch, bool) {
+	results, err := a.searchProviderBooks(ctx, a.primary, query.query)
 	if err != nil {
 		slog.Debug("primary canonical book search failed", "query", query.query, "title", source.Title, "author", sourceAuthor, "error", err)
 		return nil, false
@@ -564,7 +564,7 @@ func (a *Aggregator) canonicalPrimaryBookSearch(ctx context.Context, query prima
 	return a.canonicalPrimaryBookFromResults(query, source, sourceAuthor, results, false)
 }
 
-func (a *Aggregator) canonicalPrimaryBookFromQueries(ctx context.Context, queries []primaryBookCanonicalQuery, lookup func(primaryBookCanonicalQuery) (*canonicalPrimaryBookMatch, bool)) (*models.Book, canonicalPrimaryBookStatus) {
+func (a *aggregatorCore) canonicalPrimaryBookFromQueries(ctx context.Context, queries []primaryBookCanonicalQuery, lookup func(primaryBookCanonicalQuery) (*canonicalPrimaryBookMatch, bool)) (*models.Book, canonicalPrimaryBookStatus) {
 	hasSegmentVariant := canonicalQueriesHaveSegmentVariant(queries)
 	var provisional *canonicalPrimaryBookMatch
 	provisionalAmbiguous := false
@@ -642,7 +642,7 @@ func betterCanonicalProvisionalMatch(current *canonicalPrimaryBookMatch, ambiguo
 	return current, ambiguous
 }
 
-func (a *Aggregator) canonicalPrimaryBookAuthorWorks(ctx context.Context, source models.Book, sourceAuthor string) (*models.Book, bool) {
+func (a *aggregatorCore) canonicalPrimaryBookAuthorWorks(ctx context.Context, source models.Book, sourceAuthor string) (*models.Book, bool) {
 	if source.Author == nil || source.Author.ForeignID == "" {
 		return nil, false
 	}
@@ -679,7 +679,7 @@ func (a *Aggregator) canonicalPrimaryBookAuthorWorks(ctx context.Context, source
 	return canonical, status == canonicalPrimaryBookMatched
 }
 
-func (a *Aggregator) canonicalPrimaryBookFromResults(query primaryBookCanonicalQuery, source models.Book, sourceAuthor string, results []models.Book, assumeAuthorMatch bool) (*canonicalPrimaryBookMatch, bool) {
+func (a *aggregatorCore) canonicalPrimaryBookFromResults(query primaryBookCanonicalQuery, source models.Book, sourceAuthor string, results []models.Book, assumeAuthorMatch bool) (*canonicalPrimaryBookMatch, bool) {
 	matches := make([]bookMatchCandidate, 0, len(results))
 	seen := make(map[string]struct{}, len(results))
 	for rank, result := range results {
@@ -694,7 +694,7 @@ func (a *Aggregator) canonicalPrimaryBookFromResults(query primaryBookCanonicalQ
 		authorMatchedAlias := false
 		if !assumeAuthorMatch || bookAuthorName(result) != "" {
 			author, authorMatchedAlias = bookAuthorMatch(sourceAuthor, result)
-			if author.Kind != textutil.AuthorMatchExact && author.Kind != textutil.AuthorMatchFuzzyAuto {
+			if !author.ConfirmedByTitle() {
 				continue
 			}
 		}
@@ -741,7 +741,7 @@ func (a *Aggregator) canonicalPrimaryBookFromResults(query primaryBookCanonicalQ
 	return &canonicalPrimaryBookMatch{candidate: best}, true
 }
 
-func (a *Aggregator) fetchCanonicalPrimaryBook(ctx context.Context, match *canonicalPrimaryBookMatch) *models.Book {
+func (a *aggregatorCore) fetchCanonicalPrimaryBook(ctx context.Context, match *canonicalPrimaryBookMatch) *models.Book {
 	full, err := a.primary.GetBook(ctx, match.candidate.book.ForeignID)
 	if err != nil {
 		slog.Debug("primary canonical book fetch failed", "foreignID", match.candidate.book.ForeignID, "error", err)

@@ -71,7 +71,7 @@ Bootstrap:
 
 1. An admin saves ABS settings under the `abs.*` keys. `PUT /api/v1/abs/config` normalizes and stores local settings without contacting ABS.
 2. The UI can explicitly probe the ABS instance to validate auth and list accessible book libraries. Probes require a saved base URL and use either a request API-key override or the stored write-only key.
-3. `POST /api/v1/abs/import` starts an async import using the stored config.
+3. `POST /api/v1/abs/import` starts an async import using the stored config. The body is optional: `dryRun` previews, `libraryIds` narrows the run to a subset of the configured libraries (an id that is not configured is a `400`), and `full: true` ignores the recorded Hardcover series outcomes described under Hardcover Series Re-Match Skipping.
 4. The importer processes selected libraries sequentially in saved order. Each library receives its own `abs_import_runs` row, source snapshot, checkpoint updates, summary, rollback scope, and provenance keyed by that library ID.
 5. The importer validates that each selected library response is for a book library, rejects non-book items, and fetches detail payloads when list data is incomplete.
 6. If a library import fails, the active run is marked failed and later libraries are not started. Completed earlier library runs remain intact.
@@ -79,6 +79,21 @@ Bootstrap:
 8. Each normalized ABS item is mapped into Bindery authors, books, series, editions, provenance, and optional review/conflict records.
 9. Progress is exposed through `GET /api/v1/abs/import/status`.
 10. Completed runs are persisted and surfaced through recent-runs and rollback endpoints.
+
+## Hardcover Series Re-Match Skipping
+
+With enhanced Hardcover enabled, every item used to be searched against Hardcover on every run, and an item with no ABS series searched on its own title. On a library of thousands that is one search per item per run (#2173). The importer now records the outcome per item in `abs_series_match_state` and skips the match when the record still applies:
+
+- **matched**: the item was linked to a Hardcover series. It is skipped until its inputs change, with no expiry.
+- **miss**: Hardcover was searched and nothing usable came back (no result, or an ambiguous one). It is skipped for 30 days plus a per item offset of up to 7 days, then retried. A month because Hardcover gains series slowly and a nightly import would otherwise ask 30 times for one answer. The offset stops a first import from making every miss fall due on the same night.
+- **changed**: the record stores a hash of what the match reads (resolved author name, ABS title, the series names and sequences used as queries, the linked book id and a rule version). A different hash means the item matches again at once.
+- **failed calls are not recorded**: a rate limited or erroring search says nothing about the item, so the next run retries it.
+- **upgrading**: an item with no record is adopted as matched only when its own book already has the Hardcover provider and the item has a series membership whose series has a Hardcover link, so the upgrade does not cost one more full walk. A series link alone is not enough: a brand new volume joining a series a sibling already linked has the membership but not the Hardcover identity, so it matches normally.
+- **dry runs** read the records but never write them, so a dry run omits the Hardcover part (series link, upstream merge, catalog linking) of every skipped item.
+- **what a skip leaves out**: the upstream metadata merge and the late linking of other catalog volumes that a match performs also do not run for a skipped item, because both need a Hardcover call. A volume Hardcover adds to a series later is not linked, and upstream metadata is not re-merged, until the item changes, a miss expires, or you send `full: true`. `full: true` is the way to refresh.
+- **`full: true`** on the import request bypasses the records for that run and rewrites them.
+
+Limits: the hash covers Bindery's view of the inputs, not ABS `updatedAt` (which Bindery does not decode), so a change that does not touch those inputs does not re-match. A matched item whose series link a user later removes is not re-linked until it changes or a full run is requested. The per item series count in a run's results omits a skipped item's Hardcover series. A run limited with `libraryIds` replaces the single stored resume checkpoint, so an interrupted run of other libraries restarts from the beginning of its library, and it stamps `abs.last_import_at` like any run (nothing reads that setting).
 
 ## Per-Item Timeout
 
@@ -120,9 +135,12 @@ Secondary ABS authors are recorded as aliases where possible.
 Resolution order:
 
 1. `abs_provenance` lookup for the ABS item id
-2. fallback `books.foreign_id = abs:book:<library_id>:<item_id>`
-3. existing book under the resolved author with the same normalized title
-4. create a new shared book
+2. fallback `books.foreign_id = abs:book:<library_id>:<item_id>`, also found as a recorded book identifier after the book was relinked to an upstream id
+3. existing book that already tracks one of the item's files in `book_files` (the ebook file or the audiobook folder, after `abs.path_remap`), whatever its title, when its author is the item's author (the same row, or a name that matches automatically) and it belongs to the same owner or to nobody. The book keeps its own author and title, on this import and on every later one through the link it records; the other fields are applied as for any match
+4. existing book under the resolved author with the same normalized title
+5. create a new shared book
+
+Retitling an item in Audiobookshelf and importing again updates the same book through step 1 or 2. Step 3 covers a book Bindery had before the item was ever imported, such as one it downloaded itself under the provider's spelling of the title: the item is matched to it instead of becoming a second, wanted row beside the owned one.
 
 Important applied fields:
 
@@ -183,6 +201,8 @@ Effective roots can come from:
 - `BINDERY_AUDIOBOOK_DIR`
 - the author's explicit root folder
 - `library.defaultRootFolderId`
+- the author's explicit audiobook root folder (audiobooks only)
+- `library.defaultAudiobookRootFolderId` (audiobooks only)
 
 When a path is visible and valid, Bindery records it through the normal book-file write path. When it is not, the item remains metadata-only and contributes to pending/manual follow-up rather than failing the whole run.
 

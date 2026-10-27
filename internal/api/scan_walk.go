@@ -3,6 +3,7 @@ package api
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 
 	"github.com/vavallee/bindery/internal/importer"
@@ -50,7 +51,18 @@ const (
 // during the walk itself, rather than capping first and filtering the capped
 // result — the latter can starve the cap entirely when most of a large,
 // already-imported folder sits ahead of any new files in walk order.
-func enumerateImportUnits(root string, limit int, skip func(path string, isDir bool) bool) (units []scanUnit, truncated bool) {
+//
+// excluded lists folders the walk does not enter, as the library scan does
+// for the download folders: a path equal to one of them is left out (the root
+// itself never is). Callers pass them cleaned and symlink-resolved once, at
+// setup, so the walk compares strings and makes no filesystem call for them.
+// Junk folders are left out as in the library scan, through the same
+// deny-list (importer.JunkLibraryDirName) so the rules cannot drift.
+func enumerateImportUnits(root string, limit int, skip func(path string, isDir bool) bool, excluded []string) (units []scanUnit, truncated bool) {
+	excludedSet := make(map[string]bool, len(excluded))
+	for _, dir := range excluded {
+		excludedSet[dir] = true
+	}
 	entriesSeen := 0
 	var walk func(dir string, depth int, isRoot bool)
 	walk = func(dir string, depth int, isRoot bool) {
@@ -66,6 +78,12 @@ func enumerateImportUnits(root string, limit int, skip func(path string, isDir b
 			return // skip unreadable directories rather than abort the whole scan
 		}
 		entriesSeen += len(entries)
+		// A .binderyignore folder is left out, as in the library scan
+		// (importer.SkipLibraryDir). It is found among the entries already
+		// read rather than with a second filesystem lookup per folder.
+		if !isRoot && slices.ContainsFunc(entries, func(e os.DirEntry) bool { return e.Name() == importer.LibraryIgnoreFile }) {
+			return
+		}
 
 		var subdirs, audioFiles, ebookFiles []string
 		for _, e := range entries {
@@ -73,7 +91,12 @@ func enumerateImportUnits(root string, limit int, skip func(path string, isDir b
 			full := filepath.Join(dir, name)
 			switch {
 			case e.IsDir():
-				subdirs = append(subdirs, full)
+				// Junk folders (a torrent client's ".torrents", a trash
+				// folder) and the download folders are not library content,
+				// as in the library scan.
+				if !importer.JunkLibraryDirName(name) && !excludedSet[full] {
+					subdirs = append(subdirs, full)
+				}
 			case importer.IsAudioFile(full):
 				audioFiles = append(audioFiles, full)
 			case importer.IsEbookFile(full):
@@ -102,8 +125,11 @@ func enumerateImportUnits(root string, limit int, skip func(path string, isDir b
 				emit(dir, true)
 				return
 			}
-			// Every subdir a disc folder → one multi-disc audiobook.
-			if len(subdirs) > 0 && importer.AllDiscFolders(subdirs) {
+			// Every subdir a disc folder → one multi-disc audiobook. A disc
+			// named after its book counts only from book depth down, two
+			// levels under the root, so an author folder never becomes a book
+			// (#3327).
+			if len(subdirs) > 0 && importer.AllDiscFolders(subdirs, depth >= 2) {
 				emit(dir, true)
 				return
 			}

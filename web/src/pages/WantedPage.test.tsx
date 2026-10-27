@@ -4,7 +4,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { MemoryRouter, useLocation } from 'react-router'
 import WantedPage from './WantedPage'
 import { api } from '../api/client'
+import { coverColorFor } from '../components/coverPalette'
 import type { Author, Book, Download, SearchResult } from '../api/client'
+import { acceptConfirm, clickBulkAction } from '../test-utils'
 
 vi.mock('../api/client', async importOriginal => {
   const actual = await importOriginal<typeof import('../api/client')>()
@@ -12,7 +14,7 @@ vi.mock('../api/client', async importOriginal => {
     ...actual,
     api: {
       ...actual.api,
-      listWanted: vi.fn(),
+      listWantedPage: vi.fn(),
       searchBook: vi.fn(),
       grab: vi.fn(),
       updateBook: vi.fn(),
@@ -24,13 +26,18 @@ vi.mock('../api/client', async importOriginal => {
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     t: (key: string, options?: Record<string, unknown>) => {
-      if (key === 'wanted.countLabel') return `${String(options?.filtered)} of ${String(options?.total)}`
+      if (key === 'books.countLabel') return `${String(options?.count)} books`
       if (key === 'wanted.selectBook') return `Select ${String(options?.title)}`
+      if (key === 'search.grabs') return `${String(options?.n)} grabs`
       if (key === 'wanted.changeFormat') return `Change format for ${String(options?.title)}`
+      if (key === 'bookDetail.filteredHeading') return `Filtered (${String(options?.count)})`
+      if (key === 'bookDetail.noResultsFiltered') return `None matched, ${String(options?.count)} filtered.`
       if (key === 'bulkActionBar.selected') return `${String(options?.count)} selected`
 
       const labels: Record<string, string> = {
         'wanted.title': 'Wanted',
+        'search.grab': 'Grab',
+        'search.grabbing': 'Grabbing…',
         'wanted.searchPlaceholder': 'Search by title or author...',
         'wanted.empty': 'No wanted books. Add an author to start tracking.',
         'importHints.heading': 'Already have files on disk?',
@@ -62,28 +69,12 @@ vi.mock('react-i18next', () => ({
         'wanted.colTitleAuthor': 'Title & author',
         'wanted.colFormat': 'Format',
         'wanted.colActions': 'Actions',
-        'wanted.noCover': 'No cover',
         'wanted.authorUnknown': 'Author unknown',
         'wanted.authorNotMonitored': 'Author not monitored, so this is not searched automatically',
         'search.autoGrabDisabled': 'No search was run. Automatic grabbing is off.',
       }
       return labels[key] ?? key
     },
-  }),
-}))
-
-vi.mock('../components/usePagination', () => ({
-  usePagination: <T,>(items: T[]) => ({
-    pageItems: items,
-    paginationProps: {
-      page: 1,
-      totalPages: 1,
-      pageSize: 50,
-      totalItems: items.length,
-      onPageChange: vi.fn(),
-      onPageSizeChange: vi.fn(),
-    },
-    reset: vi.fn(),
   }),
 }))
 
@@ -123,6 +114,25 @@ function makeBook(overrides: Partial<Book> & Pick<Book, 'id' | 'title'>): Book {
     author,
     ...rest,
   }
+}
+
+// pageOf is what GET /wanted/missing?limit= answers: one page and the total
+// matching the query. pageOf(books) is the whole result on one page.
+function pageOf(items: Book[], total = items.length, offset = 0) {
+  return { items, total, limit: 50, offset }
+}
+
+// serverLike answers listWantedPage the way the server does: it filters by the
+// search (substring of title or author), then slices the page asked for and
+// reports how many matched.
+function serverLike(all: Book[]) {
+  vi.mocked(api.listWantedPage).mockImplementation(async ({ limit, offset, search }) => {
+    const q = (search ?? '').trim().toLowerCase()
+    const matching = q
+      ? all.filter(b => b.title.toLowerCase().includes(q) || (b.author?.authorName ?? '').toLowerCase().includes(q))
+      : all
+    return { items: matching.slice(offset, offset + limit), total: matching.length, limit, offset }
+  })
 }
 
 function makeResult({ guid, title, ...rest }: Partial<SearchResult> & { guid: string; title: string }): SearchResult {
@@ -176,7 +186,7 @@ function renderWantedPage(onLocation?: (location: Located) => void) {
 beforeEach(() => {
   vi.clearAllMocks()
   document.title = 'Bindery'
-  vi.mocked(api.listWanted).mockResolvedValue([])
+  vi.mocked(api.listWantedPage).mockResolvedValue(pageOf([]))
   vi.mocked(api.searchBook).mockResolvedValue({ results: [], debug: null })
   vi.mocked(api.grab).mockResolvedValue(makeDownload())
   vi.mocked(api.updateBook).mockImplementation(async (id, patch) => makeBook({ id, title: 'Updated Book', ...patch }))
@@ -192,8 +202,8 @@ describe('WantedPage', () => {
     renderWantedPage()
 
     expect(await screen.findByText('No wanted books. Add an author to start tracking.')).toBeInTheDocument()
-    expect(screen.getByText('0 of 0')).toBeInTheDocument()
-    expect(api.listWanted).toHaveBeenCalledWith({ includeExcluded: false })
+    expect(screen.getByText('0 books')).toBeInTheDocument()
+    expect(api.listWantedPage).toHaveBeenCalledWith({ limit: 50, offset: 0, search: undefined, includeExcluded: false })
   })
 
   it('surfaces the Manual Import and Scan Library hints in the empty state', async () => {
@@ -208,9 +218,9 @@ describe('WantedPage', () => {
 
   it('renders a row with the book title and its author', async () => {
     const tolkien: Author = { ...author, id: 99, authorName: 'J.R.R. Tolkien' }
-    vi.mocked(api.listWanted).mockResolvedValue([
+    vi.mocked(api.listWantedPage).mockResolvedValue(pageOf([
       makeBook({ id: 1, title: 'The Hobbit', authorId: 99, author: tolkien, releaseDate: '1937-09-21' }),
-    ])
+    ]))
 
     renderWantedPage()
 
@@ -221,9 +231,9 @@ describe('WantedPage', () => {
   })
 
   it('renders gracefully and shows a fallback when a book has no author', async () => {
-    vi.mocked(api.listWanted).mockResolvedValue([
+    vi.mocked(api.listWantedPage).mockResolvedValue(pageOf([
       makeBook({ id: 1, title: 'Orphan Book', author: undefined }),
-    ])
+    ]))
 
     renderWantedPage()
 
@@ -231,8 +241,27 @@ describe('WantedPage', () => {
     expect(screen.getByText('Author unknown')).toBeInTheDocument()
   })
 
+  // A cover that fails to load, such as a stored cover the list returned raw
+  // before #3146, shows the shared cover placeholder rather than a broken image.
+  it('shows the cover placeholder when a cover fails to load', async () => {
+    vi.mocked(api.listWantedPage).mockResolvedValue(pageOf([
+      makeBook({ id: 1, title: 'Fjellvinden', imageUrl: '/api/v1/images?url=bindery-cover%3Agone.jpg' }),
+    ]))
+
+    const { container } = renderWantedPage()
+
+    await screen.findByRole('link', { name: 'Fjellvinden' })
+    fireEvent.error(container.querySelector('img')!)
+    expect(container.querySelector('img')).toBeNull()
+    // The shared placeholder: the book's own palette ground, seeded by its id,
+    // where the old fallback was a fixed grey box.
+    const tile = container.querySelector('.w-8.h-11[aria-hidden]')!
+    expect(tile.className).toContain(coverColorFor(1).className.split(' ')[0])
+    expect(tile.className).not.toContain('bg-slate-200')
+  })
+
   it('renders the column header row with a select-all checkbox', async () => {
-    vi.mocked(api.listWanted).mockResolvedValue([makeBook({ id: 1, title: 'Dune' })])
+    vi.mocked(api.listWantedPage).mockResolvedValue(pageOf([makeBook({ id: 1, title: 'Dune' })]))
 
     renderWantedPage()
 
@@ -243,8 +272,8 @@ describe('WantedPage', () => {
     expect(screen.getByRole('checkbox', { name: 'Select all on this page' })).toBeInTheDocument()
   })
 
-  it('filters the list with the search box', async () => {
-    vi.mocked(api.listWanted).mockResolvedValue([
+  it('searches on the server with the search box', async () => {
+    serverLike([
       makeBook({ id: 1, title: 'Dune' }),
       makeBook({ id: 2, title: 'Hyperion' }),
     ])
@@ -256,12 +285,51 @@ describe('WantedPage', () => {
       target: { value: 'hyper' },
     })
 
-    expect(screen.queryByRole('link', { name: 'Dune' })).not.toBeInTheDocument()
+    // The box commits after a pause and the server answers for the query.
+    await waitFor(() => expect(api.listWantedPage).toHaveBeenLastCalledWith(
+      expect.objectContaining({ search: 'hyper', offset: 0 }),
+    ))
+    await waitFor(() => expect(screen.queryByRole('link', { name: 'Dune' })).not.toBeInTheDocument())
     expect(screen.getByRole('link', { name: 'Hyperion' })).toBeInTheDocument()
+    expect(screen.getByText('1 books')).toBeInTheDocument()
+  })
+
+  it('shows the no match message when the search finds nothing, not the empty state', async () => {
+    serverLike([makeBook({ id: 1, title: 'Dune' })])
+    renderWantedPage()
+    await screen.findByRole('link', { name: 'Dune' })
+
+    fireEvent.change(screen.getByPlaceholderText('Search by title or author...'), { target: { value: 'zzz' } })
+
+    expect(await screen.findByText('No books match your search.')).toBeInTheDocument()
+    expect(screen.queryByText('No wanted books. Add an author to start tracking.')).not.toBeInTheDocument()
+  })
+
+  // The page asks the server for one page, not the whole list: 120 wanted
+  // books means 50 rows on screen and a total of 120 in the header.
+  it('asks the server for one page and shows the total', async () => {
+    serverLike(Array.from({ length: 120 }, (_, i) => makeBook({ id: i + 1, title: `Book ${i + 1}` })))
+    renderWantedPage()
+
+    await screen.findByRole('link', { name: 'Book 1' })
+    expect(screen.getAllByRole('link', { name: /^Book \d+$/ })).toHaveLength(50)
+    expect(screen.getByText('120 books')).toBeInTheDocument()
+    expect(api.listWantedPage).toHaveBeenCalledWith(expect.objectContaining({ limit: 50, offset: 0 }))
+  })
+
+  it('removing a book on screen lowers the total with it', async () => {
+    serverLike([makeBook({ id: 1, title: 'Dune' }), makeBook({ id: 2, title: 'Hyperion' })])
+    vi.mocked(api.updateBook).mockImplementation(() => new Promise(() => {}))
+    renderWantedPage()
+
+    await screen.findByRole('link', { name: 'Dune' })
+    expect(screen.getByText('2 books')).toBeInTheDocument()
+    fireEvent.click(screen.getAllByRole('button', { name: 'Unmonitor' })[0])
+    expect(await screen.findByText('1 books')).toBeInTheDocument()
   })
 
   it('changes a book format with the per-row format control', async () => {
-    vi.mocked(api.listWanted).mockResolvedValue([makeBook({ id: 1, title: 'Dune' })])
+    vi.mocked(api.listWantedPage).mockResolvedValue(pageOf([makeBook({ id: 1, title: 'Dune' })]))
 
     renderWantedPage()
 
@@ -274,10 +342,10 @@ describe('WantedPage', () => {
   })
 
   it('selecting a row drives the bulk action bar and select-all toggles every row', async () => {
-    vi.mocked(api.listWanted).mockResolvedValue([
+    vi.mocked(api.listWantedPage).mockResolvedValue(pageOf([
       makeBook({ id: 1, title: 'Dune' }),
       makeBook({ id: 2, title: 'Hyperion' }),
-    ])
+    ]))
 
     renderWantedPage()
 
@@ -299,7 +367,7 @@ describe('WantedPage', () => {
 
   it('searches a wanted book and renders result metadata', async () => {
     const book = makeBook({ id: 1, title: 'Dune' })
-    vi.mocked(api.listWanted).mockResolvedValue([book])
+    vi.mocked(api.listWantedPage).mockResolvedValue(pageOf([book]))
     vi.mocked(api.searchBook).mockResolvedValue({
       results: [
         makeResult({
@@ -326,7 +394,7 @@ describe('WantedPage', () => {
   })
 
   it('renders the no-results message after an empty search', async () => {
-    vi.mocked(api.listWanted).mockResolvedValue([makeBook({ id: 1, title: 'Dune' })])
+    vi.mocked(api.listWantedPage).mockResolvedValue(pageOf([makeBook({ id: 1, title: 'Dune' })]))
     vi.mocked(api.searchBook).mockResolvedValue({ results: [], debug: null })
 
     renderWantedPage()
@@ -337,12 +405,73 @@ describe('WantedPage', () => {
     expect(await screen.findByText('No results found on any indexer.')).toBeInTheDocument()
   })
 
+  it('offers the releases the filters dropped, collapsed, and grabs one by its guid (#3364)', async () => {
+    const book = makeBook({ id: 1, title: 'Dune' })
+    vi.mocked(api.listWantedPage).mockResolvedValue(pageOf([book]))
+    vi.mocked(api.searchBook).mockResolvedValue({
+      results: [makeResult({ guid: 'kept', title: 'Dune 2026 EPUB' })],
+      filtered: [makeResult({ guid: 'dropped', title: 'Dune Messiah', nzbUrl: '', rejection: 'title mismatch' })],
+      filteredTotal: 7,
+      debug: null,
+    })
+    vi.mocked(api.grab).mockResolvedValue({ id: 5 } as Download)
+
+    renderWantedPage()
+
+    await screen.findByRole('link', { name: 'Dune' })
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }))
+
+    // Collapsed: the heading carries the full count, the release is hidden.
+    const heading = await screen.findByRole('button', { name: /Filtered/ })
+    expect(heading).toHaveTextContent('7')
+    expect(screen.queryByText('Dune Messiah')).not.toBeInTheDocument()
+
+    fireEvent.click(heading)
+    expect(await screen.findByText('Dune Messiah')).toBeInTheDocument()
+    expect(screen.getByText(/title mismatch/)).toBeInTheDocument()
+
+    const row = screen.getByText('Dune Messiah').closest('div.flex.items-center.justify-between') as HTMLElement
+    fireEvent.click(within(row).getByRole('button', { name: 'Grab' }))
+    await waitFor(() => expect(api.grab).toHaveBeenCalled())
+    expect(vi.mocked(api.grab).mock.calls[0][0]).toMatchObject({ guid: 'dropped', bookId: 1 })
+  })
+
+  it('points at the filtered section when every release was filtered (#3364)', async () => {
+    vi.mocked(api.listWantedPage).mockResolvedValue(pageOf([makeBook({ id: 1, title: 'Dune' })]))
+    vi.mocked(api.searchBook).mockResolvedValue({
+      results: [],
+      filtered: [makeResult({ guid: 'dropped', title: 'Dune Messiah' })],
+      debug: null,
+    })
+
+    renderWantedPage()
+
+    await screen.findByRole('link', { name: 'Dune' })
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }))
+
+    expect(await screen.findByText('None matched, 1 filtered.')).toBeInTheDocument()
+    expect(screen.queryByText('No results found on any indexer.')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Filtered/ })).toBeInTheDocument()
+  })
+
+  it('shows no filtered section when the server sends none (older server)', async () => {
+    vi.mocked(api.listWantedPage).mockResolvedValue(pageOf([makeBook({ id: 1, title: 'Dune' })]))
+    vi.mocked(api.searchBook).mockResolvedValue({ results: [makeResult({ guid: 'k', title: 'Kept' })], debug: null })
+
+    renderWantedPage()
+
+    await screen.findByRole('link', { name: 'Dune' })
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }))
+    await screen.findByText('Kept')
+    expect(screen.queryByRole('button', { name: /Filtered/ })).not.toBeInTheDocument()
+  })
+
   it('grabs a result, shows transient states, and refreshes wanted books', async () => {
     const book = makeBook({ id: 1, title: 'Dune' })
     let resolveGrab: (download: Download) => void = () => {}
-    vi.mocked(api.listWanted)
-      .mockResolvedValueOnce([book])
-      .mockResolvedValueOnce([])
+    vi.mocked(api.listWantedPage)
+      .mockResolvedValueOnce(pageOf([book]))
+      .mockResolvedValueOnce(pageOf([]))
     vi.mocked(api.searchBook).mockResolvedValue({
       results: [
         makeResult({
@@ -385,15 +514,34 @@ describe('WantedPage', () => {
       await Promise.resolve()
     })
 
-    expect(api.listWanted).toHaveBeenCalledTimes(2)
+    expect(api.listWantedPage).toHaveBeenCalledTimes(2)
     expect(screen.queryByText('Dune 2026 EPUB')).not.toBeInTheDocument()
     expect(screen.getByText('No wanted books. Add an author to start tracking.')).toBeInTheDocument()
+  })
+
+  // #2933: a dual-format book's search classifies each result, and that, not
+  // the book's 'both', is what the grab must carry.
+  it('grabs an audiobook result of a dual-format book as an audiobook', async () => {
+    vi.mocked(api.listWantedPage).mockResolvedValue(pageOf([makeBook({ id: 1, title: 'Dune', mediaType: 'both' })]))
+    vi.mocked(api.searchBook).mockResolvedValue({
+      results: [makeResult({ guid: 'dune-audio', title: 'Dune Unabridged', mediaType: 'audiobook' })],
+      debug: null,
+    })
+
+    renderWantedPage()
+
+    await screen.findByRole('link', { name: 'Dune' })
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Grab' }))
+
+    await waitFor(() => expect(api.grab).toHaveBeenCalledTimes(1))
+    expect(api.grab).toHaveBeenCalledWith(expect.objectContaining({ guid: 'dune-audio', mediaType: 'audiobook' }))
   })
 
   it('unmonitors a single wanted book and removes it from the list', async () => {
     const book = makeBook({ id: 1, title: 'Dune' })
     let resolveUpdate: (book: Book) => void = () => {}
-    vi.mocked(api.listWanted).mockResolvedValue([book])
+    vi.mocked(api.listWantedPage).mockResolvedValue(pageOf([book]))
     vi.mocked(api.updateBook).mockImplementation(() => new Promise(resolve => { resolveUpdate = resolve }))
 
     renderWantedPage()
@@ -427,9 +575,9 @@ describe('WantedPage', () => {
           makeBook({ id: 2, title: 'Hyperion Refreshed' }),
         ]
       : []
-    vi.mocked(api.listWanted)
-      .mockResolvedValueOnce(initialBooks)
-      .mockResolvedValueOnce(refreshedBooks)
+    vi.mocked(api.listWantedPage)
+      .mockResolvedValueOnce(pageOf(initialBooks))
+      .mockResolvedValueOnce(pageOf(refreshedBooks))
 
     renderWantedPage()
 
@@ -437,12 +585,17 @@ describe('WantedPage', () => {
     fireEvent.click(screen.getByTitle('Select Dune'))
     fireEvent.click(screen.getByTitle('Select Hyperion'))
 
-    const bulkBar = screen.getByText('2 selected').closest('div')
-    if (!bulkBar) throw new Error('Bulk action bar was not rendered')
-    fireEvent.click(within(bulkBar).getByRole('button', { name: label }))
+    clickBulkAction(label, action === 'blocklist' ? 'menu' : undefined)
+    // Blocklisting takes each book off Wanted for good, so it asks first and
+    // says how many.
+    if (action === 'blocklist') {
+      expect(within(await screen.findByTestId('confirm-dialog')).getByText(/wanted\.blocklistSelectedConfirm|Blocklist 2 books/)).toBeInTheDocument()
+      expect(api.bulkActionWanted).not.toHaveBeenCalled()
+      await acceptConfirm()
+    }
 
     await waitFor(() => expect(api.bulkActionWanted).toHaveBeenCalledWith([1, 2], action))
-    await waitFor(() => expect(api.listWanted).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(api.listWantedPage).toHaveBeenCalledTimes(2))
     expect(screen.queryByText('2 selected')).not.toBeInTheDocument()
     if (action === 'search') {
       expect(await screen.findByRole('link', { name: 'Dune Refreshed' })).toBeInTheDocument()
@@ -459,10 +612,10 @@ describe('WantedPage', () => {
   // cleared the selection and reloaded, and the user saw a button flash and
   // no other sign that nothing had happened.
   it('tells the user nothing was searched when automatic grabbing is off, and keeps the selection', async () => {
-    vi.mocked(api.listWanted).mockResolvedValue([
+    vi.mocked(api.listWantedPage).mockResolvedValue(pageOf([
       makeBook({ id: 1, title: 'Dune' }),
       makeBook({ id: 2, title: 'Hyperion' }),
-    ])
+    ]))
     vi.mocked(api.bulkActionWanted).mockResolvedValue({
       results: {
         1: { ok: false, code: 'auto_grab_disabled', error: 'automatic grabbing is disabled' },
@@ -476,35 +629,33 @@ describe('WantedPage', () => {
     fireEvent.click(screen.getByTitle('Select Dune'))
     fireEvent.click(screen.getByTitle('Select Hyperion'))
 
-    const bulkBar = screen.getByText('2 selected').closest('div')
-    if (!bulkBar) throw new Error('Bulk action bar was not rendered')
-    fireEvent.click(within(bulkBar).getByRole('button', { name: 'Search' }))
+    clickBulkAction('Search')
 
     expect(await screen.findByText('No search was run. Automatic grabbing is off.')).toBeInTheDocument()
     // The selection survives, so flipping the setting and pressing Search
     // again does not mean re-picking every book.
     expect(screen.getByText('2 selected')).toBeInTheDocument()
     // And the list is not reloaded, because nothing changed.
-    expect(api.listWanted).toHaveBeenCalledTimes(1)
+    expect(api.listWantedPage).toHaveBeenCalledTimes(1)
   })
 })
 
 describe('WantedPage — live polling (#1161)', () => {
   it('polls the wanted list so background changes appear without a reload', async () => {
     vi.useFakeTimers()
-    vi.mocked(api.listWanted)
-      .mockResolvedValueOnce([makeBook({ id: 1, title: 'Stays Wanted' }), makeBook({ id: 2, title: 'Grabbed Away' })])
-      .mockResolvedValue([makeBook({ id: 1, title: 'Stays Wanted' })])
+    vi.mocked(api.listWantedPage)
+      .mockResolvedValueOnce(pageOf([makeBook({ id: 1, title: 'Stays Wanted' }), makeBook({ id: 2, title: 'Grabbed Away' })]))
+      .mockResolvedValue(pageOf([makeBook({ id: 1, title: 'Stays Wanted' })]))
 
     renderWantedPage()
     await act(async () => { await vi.advanceTimersByTimeAsync(0) }) // initial load
     expect(screen.getByText('Grabbed Away')).toBeInTheDocument()
-    expect(vi.mocked(api.listWanted).mock.calls.length).toBe(1)
+    expect(vi.mocked(api.listWantedPage).mock.calls.length).toBe(1)
 
     // A background auto-grab removes book 2 from the wanted set; the 5s poll
     // reflects it without a manual reload.
     await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
-    expect(vi.mocked(api.listWanted).mock.calls.length).toBeGreaterThan(1)
+    expect(vi.mocked(api.listWantedPage).mock.calls.length).toBeGreaterThan(1)
     expect(screen.queryByText('Grabbed Away')).not.toBeInTheDocument()
     expect(screen.getByText('Stays Wanted')).toBeInTheDocument()
   })
@@ -512,10 +663,10 @@ describe('WantedPage — live polling (#1161)', () => {
 
 describe('WantedPage — book link nav state (#2548, book side)', () => {
   it('carries {ids, index} scoped to pageItems (this page’s slice), not the unpaginated filtered list', async () => {
-    vi.mocked(api.listWanted).mockResolvedValue([
+    vi.mocked(api.listWantedPage).mockResolvedValue(pageOf([
       makeBook({ id: 1, title: 'Elantris' }),
       makeBook({ id: 2, title: 'Mistborn' }),
-    ])
+    ]))
     let located: Located | undefined
     renderWantedPage(loc => { located = loc })
 
@@ -527,7 +678,7 @@ describe('WantedPage — book link nav state (#2548, book side)', () => {
   })
 
   it('narrows the carried ids to the search-filtered set, not every wanted book', async () => {
-    vi.mocked(api.listWanted).mockResolvedValue([
+    serverLike([
       makeBook({ id: 1, title: 'Elantris' }),
       makeBook({ id: 2, title: 'Mistborn' }),
       makeBook({ id: 3, title: 'Warbreaker' }),
@@ -555,10 +706,10 @@ describe('WantedPage — book link nav state (#2548, book side)', () => {
 // says which it is, and only for the rows it applies to.
 describe('WantedPage author monitoring hint', () => {
   it('explains a row the sweep will not search, and leaves the others alone', async () => {
-    vi.mocked(api.listWanted).mockResolvedValue([
+    vi.mocked(api.listWantedPage).mockResolvedValue(pageOf([
       makeBook({ id: 1, title: 'Dune', authorUnmonitored: true }),
       makeBook({ id: 2, title: 'Messiah' }),
-    ])
+    ]))
 
     render(
       <MemoryRouter>
@@ -569,5 +720,32 @@ describe('WantedPage author monitoring hint', () => {
     await screen.findByText('Dune')
     const hints = screen.getAllByText('Author not monitored, so this is not searched automatically')
     expect(hints).toHaveLength(1)
+  })
+})
+
+describe('WantedPage filter bar', () => {
+  it('sends sort and format to the server, and searches the page on screen after confirming', async () => {
+    vi.mocked(api.listWantedPage).mockResolvedValue(pageOf([makeBook({ id: 1, title: 'Dune' }), makeBook({ id: 2, title: 'Hyperion' })]))
+    renderWantedPage()
+    await screen.findByRole('link', { name: 'Dune' })
+
+    fireEvent.click(screen.getByRole('button', { name: 'books.sortLabel' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'books.sortNewest' }))
+    await waitFor(() => expect(api.listWantedPage).toHaveBeenLastCalledWith(expect.objectContaining({ sort: 'date-new' })))
+
+    fireEvent.click(screen.getByRole('button', { name: /^common\.filters/ }))
+    fireEvent.click(screen.getByRole('radio', { name: 'common.audiobook' }))
+    await waitFor(() => expect(api.listWantedPage).toHaveBeenLastCalledWith(expect.objectContaining({ mediaType: 'audiobook', sort: 'date-new' })))
+
+    // One page-level search instead of a green Search button per row. While
+    // it runs the row buttons are off, so no book is sent twice.
+    let finish: (v: unknown) => void = () => {}
+    vi.mocked(api.bulkActionWanted).mockImplementationOnce(() => new Promise(r => { finish = r }) as never)
+    fireEvent.click(await screen.findByRole('button', { name: 'wanted.searchPage' }))
+    await acceptConfirm()
+    await waitFor(() => expect(api.bulkActionWanted).toHaveBeenCalledWith([1, 2], 'search'))
+    for (const b of screen.getAllByRole('button', { name: 'Search' })) expect(b).toBeDisabled()
+    await act(async () => { finish({ results: {} }) })
+    await waitFor(() => { for (const b of screen.getAllByRole('button', { name: 'Search' })) expect(b).toBeEnabled() })
   })
 })

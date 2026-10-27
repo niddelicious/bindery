@@ -55,8 +55,10 @@ func TestSettings_ListFiltersSecrets(t *testing.T) {
 		}
 	}
 
+	// As an admin: secrets are hidden from admins too, and only an admin gets
+	// the non secret keys below since #2361 inverted the non admin default.
 	rec := httptest.NewRecorder()
-	h.List(rec, httptest.NewRequest(http.MethodGet, "/api/v1/settings", nil))
+	h.List(rec, adminReq(httptest.NewRequest(http.MethodGet, "/api/v1/settings", nil)))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rec.Code)
 	}
@@ -250,10 +252,12 @@ func TestSettings_AuthorMonitorDefaultsValidation(t *testing.T) {
 func TestSettings_SecretLeakRegression(t *testing.T) {
 	h, repo, ctx := settingsFixture(t)
 	leaky := map[string]string{
-		SettingOIDCProviders:             `[{"id":"okta","clientSecret":"S3CRET"}]`,
-		SettingAuthSessionSecretPrevious: "previous-hmac-key",
-		SettingGrimmoryAPIKey:            "grimmory-api-key",
-		SettingCalibrePluginAPIKey:       "calibre-plugin-key",
+		"auth.hardcover_daily_holds":       `{"example-fingerprint":"2026-09-19T01:00:00Z"}`,
+		"auth.hardcover_daily_hold_secret": "example-only-hold-secret",
+		SettingOIDCProviders:               `[{"id":"okta","clientSecret":"S3CRET"}]`,
+		SettingAuthSessionSecretPrevious:   "previous-hmac-key",
+		SettingGrimmoryAPIKey:              "grimmory-api-key",
+		SettingCalibrePluginAPIKey:         "calibre-plugin-key",
 		// Generic pattern coverage: keys that aren't enumerated but follow
 		// the suffix/prefix conventions must still be filtered.
 		"some_new_provider.api_key":   "secret-by-pattern",
@@ -273,8 +277,10 @@ func TestSettings_SecretLeakRegression(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// As an admin, for the same reason as TestSettings_ListFiltersSecrets: the
+	// secrets must be gone even for the most privileged reader.
 	rec := httptest.NewRecorder()
-	h.List(rec, httptest.NewRequest(http.MethodGet, "/api/v1/setting", nil))
+	h.List(rec, adminReq(httptest.NewRequest(http.MethodGet, "/api/v1/setting", nil)))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("List status = %d", rec.Code)
 	}
@@ -291,9 +297,9 @@ func TestSettings_SecretLeakRegression(t *testing.T) {
 		t.Errorf("non-secret grimmory.enabled missing from List output: %s", body)
 	}
 
-	// Direct GET on each leaky key must 404.
+	// Direct GET on each leaky key must 404, for an admin too.
 	for k := range leaky {
-		req := withKey(httptest.NewRequest(http.MethodGet, "/api/v1/setting/"+k, nil), k)
+		req := adminReq(withKey(httptest.NewRequest(http.MethodGet, "/api/v1/setting/"+k, nil), k))
 		rec := httptest.NewRecorder()
 		h.Get(rec, req)
 		if rec.Code != http.StatusNotFound {
@@ -490,6 +496,38 @@ func TestHardcoverFeatureState(t *testing.T) {
 	}
 }
 
+// TestSettings_DefaultAudiobookRootFolderID is the audiobook twin (#2166). The
+// key is spelled out rather than taken from the constant so the test also pins
+// the wire name the web UI writes.
+func TestSettings_DefaultAudiobookRootFolderID(t *testing.T) {
+	const key = "library.defaultAudiobookRootFolderId"
+	cases := []struct {
+		value  string
+		wantOK bool
+	}{
+		{"", true},
+		{"1", true},
+		{"42", true},
+		{"0", false},
+		{"-1", false},
+		{"abc", false},
+		{"1.5", false},
+	}
+	for _, tc := range cases {
+		h, _, _ := settingsFixture(t)
+		body := bytes.NewBufferString(`{"value":"` + tc.value + `"}`)
+		req := withKey(httptest.NewRequest(http.MethodPut, "/api/v1/settings/"+key, body), key)
+		rec := httptest.NewRecorder()
+		h.Set(rec, req)
+		if tc.wantOK && rec.Code != http.StatusOK {
+			t.Errorf("value %q: expected 200, got %d: %s", tc.value, rec.Code, rec.Body.String())
+		}
+		if !tc.wantOK && rec.Code != http.StatusBadRequest {
+			t.Errorf("value %q: expected 400, got %d", tc.value, rec.Code)
+		}
+	}
+}
+
 func TestSettings_DefaultLibraryRootFolderID(t *testing.T) {
 	cases := []struct {
 		value  string
@@ -530,6 +568,9 @@ func TestSettings_MetadataPrimaryProvider(t *testing.T) {
 		{"", true},
 		{"openlibrary", true},
 		{"dnb", true},
+		{"nb", true},
+		{"bnf", true},
+		{"BNF", false},
 		{"hardcover", true},
 		{"googlebooks", false},
 		{"unknown", false},
@@ -636,6 +677,54 @@ func TestSettings_MetadataPrimaryProviderHardcoverRequiresToken(t *testing.T) {
 			t.Fatalf("expected 200 clearing the token after switching away, got %d: %s", rec.Code, rec.Body.String())
 		}
 	})
+}
+
+// TestSettings_AudiobookImportRoutingValidation covers the per format import
+// keys (#1632) through the real PUT handler. The audiobook mode takes exactly
+// the values import.mode takes, plus empty for "same as import.mode", and the
+// audiobook drop folder gets the same existence check as import.drop_folder,
+// so neither can be saved in a state the importer would misread.
+func TestSettings_AudiobookImportRoutingValidation(t *testing.T) {
+	h, repo, ctx := settingsFixture(t)
+
+	put := func(key, value string) int {
+		body := bytes.NewBufferString(`{"value":` + mustJSON(value) + `}`)
+		req := withKey(httptest.NewRequest(http.MethodPut, "/api/v1/settings/"+key, body), key)
+		rec := httptest.NewRecorder()
+		h.Set(rec, req)
+		return rec.Code
+	}
+
+	for _, v := range []string{"", "auto", "move", "copy", "hardlink", "external"} {
+		if code := put(SettingImportAudiobookMode, v); code != http.StatusOK {
+			t.Errorf("audiobook mode %q: got %d, want 200", v, code)
+		}
+	}
+	if code := put(SettingImportAudiobookMode, "symlink"); code != http.StatusBadRequest {
+		t.Errorf("audiobook mode symlink: got %d, want 400", code)
+	}
+
+	dir := t.TempDir()
+	notADir := filepath.Join(dir, "afile")
+	if err := os.WriteFile(notADir, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code := put(SettingImportAudiobookDropFolder, ""); code != http.StatusOK {
+		t.Errorf("empty audiobook drop folder: got %d, want 200", code)
+	}
+	if code := put(SettingImportAudiobookDropFolder, dir); code != http.StatusOK {
+		t.Errorf("valid audiobook drop folder: got %d, want 200", code)
+	}
+	got, _ := repo.Get(ctx, SettingImportAudiobookDropFolder)
+	if got == nil || got.Value != dir {
+		t.Errorf("audiobook drop folder not persisted: %+v", got)
+	}
+	if code := put(SettingImportAudiobookDropFolder, filepath.Join(dir, "does-not-exist")); code != http.StatusBadRequest {
+		t.Errorf("missing audiobook drop folder: got %d, want 400", code)
+	}
+	if code := put(SettingImportAudiobookDropFolder, notADir); code != http.StatusBadRequest {
+		t.Errorf("audiobook drop folder pointing at a file: got %d, want 400", code)
+	}
 }
 
 // TestSettings_ImportDropValidation covers the three drop-folder handoff keys
@@ -778,6 +867,9 @@ func TestValidateSettingValue_AudiobookFileTemplate(t *testing.T) {
 		"{Title} - Part {Part:3}.{ext}",
 		"{Part}.{ext}",
 		"{Author} - {Title} - {Part:2}.{ext}",
+		// A conditional group, which a single-file audiobook drops (#2900).
+		"{Title}{ - Pt. Part:3}.{ext}",
+		"{Title}{ - Part:3}.{ext}",
 	} {
 		if err := validateSettingValue(SettingNamingAudiobookFileTemplate, v); err != nil {
 			t.Errorf("%q should be accepted: %v", v, err)
@@ -789,6 +881,33 @@ func TestValidateSettingValue_AudiobookFileTemplate(t *testing.T) {
 		if err := validateSettingValue(SettingNamingAudiobookFileTemplate, v); err == nil {
 			t.Errorf("%q should be rejected (no {Part} token)", v)
 		}
+	}
+}
+
+// TestSettings_AudiobookFolderTemplateRejectsExt covers #3217: audiobook
+// folders render {ext} empty, so a template carrying it is refused at save time
+// and nothing is stored. The same template is fine for ebooks.
+func TestSettings_AudiobookFolderTemplateRejectsExt(t *testing.T) {
+	h, repo, ctx := settingsFixture(t)
+	for _, v := range []string{"{Author} - {Title}.{ext}", "{Title}{ext}", "{Title}{.ext}"} {
+		body := bytes.NewBufferString(`{"value":"` + v + `"}`)
+		req := withKey(httptest.NewRequest(http.MethodPut, "/api/v1/settings/naming_template_audiobook", body), "naming_template_audiobook")
+		rec := httptest.NewRecorder()
+		h.Set(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%q: status = %d, want 400", v, rec.Code)
+		}
+	}
+	if got, _ := repo.Get(ctx, "naming_template_audiobook"); got != nil && got.Value != "" {
+		t.Errorf("rejected template was stored: %q", got.Value)
+	}
+	for _, v := range []string{"{Author}/{Title} ({Year})", ""} {
+		if err := validateSettingValue("naming_template_audiobook", v); err != nil {
+			t.Errorf("%q should be accepted: %v", v, err)
+		}
+	}
+	if err := validateSettingValue("naming.bookTemplate", "{Author}/{Title}.{ext}"); err != nil {
+		t.Errorf("ebook template with {ext} must stay valid: %v", err)
 	}
 }
 
@@ -880,10 +999,9 @@ func adminOnlyPathFixture(t *testing.T, repo *db.SettingsRepo, ctx context.Conte
 func TestSettings_AdminOnlyPathsHiddenFromNonAdmin(t *testing.T) {
 	h, repo, ctx := settingsFixture(t)
 	paths := adminOnlyPathFixture(t, repo, ctx)
-	// A neighbouring non-path key on the same screens must stay readable, or
-	// the fix has quietly closed the whole Calibre tab to non-admins for no
-	// security gain.
-	if err := repo.Set(ctx, SettingCalibreEnabled, "true"); err != nil {
+	// A key a non admin screen does read must stay readable, or the fix has
+	// quietly broken the add author dialog for no security gain.
+	if err := repo.Set(ctx, SettingDefaultMediaType, "both"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -901,8 +1019,8 @@ func TestSettings_AdminOnlyPathsHiddenFromNonAdmin(t *testing.T) {
 			t.Errorf("List leaked admin-only key %q to a non-admin", key)
 		}
 	}
-	if !strings.Contains(body, SettingCalibreEnabled) {
-		t.Errorf("non-admin lost the non-path key %q: %s", SettingCalibreEnabled, body)
+	if !strings.Contains(body, SettingDefaultMediaType) {
+		t.Errorf("non-admin lost the allowlisted key %q: %s", SettingDefaultMediaType, body)
 	}
 
 	for key := range paths {
@@ -1035,6 +1153,7 @@ func TestIsAdminOnlySetting_AgreesWithIsSecretSetting(t *testing.T) {
 		SettingCalibreLibraryPath,
 		SettingCalibreBinaryPath,
 		SettingImportDropFolder,
+		SettingImportAudiobookDropFolder,
 		SettingCWAIngestPath,
 		SettingCalibrePushPathRemap,
 		SettingABSPathRemap,
@@ -1048,18 +1167,208 @@ func TestIsAdminOnlySetting_AgreesWithIsSecretSetting(t *testing.T) {
 		}
 	}
 
-	// Ordinary settings stay readable by everyone. calibre.enabled and
-	// import.mode sit next to the path keys on the same screens and are the
-	// ones a too-broad classifier would take out with them.
+	// Since the allowlist inversion only the keys a non admin screen reads
+	// stay readable by everyone. Everything else is admin only, including
+	// keys nobody has registered yet, which is the fail closed half of #2361.
+	for key := range nonAdminReadableSettings {
+		if isAdminOnlySetting(key) {
+			t.Errorf("isAdminOnlySetting(%q) = true; it is on the non admin allowlist", key)
+		}
+	}
 	for _, key := range []string{
 		SettingCalibreEnabled,
 		SettingImportMode,
-		SettingImportDropLayout,
-		SettingMetadataPrimaryProvider,
-		"ui.theme",
+		SettingABSBaseURL,
+		SettingGrimmoryBaseURL,
+		SettingGrimmoryUsername,
+		SettingCalibrePluginURL,
+		"telemetry.install_id",
+		"some.key_added_next_release",
 	} {
-		if isAdminOnlySetting(key) {
-			t.Errorf("isAdminOnlySetting(%q) = true; want false", key)
+		if !isAdminOnlySetting(key) {
+			t.Errorf("isAdminOnlySetting(%q) = false; want true (not on the allowlist)", key)
 		}
+	}
+}
+
+// TestNonAdminReadableSettings_AreKnownAndNotSecret keeps the allowlist
+// honest: a typo in it would silently hide a key the UI needs, and a secret on
+// it would be a leak if isAdminOnlySetting ever lost its delegation.
+func TestNonAdminReadableSettings_AreKnownAndNotSecret(t *testing.T) {
+	known := make(map[string]bool)
+	for _, d := range SettingDescriptors() {
+		known[d.Key] = true
+	}
+	for key := range nonAdminReadableSettings {
+		if !known[key] {
+			t.Errorf("allowlisted key %q has no descriptor; typo?", key)
+		}
+		if isSecretSetting(key) {
+			t.Errorf("allowlisted key %q is a secret", key)
+		}
+	}
+	// The allowlist is the contract the non admin tests pin; keep them equal
+	// so neither can grow without the other.
+	if len(nonAdminReadableSettings) != len(nonAdminUIKeys) {
+		t.Errorf("allowlist has %d keys, the non admin UI contract has %d", len(nonAdminReadableSettings), len(nonAdminUIKeys))
+	}
+	for key := range nonAdminUIKeys {
+		if !nonAdminReadableSettings[key] {
+			t.Errorf("%q is in the UI contract but not on the allowlist", key)
+		}
+	}
+}
+
+// nonAdminUIKeys is the set of settings a non admin screen in web/src reads,
+// with the value each test stores. It is written out here rather than read
+// from the handler's allowlist so the test states the contract on its own: if
+// somebody widens the allowlist, the exact-set check below fails and makes
+// them say why.
+//
+//   - recommendations.enabled: DiscoverPage
+//   - metadata.primary_provider: AddToLibraryModal
+//   - the two default root folder ids, default.media_type and the two author
+//     monitor defaults: authorAddDefaults, used by AddToLibraryModal
+var nonAdminUIKeys = map[string]string{
+	"recommendations.enabled":              "true",
+	SettingMetadataPrimaryProvider:         "dnb",
+	SettingDefaultLibraryRootFolderID:      "3",
+	SettingDefaultAudiobookRootFolderID:    "4",
+	SettingDefaultMediaType:                "both",
+	SettingAuthorDefaultMonitorMode:        "latest",
+	SettingAuthorDefaultMonitorLatestCount: "2",
+}
+
+// operatorDetailKeys are settings no non admin screen reads. The first five
+// are what the v1.40.0 scan flagged as readable by any account: integration
+// URLs, an integration username and the telemetry install id. The rest are
+// ordinary operator knobs that sit next to them, plus one path key so the
+// earlier #2361 fix stays covered by the inverted default.
+var operatorDetailKeys = map[string]string{
+	SettingABSBaseURL:         "http://hidden-abs.internal:13378",
+	SettingGrimmoryBaseURL:    "http://hidden-grimmory.internal:6060",
+	SettingGrimmoryUsername:   "hidden-grimmory-user",
+	SettingCalibrePluginURL:   "http://hidden-calibre-plugin.internal:8099",
+	"telemetry.install_id":    "hidden-install-id-0f3c",
+	SettingCalibreEnabled:     "hidden-true",
+	SettingSearchInterval:     "hidden-12h",
+	SettingImportMode:         "hidden-copy",
+	SettingCalibreLibraryPath: "/srv/hidden-calibre-library",
+}
+
+func seedAllowlistFixture(t *testing.T, repo *db.SettingsRepo, ctx context.Context) {
+	t.Helper()
+	for _, m := range []map[string]string{nonAdminUIKeys, operatorDetailKeys} {
+		for k, v := range m {
+			if err := repo.Set(ctx, k, v); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
+func listAs(t *testing.T, h *SettingsHandler, role string) map[string]string {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/setting", nil)
+	req = req.WithContext(auth.WithUserRole(req.Context(), role))
+	rec := httptest.NewRecorder()
+	h.List(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("List as %q = %d", role, rec.Code)
+	}
+	var listed []models.Setting
+	if err := json.Unmarshal(rec.Body.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	out := make(map[string]string, len(listed))
+	for _, s := range listed {
+		out[s.Key] = s.Value
+	}
+	return out
+}
+
+func getAs(h *SettingsHandler, role, key string) *httptest.ResponseRecorder {
+	req := withKey(httptest.NewRequest(http.MethodGet, "/api/v1/setting/"+key, nil), key)
+	req = req.WithContext(auth.WithUserRole(req.Context(), role))
+	rec := httptest.NewRecorder()
+	h.Get(rec, req)
+	return rec
+}
+
+// TestSettings_NonAdminReadsOnlyTheAllowlist pins the allowlist inversion of
+// #2361. Before it, a non admin got every stored setting that was not a secret
+// or a known path, which included integration base URLs, the Grimmory
+// username and the telemetry install id. Now a non admin gets exactly the keys
+// a non admin screen reads and nothing else, whichever role it holds. The
+// empty role is the fail closed case: a request whose role was never stamped
+// is treated as a non admin, not as an admin.
+func TestSettings_NonAdminReadsOnlyTheAllowlist(t *testing.T) {
+	for _, role := range []string{auth.RoleUser, auth.RoleRequester, ""} {
+		t.Run("role="+role, func(t *testing.T) {
+			h, repo, ctx := settingsFixture(t)
+			seedAllowlistFixture(t, repo, ctx)
+
+			got := listAs(t, h, role)
+			for k, v := range got {
+				if strings.Contains(v, "hidden") {
+					t.Errorf("List leaked operator detail %q = %q", k, v)
+				}
+				if _, ok := nonAdminUIKeys[k]; !ok {
+					t.Errorf("List returned %q, which no non admin screen reads", k)
+				}
+			}
+			for k, want := range nonAdminUIKeys {
+				if got[k] != want {
+					t.Errorf("List %q = %q, want %q (a non admin screen reads it)", k, got[k], want)
+				}
+			}
+
+			for k := range operatorDetailKeys {
+				if rec := getAs(h, role, k); rec.Code != http.StatusNotFound {
+					t.Errorf("Get %q = %d, want 404; body=%s", k, rec.Code, rec.Body.String())
+				}
+			}
+			for k, want := range nonAdminUIKeys {
+				rec := getAs(h, role, k)
+				if rec.Code != http.StatusOK {
+					t.Errorf("Get %q = %d, want 200", k, rec.Code)
+					continue
+				}
+				var s models.Setting
+				if err := json.Unmarshal(rec.Body.Bytes(), &s); err != nil {
+					t.Fatal(err)
+				}
+				if s.Value != want {
+					t.Errorf("Get %q = %q, want %q", k, s.Value, want)
+				}
+			}
+		})
+	}
+}
+
+// TestSettings_AdminReadsEverythingAsBefore is the other half of the
+// inversion: the admin Settings screens render every stored non secret value,
+// so an admin must still get all of them back from List and Get.
+func TestSettings_AdminReadsEverythingAsBefore(t *testing.T) {
+	h, repo, ctx := settingsFixture(t)
+	seedAllowlistFixture(t, repo, ctx)
+	if err := repo.Set(ctx, SettingGrimmoryAPIKey, "grimmory-secret-value"); err != nil {
+		t.Fatal(err)
+	}
+
+	got := listAs(t, h, auth.RoleAdmin)
+	for _, m := range []map[string]string{nonAdminUIKeys, operatorDetailKeys} {
+		for k, want := range m {
+			if got[k] != want {
+				t.Errorf("admin List %q = %q, want %q", k, got[k], want)
+			}
+			rec := getAs(h, auth.RoleAdmin, k)
+			if rec.Code != http.StatusOK {
+				t.Errorf("admin Get %q = %d, want 200", k, rec.Code)
+			}
+		}
+	}
+	if _, ok := got[SettingGrimmoryAPIKey]; ok {
+		t.Errorf("admin List returned a secret")
 	}
 }

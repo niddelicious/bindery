@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -820,6 +821,44 @@ func TestBooksBulk_Exclude(t *testing.T) {
 	}
 }
 
+// TestBooksBulk_Unexclude covers #3454: the Excluded view had a bulk Exclude
+// and no way back. Repeating the call leaves the book included, since the
+// action sets the flag rather than toggling it.
+func TestBooksBulk_Unexclude(t *testing.T) {
+	h, _, books, author, ctx := bulkFixture(t)
+
+	book := mustCreateBook(t, books, ctx, &models.Book{
+		ForeignID: "B_UNEXC", AuthorID: author.ID, Title: "Put Me Back",
+		SortTitle: "put me back", Status: models.BookStatusWanted,
+		Genres: []string{}, MetadataProvider: "openlibrary", Monitored: true,
+	})
+	if err := books.SetExcluded(ctx, book.ID, true); err != nil {
+		t.Fatal(err)
+	}
+
+	body := fmt.Sprintf(`{"ids":[%d],"action":"unexclude"}`, book.ID)
+	for i := 0; i < 2; i++ {
+		rec := postBulk(t, h.BooksBulk, body)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("call %d: expected 200, got %d: %s", i+1, rec.Code, rec.Body.String())
+		}
+		var resp bulkResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		if r := resp.Results[fmt.Sprintf("%d", book.ID)]; !r.OK {
+			t.Errorf("call %d: expected ok, got %+v", i+1, r)
+		}
+		got, err := books.GetByID(ctx, book.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Excluded {
+			t.Errorf("call %d: book.Excluded: want false after bulk unexclude", i+1)
+		}
+	}
+}
+
 func TestBooksBulk_SetMediaType_Ebook(t *testing.T) {
 	h, _, books, author, ctx := bulkFixture(t)
 
@@ -1278,6 +1317,72 @@ func (s *ctxCapturingSearcher) SearchAndGrabBook(ctx context.Context, _ models.B
 	<-ctx.Done()
 }
 
+// waitCancelledBy waits for the searcher to be called, cancels the lifetime
+// ctx, and fails unless the spawned search sees that cancellation (#1844).
+func (s *ctxCapturingSearcher) waitCancelledBy(t *testing.T, cancel context.CancelFunc) {
+	t.Helper()
+	select {
+	case <-s.seen:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the search was not started within 2s")
+	}
+	cancel()
+	s.mu.Lock()
+	got := s.gotCtx
+	s.mu.Unlock()
+	select {
+	case <-got.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("the spawned search did not see the lifetime ctx cancelled")
+	}
+}
+
+// hangingServer answers no request: each one waits until its client gives up,
+// so a test can see whether cancelling a ctx ends an outbound call (#1844).
+type hangingServer struct {
+	*httptest.Server
+	started, cancelled chan struct{}
+	once1, once2       sync.Once
+}
+
+func newHangingServer(t *testing.T) *hangingServer {
+	t.Helper()
+	release := make(chan struct{})
+	h := &hangingServer{started: make(chan struct{}), cancelled: make(chan struct{})}
+	h.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The server only notices a client hanging up once the request body
+		// has been read, so a POST (a qBittorrent login) is drained first.
+		_, _ = io.Copy(io.Discard, r.Body)
+		h.once1.Do(func() { close(h.started) })
+		select {
+		case <-r.Context().Done():
+			h.once2.Do(func() { close(h.cancelled) })
+		case <-release:
+		}
+	}))
+	// Release any request still waiting before Close, so a regression fails
+	// the assertion instead of hanging the test in Close.
+	t.Cleanup(func() { close(release); h.Close() })
+	return h
+}
+
+// waitCancelledBy waits for a request to arrive, cancels the lifetime ctx,
+// and fails unless the request is abandoned because of it.
+func (h *hangingServer) waitCancelledBy(t *testing.T, cancel context.CancelFunc) {
+	t.Helper()
+	select {
+	case <-h.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no request reached the server within 5s")
+	}
+	cancel()
+	select {
+	case <-h.cancelled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelling the lifetime ctx did not end the outbound request")
+	}
+}
+
 // TestBulkHandler_GoroutineCancelsOnLifetimeCtxCancel is the #846 regression
 // guard for BulkHandler. The bulk-action search fan-out must derive from the
 // process-lifecycle ctx passed via WithLifetimeCtx; cancelling that ctx must
@@ -1680,5 +1785,63 @@ func TestBulk_MixedOwnership_PartialEnforcement(t *testing.T) {
 	}
 	if got, _ := f.authors.GetByID(ctx, f.a2.ID); got == nil {
 		t.Error("Bob's author must be untouched (durable invariant)")
+	}
+}
+
+// TestBooksBulk_ExcludeExpectNoFiles is the stale page race from the #3004
+// review: the duplicate review loaded while both rows were empty, then one of
+// them was imported before the person clicked "exclude the empty rows". With
+// expectNoFiles the imported row is skipped and reported, never excluded;
+// without it the action keeps its old unconditional behaviour.
+func TestBooksBulk_ExcludeExpectNoFiles(t *testing.T) {
+	h, _, books, author, ctx := bulkFixture(t)
+	mk := func(fid, title string) *models.Book {
+		return mustCreateBook(t, books, ctx, &models.Book{
+			ForeignID: fid, AuthorID: author.ID, Title: title, SortTitle: title,
+			Status: models.BookStatusWanted, Genres: []string{}, MetadataProvider: "openlibrary", Monitored: true,
+		})
+	}
+	stillEmpty := mk("B_EMPTY", "Nightingale")
+	importedSince := mk("B_LATE", "Nightingale")
+	// The import lands after the page was rendered.
+	if err := books.AddBookFile(ctx, importedSince.ID, "ebook", "/library/Nightingale.epub"); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := postBulk(t, h.BooksBulk, fmt.Sprintf(`{"ids":[%d,%d],"action":"exclude","expectNoFiles":true}`, stillEmpty.ID, importedSince.ID))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp bulkResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if r := resp.Results[fmt.Sprintf("%d", stillEmpty.ID)]; !r.OK {
+		t.Errorf("empty row: %+v, want ok", r)
+	}
+	if r := resp.Results[fmt.Sprintf("%d", importedSince.ID)]; r.OK || r.Code != bookHasFilesCode {
+		t.Errorf("imported row: %+v, want skipped with code %q", r, bookHasFilesCode)
+	}
+	excluded := func(id int64) bool {
+		b, err := books.GetByID(ctx, id)
+		if err != nil || b == nil {
+			t.Fatalf("get %d: %v", id, err)
+		}
+		return b.Excluded
+	}
+	if !excluded(stillEmpty.ID) {
+		t.Error("empty row was not excluded")
+	}
+	if excluded(importedSince.ID) {
+		t.Error("a row that has files was excluded on a stale page")
+	}
+
+	// Without the flag the action is unconditional, as before.
+	rec = postBulk(t, h.BooksBulk, fmt.Sprintf(`{"ids":[%d],"action":"exclude"}`, importedSince.ID))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if !excluded(importedSince.ID) {
+		t.Error("plain bulk exclude no longer excludes")
 	}
 }

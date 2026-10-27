@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -42,13 +44,94 @@ const notifierEventHealth = "health"
 
 // HealthStore keeps non-persistent download-client health diagnostics.
 type HealthStore struct {
-	mu    sync.RWMutex
-	byID  map[int64]models.DownloadClientHealth
-	notif eventNotifier
+	mu   sync.RWMutex
+	byID map[int64]models.DownloadClientHealth
+	// advisory holds problems found outside the path probe, by source: the
+	// importer pausing automatic blocklisting (AdvisoryBlocklist) and NZBGet
+	// missing UnRAR (AdvisoryUnpackers), both #3024. They live apart from
+	// byID because the 15 minute probe rewrites byID wholesale and would
+	// otherwise erase them.
+	advisory map[int64]map[string]models.DownloadClientHealth
+	notif    eventNotifier
+
+	// unpackers caches what NZBGet's sysinfo said (see NZBGetUnpackers).
+	unpackersMu sync.Mutex
+	unpackers   map[int64]*unpackerEntry
+	// sysinfo and now are test seams; nil means the real NZBGet call and
+	// time.Now.
+	sysinfo func(ctx context.Context, client *models.DownloadClient) ([]string, error)
+	now     func() time.Time
 }
 
+// Advisory sources.
+const (
+	AdvisoryBlocklist = "blocklist"
+	AdvisoryUnpackers = "unpackers"
+)
+
 func NewHealthStore() *HealthStore {
-	return &HealthStore{byID: make(map[int64]models.DownloadClientHealth)}
+	return &HealthStore{
+		byID:      make(map[int64]models.DownloadClientHealth),
+		advisory:  make(map[int64]map[string]models.DownloadClientHealth),
+		unpackers: make(map[int64]*unpackerEntry),
+	}
+}
+
+// SetAdvisory records a problem for the client from one source. It is shown
+// in place of a passing path check, or after a failing one, until
+// ClearAdvisory. The first advisory from a source publishes the health
+// event, like an entry into HealthError does in Set.
+func (s *HealthStore) SetAdvisory(id int64, source string, health models.DownloadClientHealth) {
+	if s == nil || id == 0 {
+		return
+	}
+	s.mu.Lock()
+	bySource := s.advisory[id]
+	if bySource == nil {
+		bySource = make(map[string]models.DownloadClientHealth)
+		s.advisory[id] = bySource
+	}
+	_, had := bySource[source]
+	bySource[source] = health
+	notif := s.notif
+	s.mu.Unlock()
+	if had || notif == nil {
+		return
+	}
+	notif.Send(context.Background(), notifierEventHealth, map[string]interface{}{
+		"clientId": id,
+		"status":   health.Status,
+		"message":  health.Message,
+	})
+}
+
+// ClearAdvisory removes one source's advisory, if any.
+func (s *HealthStore) ClearAdvisory(id int64, source string) {
+	if s == nil || id == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if bySource := s.advisory[id]; bySource != nil {
+		delete(bySource, source)
+		if len(bySource) == 0 {
+			delete(s.advisory, id)
+		}
+	}
+}
+
+// ForgetClient drops every advisory and the cached unpacker check for a
+// client that was disabled or deleted.
+func (s *HealthStore) ForgetClient(id int64) {
+	if s == nil || id == 0 {
+		return
+	}
+	s.mu.Lock()
+	delete(s.advisory, id)
+	s.mu.Unlock()
+	s.unpackersMu.Lock()
+	delete(s.unpackers, id)
+	s.unpackersMu.Unlock()
 }
 
 // WithNotifier attaches a webhook event notifier so transitions into
@@ -115,10 +198,39 @@ func (s *HealthStore) Get(id int64) *models.DownloadClientHealth {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	health, ok := s.byID[id]
-	if !ok {
-		return nil
+	bySource := s.advisory[id]
+	if len(bySource) == 0 {
+		if !ok {
+			return nil
+		}
+		return &health
 	}
-	return &health
+	sources := make([]string, 0, len(bySource))
+	for src := range bySource {
+		sources = append(sources, src)
+	}
+	sort.Strings(sources)
+	msgs := make([]string, 0, len(sources)+1)
+	if ok && health.Status == HealthError {
+		msgs = append(msgs, strings.TrimRight(health.Message, ". "))
+	}
+	for _, src := range sources {
+		msgs = append(msgs, strings.TrimRight(bySource[src].Message, ". "))
+	}
+	return &models.DownloadClientHealth{Status: HealthError, Message: strings.Join(msgs, ". ")}
+}
+
+// ProbeStatus returns the status of the path probe alone, ignoring advisories,
+// or "" when nothing has been recorded for the client. Callers asking "can this
+// client's finished downloads be read" want this rather than Get, which folds
+// advisories (blocklist paused, missing unpackers) into an error.
+func (s *HealthStore) ProbeStatus(id int64) string {
+	if s == nil || id == 0 {
+		return ""
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.byID[id].Status
 }
 
 func (s *HealthStore) Attach(client *models.DownloadClient) {
@@ -178,8 +290,9 @@ func RefreshDownloadClientHealthAsync(parent context.Context, g *jobs.Group, sto
 // common support shape, where the connection tests fine, the client accepts
 // grabs, and nothing ever imports.
 //
-// qBittorrent keeps its own richer check because it validates both the ebook
-// and audiobook categories rather than a single path. Everything else goes
+// qBittorrent with a category keeps its own richer check because it validates
+// both the ebook and audiobook categories rather than a single path; without
+// one it gets the shared check, the same as Test (#2664). Everything else goes
 // through the shared visibility check, and a type that genuinely cannot be
 // introspected now answers HealthUnknown rather than a fabricated OK.
 func CheckDownloadClientHealth(ctx context.Context, client *models.DownloadClient, downloadDir, audiobookDownloadDir, globalRemap string) models.DownloadClientHealth {
@@ -193,10 +306,19 @@ func CheckDownloadClientHealth(ctx context.Context, client *models.DownloadClien
 	if _, err := clienthost.Normalize(client.Host); err != nil {
 		return models.DownloadClientHealth{Status: HealthError, Message: err.Error()}
 	}
-	if client.Type == "qbittorrent" {
-		return checkQbittorrentCategoryPath(ctx, client, downloadDir, audiobookDownloadDir)
+	// A qBittorrent client with no category is valid: grabs are then sent
+	// Bindery's download folder as the save path. It used to fail here while
+	// Test passed it; it now gets the same check as Test, on the folder
+	// grabs land in (#2664).
+	if client.Type == "qbittorrent" && strings.TrimSpace(client.Category) != "" {
+		return checkQbittorrentCategoryPath(ctx, client, downloadDir, audiobookDownloadDir, globalRemap)
 	}
+	return checkCompletedPath(ctx, client, downloadDir, audiobookDownloadDir, globalRemap)
+}
 
+// checkCompletedPath is the shared visibility check for every client type
+// but qBittorrent.
+func checkCompletedPath(ctx context.Context, client *models.DownloadClient, downloadDir, audiobookDownloadDir, globalRemap string) models.DownloadClientHealth {
 	vis := CheckCompletedPathVisibility(ctx, client, downloadDir, audiobookDownloadDir, globalRemap)
 	switch vis.Status {
 	case PathVisible:
@@ -241,15 +363,11 @@ func TargetDownloadDir(mediaType, downloadDir, audiobookDownloadDir string) stri
 	return strings.TrimSpace(downloadDir)
 }
 
-func checkQbittorrentCategoryPath(ctx context.Context, client *models.DownloadClient, downloadDir, audiobookDownloadDir string) models.DownloadClientHealth {
+func checkQbittorrentCategoryPath(ctx context.Context, client *models.DownloadClient, downloadDir, audiobookDownloadDir, globalRemap string) models.DownloadClientHealth {
 	category := strings.TrimSpace(client.Category)
-	if category == "" {
-		return healthError("qBittorrent category is empty; configure a category with a save path")
-	}
-	expected := filepath.Clean(ExpectedDownloadDirForClient(client, models.MediaTypeEbook, downloadDir, audiobookDownloadDir))
-	if expected == "." || expected == "" {
-		return healthError("Bindery download directory is empty; check BINDERY_DOWNLOAD_DIR")
-	}
+	// An unset download directory is not an error: the Windows binary has no
+	// built in default (#2902). The save path then only has to exist here.
+	expected := cleanConfiguredDir(ExpectedDownloadDirForClient(client, models.MediaTypeEbook, downloadDir, audiobookDownloadDir))
 
 	qb := qbittorrent.New(client.Host, client.Port, client.Username, client.Password, client.URLBase, client.UseSSL)
 	categories, err := qb.GetCategories(ctx)
@@ -260,17 +378,14 @@ func checkQbittorrentCategoryPath(ctx context.Context, client *models.DownloadCl
 	// Validate the ebook category first; if it fails, return immediately.
 	// When CategoryAudiobook is set, validate it against audiobookDownloadDir
 	// as well — both must be healthy for the client to be healthy (#700).
-	if h := validateQbittorrentCategorySavePath(ctx, qb, client, category, expected, categories); h.Status != HealthOK {
+	if h := validateQbittorrentCategorySavePath(ctx, qb, client, category, expected, globalRemap, categories); h.Status != HealthOK {
 		return h
 	}
 
 	audioCategory := strings.TrimSpace(client.CategoryAudiobook)
 	if audioCategory != "" && audioCategory != category {
-		expectedAudio := filepath.Clean(ExpectedDownloadDirForClient(client, models.MediaTypeAudiobook, downloadDir, audiobookDownloadDir))
-		if expectedAudio == "." || expectedAudio == "" {
-			return healthError("Bindery audiobook download directory is empty; check BINDERY_AUDIOBOOK_DOWNLOAD_DIR")
-		}
-		if h := validateQbittorrentCategorySavePath(ctx, qb, client, audioCategory, expectedAudio, categories); h.Status != HealthOK {
+		expectedAudio := cleanConfiguredDir(ExpectedDownloadDirForClient(client, models.MediaTypeAudiobook, downloadDir, audiobookDownloadDir))
+		if h := validateQbittorrentCategorySavePath(ctx, qb, client, audioCategory, expectedAudio, globalRemap, categories); h.Status != HealthOK {
 			return h
 		}
 	}
@@ -281,31 +396,71 @@ func checkQbittorrentCategoryPath(ctx context.Context, client *models.DownloadCl
 			Message: fmt.Sprintf("qBittorrent categories %q and %q (audiobook) both validated", category, audioCategory),
 		}
 	}
+	if expected == "" {
+		return models.DownloadClientHealth{
+			Status:  HealthOK,
+			Message: fmt.Sprintf("qBittorrent category %q saves to a folder Bindery can read", category),
+		}
+	}
 	return models.DownloadClientHealth{
 		Status:  HealthOK,
 		Message: fmt.Sprintf("qBittorrent category %q saves under %q", category, expected),
 	}
 }
 
+// cleanConfiguredDir is filepath.Clean for a configured download directory,
+// returning "" rather than "." when it is not set.
+func cleanConfiguredDir(dir string) string {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return ""
+	}
+	return filepath.Clean(dir)
+}
+
 // validateQbittorrentCategorySavePath checks that a single qBittorrent category
 // exists and that its (path-remapped) save path falls at or under expected.
-func validateQbittorrentCategorySavePath(ctx context.Context, qb *qbittorrent.Client, client *models.DownloadClient, category, expected string, categories map[string]qbittorrent.Category) models.DownloadClientHealth {
+func validateQbittorrentCategorySavePath(ctx context.Context, qb *qbittorrent.Client, client *models.DownloadClient, category, expected, globalRemap string, categories map[string]qbittorrent.Category) models.DownloadClientHealth {
 	qbCategory, ok := categories[category]
 	if !ok {
+		if expected == "" {
+			return healthError(fmt.Sprintf("qBittorrent category %q was not found; create it with a save path", category))
+		}
 		return healthError(fmt.Sprintf("qBittorrent category %q was not found; create it with save path %q", category, expected))
 	}
 
 	savePath := strings.TrimSpace(qbCategory.SavePath)
-	if savePath == "" {
-		message := fmt.Sprintf("qBittorrent category %q has no save path; expected %q", category, expected)
-		if defaultPath, err := qb.GetDefaultSavePath(ctx); err == nil && strings.TrimSpace(defaultPath) != "" {
-			message += fmt.Sprintf(" and qBittorrent default is %q", strings.TrimSpace(defaultPath))
+	// A category whose save path is empty or relative saves under
+	// qBittorrent's default save path (#2664): the category name, or the
+	// relative path, inside it. That is the folder grabs land in, so it is
+	// the folder to check, not a reason to fail. qBittorrent creates it on
+	// the first download, so until then its parent standing in for it is
+	// enough (createdOnGrab).
+	createdOnGrab := false
+	if !pathmap.IsAbsClientPath(savePath) {
+		defaultPath, err := qb.GetDefaultSavePath(ctx)
+		defaultPath = strings.TrimSpace(defaultPath)
+		if err != nil || defaultPath == "" {
+			message := fmt.Sprintf("qBittorrent category %q has no save path", category)
+			if savePath != "" {
+				message = fmt.Sprintf("qBittorrent category %q has the relative save path %q and qBittorrent did not report its default save path", category, savePath)
+			}
+			if expected != "" {
+				message += fmt.Sprintf("; expected %q", expected)
+			}
+			return healthError(message)
 		}
-		return healthError(message)
+		savePath, _ = qbittorrentCategoryFolder(defaultPath, savePath, category)
+		createdOnGrab = true
 	}
 
-	localPath := filepath.Clean(pathmap.Parse(client.PathRemap).Apply(savePath))
-	if !pathIsAtOrUnder(localPath, expected) {
+	// The remap runs on the save path exactly as qBittorrent reports it; only
+	// its result is a path on this host. Same precedence as the importer:
+	// the client's remap, then the global one.
+	localPath := filepath.Clean(remapClientPath(client, savePath, globalRemap))
+	// With no download directory configured there is nothing to be under, and
+	// the stat below is the whole check (#2902).
+	if expected != "" && !pathIsAtOrUnder(localPath, expected) {
 		// #800: the error message above told the user where the paths
 		// disagreed but never named the fix. Most users hit this when
 		// qBittorrent and Bindery mount the same storage at different paths
@@ -327,6 +482,14 @@ func validateQbittorrentCategorySavePath(ctx context.Context, qb *qbittorrent.Cl
 	if _, err := os.Stat(localPath); os.IsNotExist(err) {
 		if resolved, divergedAt := findCaseInsensitivePath(localPath); resolved != "" {
 			return healthError(fmt.Sprintf("qBittorrent category %q saves to %q, which maps to %q inside Bindery — that exact path does not exist, but %q does. Linux is case-sensitive; update the path remap so it produces %q (the segment %q must match the on-disk case).", category, savePath, localPath, resolved, resolved, filepath.Base(divergedAt)))
+		}
+		if createdOnGrab {
+			if info, err := os.Stat(filepath.Dir(localPath)); err == nil && info.IsDir() {
+				return models.DownloadClientHealth{
+					Status:  HealthOK,
+					Message: fmt.Sprintf("qBittorrent category %q saves to %q, which qBittorrent creates inside %q on its first download", category, localPath, filepath.Dir(localPath)),
+				}
+			}
 		}
 		return healthError(fmt.Sprintf("qBittorrent category %q saves to %q, which maps to %q inside Bindery — but that path does not exist. Check the path remap and the directory Bindery is mounting.", category, savePath, localPath))
 	}
@@ -412,14 +575,22 @@ func healthError(message string) models.DownloadClientHealth {
 // and Bindery at "/downloads" gets "/torrents/complete:/downloads", which
 // also covers any sibling category save paths under the same root. When
 // either path is "/" the hint falls back to the full strings.
+//
+// savePath is qBittorrent's own path, so its parent is taken in the client's
+// namespace: on a Windows Bindery filepath would turn a Docker client's
+// "/downloads/x" into "\downloads", a remap source nothing matches (#2902).
 func remapHint(savePath, expected string) string {
-	src := strings.TrimRight(filepath.Dir(filepath.Clean(savePath)), string(filepath.Separator))
+	src := pathmap.ClientPathDir(savePath)
 	dst := strings.TrimRight(filepath.Clean(expected), string(filepath.Separator))
-	if src == "" || src == "." {
-		src = filepath.Clean(savePath)
+	if src == "." || pathmap.ClientPathBase(src) == "" {
+		src = pathmap.CleanClientPath(savePath)
 	}
 	if dst == "" {
 		dst = "/"
+	}
+	if len(dst) == 2 && dst[1] == ':' {
+		// A drive root such as `H:\` would otherwise lose its separator.
+		dst += string(filepath.Separator)
 	}
 	return src + ":" + dst
 }
@@ -429,8 +600,23 @@ func remapHint(savePath, expected string) string {
 // A trailing separator is added to base before the prefix check so that
 // "/data/downloads-extra" is not mistakenly accepted as "under" "/data/downloads".
 func pathIsAtOrUnder(candidate, base string) bool {
+	return pathIsAtOrUnderOn(runtime.GOOS, candidate, base)
+}
+
+// pathIsAtOrUnderOn is pathIsAtOrUnder for the named host OS. Windows paths
+// compare case-insensitively and with either separator, the way Windows
+// resolves them, so `H:\Downloads\x` is under `h:\downloads`. Everywhere else
+// the comparison stays exact, because Linux filesystems are case-sensitive.
+func pathIsAtOrUnderOn(goos, candidate, base string) bool {
+	sep := "/"
+	if goos == "windows" {
+		fold := strings.NewReplacer("/", `\`)
+		candidate = strings.ToLower(fold.Replace(candidate))
+		base = strings.ToLower(fold.Replace(base))
+		sep = `\`
+	}
 	if candidate == base {
 		return true
 	}
-	return strings.HasPrefix(candidate, base+string(filepath.Separator))
+	return strings.HasPrefix(candidate, base+sep)
 }

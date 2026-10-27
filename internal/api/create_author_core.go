@@ -123,7 +123,7 @@ func (h *AuthorHandler) writeCreateAuthorError(w http.ResponseWriter, r *http.Re
 	}
 	var lookup *createAuthorLookupError
 	if errors.As(err, &lookup) {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": lookup.Err.Error()})
+		writeUpstreamError(w, lookup.Err)
 		return
 	}
 	for _, resp := range createAuthorErrorResponses {
@@ -186,6 +186,9 @@ func (h *AuthorHandler) createAuthorCore(ctx context.Context, req createAuthorPa
 				if isAuthorIdentityConflict(err) {
 					return createAuthorResult{}, &authorConflictError{Message: "upstream author already exists locally"}
 				}
+				if errors.Is(err, errAuthorRowChanged) {
+					return createAuthorResult{}, &authorConflictError{Message: errAuthorChanged}
+				}
 				return createAuthorResult{}, err
 			}
 			mediaType := req.MediaType
@@ -200,7 +203,7 @@ func (h *AuthorHandler) createAuthorCore(ctx context.Context, req createAuthorPa
 			cleanAuthorDescription(canonical)
 			h.stampProviderMismatch(canonical)
 			if !req.SkipCatalogueSync {
-				h.fetchAuthorBooksAsync(canonical, catalogueSyncOptions{autoSearch: req.SearchOnAdd, mediaType: mediaType})
+				h.startAddSync(canonical, mediaType, req.SearchOnAdd)
 			}
 			return createAuthorResult{Author: canonical}, nil
 		}
@@ -247,9 +250,18 @@ func (h *AuthorHandler) createAuthorCore(ctx context.Context, req createAuthorPa
 	// Fetch and store books for this author. Always populate the catalogue;
 	// pass searchOnAdd so FetchAuthorBooks knows whether to also queue grabs.
 	if !req.SkipCatalogueSync {
-		h.fetchAuthorBooksAsync(author, catalogueSyncOptions{autoSearch: req.SearchOnAdd, mediaType: mediaType})
+		h.startAddSync(author, mediaType, req.SearchOnAdd)
 	}
 
 	telemetry.MarkFirst(ctx, h.settings, telemetry.SettingFirstAuthorAt)
 	return createAuthorResult{Author: author, Created: true}, nil
+}
+
+// startAddSync starts the catalogue sync an add runs, counted in runningSyncs
+// before the add answers (#3058). Counted only once its goroutine started, a
+// page opened straight after the add could read syncInProgress false and
+// show the author as having no books while the sync was still fetching.
+func (h *AuthorHandler) startAddSync(author *models.Author, mediaType string, autoSearch bool) {
+	h.runningSyncs.start(author.ID)
+	h.fetchAuthorBooksAsync(author, catalogueSyncOptions{autoSearch: autoSearch, mediaType: mediaType, enrichProfile: true, syncClaimed: true})
 }

@@ -1,12 +1,15 @@
 package httpsec
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
+	"time"
 )
 
 // Outbound-proxy state. All of these are written once during startup by
@@ -122,27 +125,68 @@ func DefaultProxyTransport() http.RoundTripper {
 }
 
 // GuardedTransport returns a RoundTripper that re-validates the resolved IP on
-// every dial against policy, closing the DNS-rebind TOCTOU window between an
-// up-front ValidateOutboundURL check and the actual connect. For clients that
-// follow redirects it also catches a redirect to a forbidden host at dial time.
+// every direct dial against policy, closing the DNS-rebind TOCTOU window
+// between an up-front ValidateOutboundURL check and the actual connect. For
+// clients that follow redirects it also catches a redirect to a forbidden host
+// at dial time.
 //
-// When an outbound proxy is configured the dial targets the operator-trusted
-// proxy (not the destination host), so a per-dial recheck would re-validate the
-// proxy's own address and break a LAN/loopback proxy; in that case the shared
-// proxy transport is returned unchanged and callers rely on the up-front
-// validation (the rebind recheck cannot see past the proxy anyway). It clones
+// When an outbound proxy is configured, a dial to the operator-trusted proxy
+// itself is not checked (a per-dial recheck would reject a LAN or loopback
+// proxy). A dial to anything else is a direct connection, which is what happens
+// for a destination on the proxy bypass list (bypassLocal or no-proxy), and
+// that one is checked against policy exactly as on the no-proxy path. A
+// destination that goes through the proxy is only seen as the proxy address, so
+// for those the up-front validation remains the guard. It clones
 // DefaultProxyTransport so installing DialContext never mutates the shared pool.
 func GuardedTransport(policy Policy) http.RoundTripper {
 	base := DefaultProxyTransport()
-	if ProxyFunc() != nil {
-		return base
-	}
 	if t, ok := base.(*http.Transport); ok {
 		c := t.Clone()
-		c.DialContext = NewDialContext(policy)
+		c.DialContext = guardedDialContext(policy)
 		return c
 	}
-	return &http.Transport{DialContext: NewDialContext(policy)}
+	return &http.Transport{DialContext: guardedDialContext(policy)}
+}
+
+// guardedDialContext is NewDialContext(policy), except that while an outbound
+// proxy is configured a dial to the proxy's own address bypasses the policy.
+func guardedDialContext(policy Policy) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	guarded := NewDialContext(policy)
+	if outboundProxyURL == nil {
+		return guarded
+	}
+	plain := (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if isProxyAddr(addr) {
+			return plain(ctx, network, addr)
+		}
+		return guarded(ctx, network, addr)
+	}
+}
+
+// isProxyAddr reports whether addr ("host:port") is the configured outbound
+// proxy's own address. Scheme default ports apply when the proxy URL has none.
+func isProxyAddr(addr string) bool {
+	u := outboundProxyURL
+	if u == nil {
+		return false
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	pport := u.Port()
+	if pport == "" {
+		switch strings.ToLower(u.Scheme) {
+		case "https":
+			pport = "443"
+		case "socks5":
+			pport = "1080"
+		default:
+			pport = "80"
+		}
+	}
+	return strings.EqualFold(host, u.Hostname()) && port == pport
 }
 
 // bypassProxyForHost reports whether requests to host should skip the proxy and
@@ -215,3 +259,108 @@ func parseNoProxy(raw string) []string {
 	}
 	return rules
 }
+
+var (
+	directGuardedMu sync.Mutex
+	directGuarded   = map[Policy]*http.Transport{}
+)
+
+// DirectGuardedTransport returns the RoundTripper for admin-configured
+// infrastructure that is always dialled directly: download clients and the
+// Audiobookshelf client. It is a clone of http.DefaultTransport (so the
+// standard HTTP_PROXY / NO_PROXY environment still applies, and
+// BINDERY_OUTBOUND_PROXY does not: those endpoints are intentionally left
+// direct) with a per-dial policy check, so a redirect hop or a hostname that
+// resolves to a forbidden address is refused at connect time.
+//
+// One transport is shared per policy so every client keeps one connection pool,
+// as http.DefaultTransport gave them before.
+func DirectGuardedTransport(policy Policy) http.RoundTripper {
+	directGuardedMu.Lock()
+	defer directGuardedMu.Unlock()
+	if t, ok := directGuarded[policy]; ok {
+		return t
+	}
+	var t *http.Transport
+	if dt, ok := http.DefaultTransport.(*http.Transport); ok {
+		t = dt.Clone()
+	} else {
+		t = &http.Transport{Proxy: http.ProxyFromEnvironment}
+	}
+	t.DialContext = NewDialContext(policy)
+	directGuarded[policy] = t
+	return t
+}
+
+// RedirectGuard returns an http.Client.CheckRedirect that stops after 10 hops
+// (net/http's own limit) and re-validates each hop's URL against policy, so a
+// redirect off a control endpoint cannot be used to reach a link-local or
+// cloud-metadata address. The error names the policy refusal.
+//
+// For PolicyService a hop is checked as PolicyLANLoopback, and the follow-up
+// request is marked so its dial is too: the link-local allowance belongs to the
+// admin-typed base URL, never to a redirect a remote service answers with.
+func RedirectGuard(policy Policy) func(*http.Request, []*http.Request) error {
+	return func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		hop := policy
+		if policy == PolicyService {
+			hop = PolicyLANLoopback
+		}
+		if err := ValidateOutboundURL(req.URL.String(), hop); err != nil {
+			return fmt.Errorf("redirect blocked: %w", err)
+		}
+		if policy == PolicyService {
+			// The client sends this very request next, so replacing its
+			// contents carries the marker to the dial.
+			*req = *req.WithContext(context.WithValue(req.Context(), redirectHopKey{}, true))
+		}
+		return nil
+	}
+}
+
+// metadataIdleConnsPerHost is how many idle connections a metadata provider
+// transport keeps per host. net/http keeps 2, so a burst of 8 parallel lookups
+// to one provider (an author refresh fanning out) closes six connections when
+// it ends and pays the TCP and TLS handshakes again on the next burst.
+const metadataIdleConnsPerHost = 16
+
+// MetadataTransport returns the RoundTripper for a metadata provider client
+// (Open Library, Hardcover, Google Books and the like). It is a clone of
+// DefaultProxyTransport, so the configured outbound proxy, its bypass rules and
+// every other field of the base carry over, with a larger idle pool per host.
+// The clone is shared by every caller, as http.DefaultTransport was: some
+// providers are built per request (the Hardcover settings test, the list
+// syncer's client factory), and a clone per call would give each of those its
+// own idle pool, never reused and held open until the idle timeout. The
+// shared http.DefaultTransport that DefaultProxyTransport may return is never
+// mutated. If the base changes (ConfigureOutboundProxy installs a proxy), the
+// next call clones the new base.
+//
+// These providers are fixed public endpoints and were never dial guarded, so
+// the clone adds no guard and removes none; a DialContext on the base survives
+// the clone. Callers that need a policy use GuardedTransport.
+func MetadataTransport() http.RoundTripper {
+	base := DefaultProxyTransport()
+	t, ok := base.(*http.Transport)
+	if !ok {
+		return base
+	}
+	metadataMu.Lock()
+	defer metadataMu.Unlock()
+	if metadataBase == base && metadataClone != nil {
+		return metadataClone
+	}
+	c := t.Clone()
+	c.MaxIdleConnsPerHost = metadataIdleConnsPerHost
+	metadataBase, metadataClone = base, c
+	return c
+}
+
+var (
+	metadataMu    sync.Mutex
+	metadataBase  http.RoundTripper
+	metadataClone *http.Transport
+)

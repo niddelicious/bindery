@@ -131,30 +131,30 @@ func TestGetLiveStatuses_Rtorrent(t *testing.T) {
 	}
 }
 
-func TestGetStalledIDs_Rtorrent(t *testing.T) {
+func TestGetStalledTorrents_Rtorrent(t *testing.T) {
 	t.Run("errored torrent is stalled", func(t *testing.T) {
 		stub := newRtorrentStub(t, "0", "Tracker: unregistered torrent")
-		ids, usesTorrentID, err := GetStalledIDs(context.Background(), stub.client(t, 102))
+		report, err := GetStalledTorrents(context.Background(), stub.client(t, 102))
 		if err != nil {
-			t.Fatalf("GetStalledIDs: %v", err)
+			t.Fatalf("GetStalledTorrents: %v", err)
 		}
-		if !usesTorrentID {
+		if !report.UsesTorrentID {
 			t.Fatal("expected hash keys")
 		}
-		if !ids[rtorrentTestHash] {
-			t.Fatalf("expected the errored torrent to be stalled, got %v", ids)
+		if !report.ClientReported[rtorrentTestHash] {
+			t.Fatalf("expected the errored torrent to be stalled, got %v", report.ClientReported)
 		}
 	})
 
 	t.Run("a message on a complete torrent is not a stall", func(t *testing.T) {
 		// Tracker chatter on a seeding torrent says nothing about its files.
 		stub := newRtorrentStub(t, "1", "Tracker: unregistered torrent")
-		ids, _, err := GetStalledIDs(context.Background(), stub.client(t, 103))
+		report, err := GetStalledTorrents(context.Background(), stub.client(t, 103))
 		if err != nil {
-			t.Fatalf("GetStalledIDs: %v", err)
+			t.Fatalf("GetStalledTorrents: %v", err)
 		}
-		if len(ids) != 0 {
-			t.Fatalf("expected no stalls, got %v", ids)
+		if len(report.ClientReported)+len(report.NoMetadata) != 0 {
+			t.Fatalf("expected no stalls, got %+v", report)
 		}
 	})
 }
@@ -300,10 +300,11 @@ func TestCheckCompletedPathVisibility_Rtorrent(t *testing.T) {
 	})
 
 	t.Run("not visible", func(t *testing.T) {
-		// The classic seedbox setup with no remap configured: connection fine,
-		// nothing will ever import (#1182).
+		// Grabs are sent to Bindery's download folder (#2664), so that is
+		// the folder judged: one Bindery cannot read is a warning naming the
+		// fix, whatever rTorrent's own default directory is (#1182).
 		client := &models.DownloadClient{ID: 111, Type: "rtorrent", Host: host, Port: port}
-		got := CheckCompletedPathVisibility(context.Background(), client, root, "", "")
+		got := CheckCompletedPathVisibility(context.Background(), client, filepath.Join(root, "missing"), "", "")
 		if got.Status != PathNotVisible {
 			t.Fatalf("got %+v", got)
 		}
@@ -311,6 +312,40 @@ func TestCheckCompletedPathVisibility_Rtorrent(t *testing.T) {
 			t.Errorf("warning should name the fix, got %q", got.Message)
 		}
 	})
+}
+
+// TestCheckCompletedPathVisibility_RtorrentChecksTheSentFolder replays #2664.
+// A seedbox rTorrent keeps its own default directory, which Bindery cannot
+// see, while every grab is sent d.directory.set with Bindery's download
+// folder through the client remap /data:<root>, and imports work. The Test
+// button and the health job judged the default directory and warned on a
+// working setup; they must judge the folder grabs are sent to.
+func TestCheckCompletedPathVisibility_RtorrentChecksTheSentFolder(t *testing.T) {
+	root := t.TempDir()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/xml")
+		if strings.Contains(string(body), "directory.default") {
+			_, _ = io.WriteString(w, `<?xml version="1.0"?><methodResponse><params><param><value><string>/home/seedbox/rtorrent/download</string></value></param></params></methodResponse>`)
+			return
+		}
+		_, _ = io.WriteString(w, `<?xml version="1.0"?><methodResponse><params><param><value><i8>0</i8></value></param></params></methodResponse>`)
+	}))
+	defer srv.Close()
+	host, port := serverHostPort(t, srv.URL)
+	client := &models.DownloadClient{ID: 112, Type: "rtorrent", Host: host, Port: port, PathRemap: "/data:" + root}
+
+	got := CheckCompletedPathVisibility(context.Background(), client, root, "", "")
+	if got.Status != PathVisible {
+		t.Fatalf("#2664: the folder grabs are sent to is readable, so Test must pass; got %+v", got)
+	}
+	if got.Path != root {
+		t.Errorf("expected the sent folder %q to be the one checked, got %q", root, got.Path)
+	}
+	health := CheckDownloadClientHealth(context.Background(), client, root, "", "")
+	if health.Status != HealthOK {
+		t.Errorf("#2664: the health job must agree with Test; got %+v", health)
+	}
 }
 
 func TestRtorrentStatus(t *testing.T) {
@@ -331,7 +366,7 @@ func TestRtorrentStatus(t *testing.T) {
 		// rTorrent parks routine tracker chatter there on healthy, fully
 		// downloaded torrents, and treating that as an error painted a seeding
 		// row red and tripped LiveStatusIsError's "error" substring match. The
-		// importer's poller and GetStalledIDs both already qualify on
+		// importer's poller and GetStalledTorrents both already qualify on
 		// !Complete; this is the third call site agreeing with them.
 		"complete with tracker chatter": {
 			rtorrent.Torrent{Complete: true, IsActive: true, Message: "Tracker: [Failure reason \"Torrent not registered with this tracker\"]"},
@@ -510,5 +545,60 @@ func TestRtorrentFor_IsCached(t *testing.T) {
 	}
 	if got := cache.ConstructorCount(); got != 2 {
 		t.Fatalf("constructor count after rotation: got %d, want 2", got)
+	}
+}
+
+// TestSendDownload_RtorrentGlobalRemapOnly: rTorrent always receives
+// d.directory.set, so with only BINDERY_DOWNLOAD_PATH_REMAP configured the
+// directory must still be in rTorrent's namespace (#2665).
+func TestSendDownload_RtorrentGlobalRemapOnly(t *testing.T) {
+	stub := newRtorrentStub(t, "0", "")
+	client := stub.client(t, 105)
+
+	magnet := "magnet:?xt=urn:btih:" + rtorrentTestHash
+	if _, err := SendDownload(context.Background(), client, magnet, "The Book", SendOptions{
+		DownloadDir: "/downloads",
+		GlobalRemap: "/data:/downloads",
+	}); err != nil {
+		t.Fatalf("SendDownload: %v", err)
+	}
+	body := stub.allBodies()
+	if !strings.Contains(body, "d.directory.set=&#34;/data&#34;") {
+		t.Errorf("download directory not run back through the global remap: %s", body)
+	}
+}
+
+// TestSendDownload_RtorrentMixedSetup is a global remap written for one client
+// (SABnzbd sees Bindery's /downloads as /data) next to an rTorrent that mounts
+// Bindery's /downloads directly. The global remap's Bindery side always
+// matches a sent folder, so without an opt out every client gets /data; an
+// identity remap on rTorrent keeps it on /downloads, while a second rTorrent
+// with no remap of its own still follows the global one (#2665).
+func TestSendDownload_RtorrentMixedSetup(t *testing.T) {
+	const global = "/data:/downloads"
+	cases := []struct {
+		name        string
+		clientRemap string
+		want        string
+	}{
+		{name: "identity remap keeps Bindery's folder", clientRemap: "/downloads:/downloads", want: "/downloads"},
+		{name: "no client remap follows the global one", want: "/data"},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := newRtorrentStub(t, "0", "")
+			client := stub.client(t, int64(106+i))
+			client.PathRemap = tc.clientRemap
+			magnet := "magnet:?xt=urn:btih:" + rtorrentTestHash
+			if _, err := SendDownload(context.Background(), client, magnet, "The Book", SendOptions{
+				DownloadDir: "/downloads",
+				GlobalRemap: global,
+			}); err != nil {
+				t.Fatalf("SendDownload: %v", err)
+			}
+			if body := stub.allBodies(); !strings.Contains(body, "d.directory.set=&#34;"+tc.want+"&#34;") {
+				t.Errorf("want d.directory.set=%q in: %s", tc.want, body)
+			}
+		})
 	}
 }

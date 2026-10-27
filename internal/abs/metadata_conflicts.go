@@ -72,7 +72,7 @@ func SerializeBookConflictValue(book *models.Book, field string) string {
 	case "release_date":
 		return formatConflictDate(book.ReleaseDate)
 	case "language":
-		return strings.TrimSpace(strings.ToLower(book.Language))
+		return models.NormalizeLanguageCode(book.Language)
 	case "average_rating":
 		if book.AverageRating <= 0 {
 			return ""
@@ -94,9 +94,9 @@ func ApplyAuthorConflictValue(author *models.Author, field, value string) error 
 	}
 	switch field {
 	case "description":
-		author.Description = textutil.CleanDescription(value)
+		setUncreditedProfileField(&author.Description, &author.DescriptionSource, textutil.CleanDescription(value))
 	case "image_url":
-		author.ImageURL = strings.TrimSpace(value)
+		setUncreditedProfileField(&author.ImageURL, &author.ImageSource, strings.TrimSpace(value))
 	case "disambiguation":
 		author.Disambiguation = strings.TrimSpace(value)
 	case "sort_name":
@@ -105,6 +105,37 @@ func ApplyAuthorConflictValue(author *models.Author, field, value string) error 
 		return fmt.Errorf("unsupported author conflict field %q", field)
 	}
 	return nil
+}
+
+// setUncreditedProfileField writes a conflict choice. Both sides of an author
+// conflict are uncredited values (credited ones never become conflicts, see
+// mergeCreditedAuthorField), so a changed value drops any credit the old one
+// carried rather than keep one that no longer describes it (#3287).
+func setUncreditedProfileField(cur *string, curSrc **models.ProfileSource, val string) {
+	if val != *cur {
+		*curSrc = nil
+	}
+	*cur = val
+}
+
+// mergeCreditedAuthorField handles a photo or bio field when the stored value
+// or the upstream one carries a credit (#3287), with models.MergeProfileField.
+// ok is false for any other field, or when neither side is credited, which
+// leaves the field to conflict planning.
+func mergeCreditedAuthorField(author, full *models.Author, field string) (changed, ok bool) {
+	switch field {
+	case "description":
+		if author.DescriptionSource == nil && full.DescriptionSource == nil {
+			return false, false
+		}
+		return models.MergeProfileField(&author.Description, &author.DescriptionSource, textutil.CleanDescription(full.Description), full.DescriptionSource), true
+	case "image_url":
+		if author.ImageSource == nil && full.ImageSource == nil {
+			return false, false
+		}
+		return models.MergeProfileField(&author.ImageURL, &author.ImageSource, strings.TrimSpace(full.ImageURL), full.ImageSource), true
+	}
+	return false, false
 }
 
 func ApplyBookConflictValue(book *models.Book, field, value string) error {
@@ -121,7 +152,10 @@ func ApplyBookConflictValue(book *models.Book, field, value string) error {
 	case "release_date":
 		book.ReleaseDate = parseConflictDate(value)
 	case "language":
-		book.Language = strings.TrimSpace(strings.ToLower(value))
+		// A conflict recorded before #3086 holds the spelling its source
+		// used ("en", "english"); what is written to the book is the same
+		// ISO 639-2/B code every other path stores.
+		book.Language = models.NormalizeLanguageCode(value)
 	case "average_rating":
 		book.AverageRating = parseConflictFloat(value)
 	case "ratings_count":
@@ -137,7 +171,10 @@ func normalizeConflictValue(field, value string) string {
 	switch field {
 	case "description":
 		return textutil.CleanDescription(value)
-	case "language", "image_url":
+	case "language":
+		// "en" against "eng" is one language, not a conflict (#3086).
+		return models.NormalizeLanguageCode(value)
+	case "image_url":
 		return strings.ToLower(value)
 	default:
 		return value

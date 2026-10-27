@@ -149,7 +149,31 @@ const (
 	// to exempt the request — never the mere presence of an apikey parameter,
 	// which an attacker can forge to switch the CSRF layer off (#708).
 	viaAPIKeyCtxKey ctxKey = "auth.via_api_key" //nolint:gosec // context key name, not a credential
+	// sessionLookupFailedCtxKey marks a request that carried a correctly
+	// signed session cookie whose epoch or revocation check could not run.
+	sessionLookupFailedCtxKey ctxKey = "auth.session_lookup_failed"
+	// adminByModeCtxKey marks a request that holds the admin role only
+	// because the auth mode admits it (disabled mode, or a local client in
+	// local-only mode), not because an admin signed in or sent the API key.
+	adminByModeCtxKey ctxKey = "auth.admin_by_mode"
 )
+
+// StatusClientClosedRequest is the nginx convention for a request the client
+// abandoned before the server answered. Nobody reads the response; the code
+// only keeps an abandoned request from being counted as a server fault.
+const StatusClientClosedRequest = 499
+
+// SessionLookupFailed reports whether the request carried a correctly signed
+// session cookie that the middleware could not check against the database
+// (an error, or the request being cancelled mid lookup). Such a request is
+// neither signed in nor signed out. Handlers on paths the middleware lets
+// through without identity, GET /auth/status above all, must answer it with
+// an error rather than report the caller as signed out: the UI treats
+// authenticated=false as a logout and goes to the login page.
+func SessionLookupFailed(ctx context.Context) bool {
+	v, _ := ctx.Value(sessionLookupFailedCtxKey).(bool)
+	return v
+}
 
 // AuthedViaAPIKey reports whether the request was authenticated by a verified
 // API key. False for session-cookie, proxy, local-only, or disabled-mode
@@ -164,6 +188,23 @@ func AuthedViaAPIKey(ctx context.Context) bool {
 // key. Exported only so tests can construct the same state Middleware sets.
 func WithAPIKeyAuth(ctx context.Context) context.Context {
 	return context.WithValue(ctx, viaAPIKeyCtxKey, true)
+}
+
+// AdminByAuthMode reports whether the request holds the admin role only
+// because the auth mode admits it: an anonymous caller in disabled mode or a
+// local client in local-only mode, or a non-admin session the mode elevated.
+// False for an admin's own session and for the API key. Handlers that must
+// know a person or the key really asked, rather than "whoever reached the
+// install", check it alongside the role.
+func AdminByAuthMode(ctx context.Context) bool {
+	v, _ := ctx.Value(adminByModeCtxKey).(bool)
+	return v
+}
+
+// WithAdminByAuthMode returns a context marked as AdminByAuthMode. Exported
+// only so tests can construct the same state Middleware sets.
+func WithAdminByAuthMode(ctx context.Context) context.Context {
+	return context.WithValue(ctx, adminByModeCtxKey, true)
 }
 
 // operatorWarnOnce keeps a missing-operator install from logging on every
@@ -293,6 +334,35 @@ type Provider interface {
 	// cookie's epoch is a real mismatch (revoked cookie) and the user is logged
 	// out exactly as before.
 	UserSessionEpoch(ctx context.Context, userID int64) (int64, error)
+	// SessionRevoked reports whether the session token whose
+	// SessionTokenHash is tokenHash was signed out (POST /auth/logout).
+	// Logout revokes only the one token presented, so the user's sessions on
+	// other devices are untouched; the epoch is the tool for "everywhere".
+	// A non-nil error is handled like a failed epoch lookup: the request is
+	// failed with a 5xx rather than treated as authenticated or as a logout.
+	SessionRevoked(ctx context.Context, tokenHash string) (bool, error)
+}
+
+// SessionCookieUsable is the server side half of session validation that the
+// signature cannot answer: the cookie's epoch must equal the user's live
+// session epoch, and the token must not have been signed out. Callers verify
+// the signature and expiry first and pass the decoded uid and epoch. It
+// returns (true, nil) when the session may authenticate, (false, nil) for a
+// genuine rejection, and a non-nil error for a transient lookup failure that
+// must not be mistaken for either.
+func SessionCookieUsable(ctx context.Context, p Provider, cookie string, uid, epoch int64) (bool, error) {
+	curEpoch, err := p.UserSessionEpoch(ctx, uid)
+	if err != nil {
+		return false, err
+	}
+	if curEpoch != epoch {
+		return false, nil
+	}
+	revoked, err := p.SessionRevoked(ctx, SessionTokenHash(cookie))
+	if err != nil {
+		return false, err
+	}
+	return !revoked, nil
 }
 
 // AllowUnauthPath reports whether the given method+path combination must always
@@ -334,7 +404,36 @@ func AllowUnauthPath(method, path string) bool {
 // mode branch runs. Two copies of it drifted once already: disabled mode was
 // reported as admin by the status route while the middleware stamped nothing,
 // so the UI rendered admin screens that every RequireAdmin route refused.
+//
+// The grant also requires the Host the browser used to pass
+// HostAllowedForModeGrant; see RefusedModeGrantHost for the case where the
+// peer qualifies but the name does not.
 func ModeGrantsAdmin(mode Mode, r *http.Request, trusted []*net.IPNet) bool {
+	return modeAdmitsPeer(mode, r, trusted) && HostAllowedForModeGrant(r)
+}
+
+// RefusedModeGrantHost reports whether the mode would have admitted r as the
+// admin from its network peer but the Host name cost it the grant, and returns
+// that name. Callers use it to tell the operator why, instead of answering as
+// if the request were simply unauthenticated.
+func RefusedModeGrantHost(mode Mode, r *http.Request, trusted []*net.IPNet) (string, bool) {
+	if !modeAdmitsPeer(mode, r, trusted) {
+		return "", false
+	}
+	host, ok := rejectedModeGrantHost(r)
+	if ok {
+		return "", false
+	}
+	return clipHost(host), true
+}
+
+// LogRefusedModeGrantHost records a refused host the way the middleware does:
+// once per host per hour, with a cap on distinct hosts.
+func LogRefusedModeGrantHost(host string) { hostRejectLog.note(clipHost(host)) }
+
+// modeAdmitsPeer is the network half of ModeGrantsAdmin: disabled admits
+// everyone, local-only a client on a private network.
+func modeAdmitsPeer(mode Mode, r *http.Request, trusted []*net.IPNet) bool {
 	switch mode {
 	case ModeDisabled:
 		return true
@@ -354,7 +453,9 @@ func ModeGrantsAdmin(mode Mode, r *http.Request, trusted []*net.IPNet) bool {
 //     proxy-authed user instead of always returning authenticated:false (#560).
 //  3. Health / auth endpoints: always allowed through
 //  4. Valid X-Api-Key header or ?apikey= query: admin, as the operator
-//  5. ModeGrantsAdmin (disabled, or local-only and local): admin, as the operator
+//  5. ModeGrantsAdmin (disabled, or local-only and local): admin, as the operator.
+//     Without a session, a Host that fails HostAllowedForModeGrant is refused
+//     with 403 here rather than falling through to 401.
 //  6. Valid signed session cookie: allowed
 //  7. Mode == proxy: trusted peer IP + identity header → resolve/provision user
 //  8. Otherwise: 401
@@ -396,17 +497,36 @@ func Middleware(p Provider) func(http.Handler) http.Handler {
 					// (Wave 1 / Bundle C audit finding). Pre-047-migration
 					// cookies decode as epoch=0; the migration default of 1
 					// makes them all fail here on upgrade, which is the
-					// deliberate forced-logout-on-upgrade behaviour.
-					curEpoch, epochErr := p.UserSessionEpoch(ctx, uid)
+					// deliberate forced-logout-on-upgrade behaviour. A token
+					// that was signed out via /auth/logout is rejected here too.
+					usable, lookupErr := SessionCookieUsable(ctx, p, c.Value, uid, epoch)
 					switch {
-					case epochErr != nil:
+					case lookupErr != nil:
 						// Transient lookup failure — do not authenticate, but do
 						// not treat as a revoked cookie either. Flag it so an
 						// otherwise-unauthenticated request fails with 500 rather
 						// than silently logging the user out on a DB blip.
-						slog.Error("session epoch lookup failed", "user_id", uid, "error", epochErr)
+						//
+						// A request the client abandoned (the browser aborting a
+						// fetch on navigation) cancels its own context, which
+						// fails the lookup with context.Canceled. That is not a
+						// database fault and touches nothing shared: the cookie,
+						// the user row and other requests on the same session are
+						// unaffected. Log it quietly.
+						//
+						// This treats a done context as "the client left". That
+						// holds only while no server side request timeout (a
+						// context deadline or http.TimeoutHandler) sits in front
+						// of this middleware. If one is added, a deadline here is
+						// a server fault and must be logged and answered as one.
+						if ctx.Err() != nil {
+							slog.Debug("session lookup abandoned by client", "user_id", uid, "error", lookupErr)
+						} else {
+							slog.Error("session lookup failed", "user_id", uid, "error", lookupErr)
+						}
 						epochLookupFailed = true
-					case curEpoch == epoch:
+						ctx = context.WithValue(ctx, sessionLookupFailedCtxKey, true)
+					case usable:
 						ctx = context.WithValue(ctx, userIDCtxKey, uid)
 						ctx = context.WithValue(ctx, userRoleCtxKey, p.UserRole(ctx, uid))
 						cookieValid = true
@@ -470,7 +590,21 @@ func Middleware(p Provider) func(http.Handler) http.Handler {
 				next.ServeHTTP(w, r)
 				return
 			}
-			if ModeGrantsAdmin(mode, r, p.TrustedProxyCIDRs()) {
+			if modeAdmitsPeer(mode, r, p.TrustedProxyCIDRs()) {
+				// The mode admits this peer, but with no session of its own
+				// the request is only served as the admin under a host name
+				// an outside site cannot have. Otherwise a page on another
+				// site, rebound to Bindery's address, would be served from
+				// the victim's own LAN address (DNS rebinding). A signed
+				// session (including one whose epoch lookup failed) and the
+				// API key are personal credentials such a page cannot obtain,
+				// so they are not checked.
+				if !cookieValid && !epochLookupFailed {
+					if host, ok := rejectedModeGrantHost(r); !ok {
+						writeHostRejected(w, host)
+						return
+					}
+				}
 				// A signed session whose epoch or role could not be read (a
 				// database error) might belong to a requester, so the mode
 				// grant is not applied to it. It goes through as that user
@@ -491,7 +625,14 @@ func Middleware(p Provider) func(http.Handler) http.Handler {
 				// Without the role, RequireAdmin-protected endpoints answer
 				// "admin role required" 403: first for local-only (#799), and
 				// for disabled mode until this branch absorbed it.
+				//
+				// An admin's own session passes through here too in local-only
+				// mode; only a caller the mode raised to admin is marked.
+				signedInAdmin := (cookieValid || proxyValid) && UserRoleFromContext(r.Context()) == RoleAdmin
 				ctx := context.WithValue(r.Context(), userRoleCtxKey, "admin")
+				if !signedInAdmin {
+					ctx = context.WithValue(ctx, adminByModeCtxKey, true)
+				}
 				ctx = withOperatorUserID(ctx, p)
 				r = r.WithContext(ctx)
 				next.ServeHTTP(w, r)
@@ -509,6 +650,13 @@ func Middleware(p Provider) func(http.Handler) http.Handler {
 			// of the path-based bypasses above applied (those already returned),
 			// so surface this as a server error instead of a spurious 401.
 			if epochLookupFailed {
+				if r.Context().Err() != nil {
+					// The client is gone; answer for the access log only.
+					// 499 assumes no server side request timeout sits in
+					// front of auth; see the lookup comment above.
+					w.WriteHeader(StatusClientClosedRequest)
+					return
+				}
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusInternalServerError)
 				if _, err := w.Write([]byte(`{"error":"internal error"}`)); err != nil {
@@ -550,17 +698,33 @@ func Middleware(p Provider) func(http.Handler) http.Handler {
 // identity header from a configured proxy IP. Returns (userID, true) on
 // success. Returns (0, false) when the header is missing or the source is
 // untrusted. A forged header from an untrusted IP is logged and rejected.
+//
+// The trust decision is made on the TCP peer, the proxy that actually opened
+// the connection, never on the client address resolved from
+// X-Forwarded-For. By the time this runs trustedProxyMiddleware has let
+// TrustedRealIP rewrite r.RemoteAddr to the forwarded client for a trusted
+// peer, so checking r.RemoteAddr asked "is the visitor a trusted proxy?" and
+// rejected every request through a proxy that sets X-Forwarded-For, which is
+// every real one (Cloudflare Tunnel, Traefik, nginx; #3096). RealPeerHost
+// reads the peer trustedProxyMiddleware stored before that rewrite. An
+// untrusted peer cannot move it: its forwarded headers are stripped and its
+// RemoteAddr is left alone.
 func resolveProxyIdentity(r *http.Request, p Provider) (int64, bool) {
 	header := p.ProxyAuthHeader()
 	username := strings.TrimSpace(r.Header.Get(header))
 
-	peerIP := requestPeerIP(r)
+	peerIP := net.ParseIP(RealPeerHost(r))
 
 	trusted := isTrustedProxy(peerIP, p.TrustedProxyCIDRs())
 
 	if username != "" && !trusted {
-		slog.Warn("proxy auth: identity header from untrusted source — rejecting",
-			"header", header, "peer", peerIP)
+		// peer is the connection's own address, the one the decision was
+		// made on; client is what X-Forwarded-For resolved to. They differ
+		// only when a trusted proxy forwarded the request, so reporting both
+		// tells "the proxy is not in BINDERY_TRUSTED_PROXY" apart from "a
+		// host is talking to Bindery directly".
+		slog.Warn("proxy auth: identity header from untrusted source, rejecting",
+			"header", header, "peer", RealPeerHost(r), "client", ipString(requestPeerIP(r)))
 		return 0, false
 	}
 	if !trusted || username == "" {
@@ -591,6 +755,18 @@ func isTrustedProxy(ip net.IP, cidrs []*net.IPNet) bool {
 	return false
 }
 
+// ipString renders ip for a log attribute, "" when it did not parse.
+func ipString(ip net.IP) string {
+	if ip == nil {
+		return ""
+	}
+	return ip.String()
+}
+
+// requestPeerIP returns the client IP as r.RemoteAddr carries it. Behind a
+// trusted proxy that is the client resolved from X-Forwarded-For, not the TCP
+// peer: use it to key or log the end user, never to decide whether the sender
+// is a trusted proxy (RealPeerHost answers that).
 func requestPeerIP(r *http.Request) net.IP {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
@@ -629,8 +805,11 @@ func RequireXRequestedWith(next http.Handler) http.Handler {
 				logCSRFRejection("x_requested_with", r,
 					"request is not API-key-authenticated and X-Requested-With is not the UI value",
 					"x_requested_with_present", r.Header.Get("X-Requested-With") != "")
+				// Not http.Error: it resets Content-Type to text/plain, which
+				// mislabelled this JSON body.
 				w.Header().Set("Content-Type", "application/json")
-				http.Error(w, `{"error":"forbidden"}`, http.StatusForbidden)
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte(`{"error":"forbidden"}` + "\n"))
 				return
 			}
 		}

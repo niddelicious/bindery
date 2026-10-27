@@ -145,11 +145,25 @@ var settingDescriptors = []SettingDescriptor{
 		State:       SettingStateActive,
 	},
 	{
+		Key: SettingDefaultAudiobookRootFolderID, Type: SettingTypeInt, Default: "", Min: "1",
+		Description: "root_folder.id used as the audiobook path for authors with no audiobook root folder of their own. Empty falls back to BINDERY_AUDIOBOOK_DIR, then BINDERY_LIBRARY_DIR.",
+		State:       SettingStateActive,
+	},
+	{
 		Key: SettingMetadataPrimaryProvider, Type: SettingTypeEnum, Default: "openlibrary",
-		Values:          MetadataPrimaryProviders,
-		Description:     "Provider that decides what an author catalogue looks like. The others stay wired as enrichers. Selecting hardcover requires a stored Hardcover API token.",
-		RestartRequired: true,
-		State:           SettingStateActive,
+		Values:      MetadataPrimaryProviders,
+		Description: "Provider that decides what an author catalogue looks like. The others stay wired as enrichers. Selecting hardcover requires a stored Hardcover API token. A change applies to the next metadata lookup, without a restart.",
+		State:       SettingStateActive,
+	},
+	{
+		Key: SettingMetadataAuthorWikidata, Type: SettingTypeBool, Default: "false",
+		Description: "Fill an author's missing photo and bio from Wikimedia Commons and Wikipedia, found on Wikidata by the author's authority ID (NORAF, GND, BnF or OpenLibrary), never by name. Off by default: while off, Wikimedia is sent no request. A change applies to the next metadata lookup, without a restart.",
+		State:       SettingStateActive,
+	},
+	{
+		Key: SettingMetadataEnrichersDisabled, Type: SettingTypeString, Default: "",
+		Description: "Comma separated metadata enrichers to turn off: any of openlibrary, hardcover, googlebooks, dnb, plus the audiobook sources audible (Audible catalogue) and audnex. Empty leaves all on. The primary provider is never turned off, so naming it is ignored. A disabled enricher is no longer used as an enricher (Hardcover can still be reached by its list sync, recommendations and series features), and a disabled audible or audnex is never asked. A change applies to the next metadata lookup, without a restart.",
+		State:       SettingStateActive,
 	},
 	{
 		Key: "search.preferredLanguage", Type: SettingTypeString, Default: "",
@@ -209,13 +223,36 @@ var settingDescriptors = []SettingDescriptor{
 	// Import placement and naming.
 	{
 		Key: SettingImportMode, Type: SettingTypeEnum, Default: "auto",
-		Values:      []string{"auto", "move", "copy", "hardlink", "external"},
+		Values:      importModeValues,
 		Description: "How a finished download reaches the library. auto hardlinks when source and destination share a filesystem and copies otherwise, so seeding survives.",
+		State:       SettingStateActive,
+	},
+	{
+		Key: SettingImportAudiobookMode, Type: SettingTypeEnum, Default: "",
+		Values:      importModeValues,
+		Description: "Import mode for audiobooks only. Empty uses import.mode for both formats; set it to send audiobooks somewhere else, such as copy into the Audiobookshelf library while ebooks go external to Calibre-Web-Automated.",
+		State:       SettingStateActive,
+	},
+	{
+		Key: SettingImportAudiobookContentCheck, Type: SettingTypeEnum, Default: "warn",
+		Values:      contentCheckValues,
+		Description: "Read the audio tags of a downloaded audiobook and compare them with the book it was grabbed for. warn imports it and records the other books found on the History event and webhook, block refuses the download and blocklists the release, off skips the check and reads no tags. Match to book and manual import always skip it.",
+		State:       SettingStateActive,
+	},
+	{
+		Key: SettingImportAudiobookDropFolder, Type: SettingTypeString, Default: "",
+		Description: "Drop folder for audiobooks when their import mode is external. Must exist inside the container. Empty uses import.drop_folder.",
 		State:       SettingStateActive,
 	},
 	{
 		Key: SettingImportAudiobookFlattenMultiDisc, Type: SettingTypeBool, Default: "false",
 		Description: "Flatten a multi disc audiobook download into one Part sequence on import. Only ever runs in copy or hardlink mode.",
+		State:       SettingStateActive,
+	},
+	{
+		Key: SettingImportEbookContentCheck, Type: SettingTypeEnum, Default: "warn",
+		Values:      contentCheckValues,
+		Description: "Compare a downloaded EPUB's own title and author with the book it was grabbed for. warn imports it and records the mismatch on the History event and webhook, block refuses the download and blocklists the release, off skips the check. Match to book and manual import always skip it.",
 		State:       SettingStateActive,
 	},
 	{
@@ -329,6 +366,41 @@ var settingDescriptors = []SettingDescriptor{
 		Key: SettingCalibreLibraryImportEnabled, Type: SettingTypeBool, Default: "false",
 		Description: "Allow importing an existing Calibre library into Bindery.",
 		State:       SettingStateActive,
+	},
+	{
+		Key: "backfill.asin_case_rev", Type: SettingTypeInt, Default: "0",
+		Description: "Revision of the ASIN case fold normalizer the startup backfill last ran at (isbnutil.NormalizeASINRev). Bindery compares it with the current revision at every start and re-runs the backfill only when they differ. Removing the row is harmless but makes the next start repeat the backfill once.",
+		State:       SettingStateInternal,
+	},
+	{
+		Key: "backfill.book_sort_key_rev", Type: SettingTypeInt, Default: "0",
+		Description: "Revision of the book sort key normalizer the startup backfill last ran at (the book sort key normalizer). Bindery compares it with the current revision at every start and re-runs the backfill only when they differ. Removing the row is harmless but makes the next start repeat the backfill once.",
+		State:       SettingStateInternal,
+	},
+	{
+		Key: "backfill.dedup_key_rev", Type: SettingTypeInt, Default: "0",
+		Description: "Revision of the book dedup key normalizer the startup backfill last ran at (CanonicalDedupKeyRev). Bindery compares it with the current revision at every start and re-runs the backfill only when they differ. Removing the row is harmless but makes the next start repeat the backfill once.",
+		State:       SettingStateInternal,
+	},
+	{
+		Key: "backfill.book_file_format_rev", Type: SettingTypeInt, Default: "0",
+		Description: "Revision of the audio file labelling rule the startup backfill last ran at. Bindery compares it with the current revision at every start and re-runs the backfill only when they differ. Removing the row is harmless but makes the next start repeat the backfill once.",
+		State:       SettingStateInternal,
+	},
+	{
+		Key: "backfill.language_code_rev", Type: SettingTypeInt, Default: "0",
+		Description: "Revision of the language code normalizer the startup backfill last ran at (models.NormalizeLanguageCodeRev). Bindery compares it with the current revision at every start and re-runs the backfill only when they differ. Removing the row is harmless but makes the next start repeat the backfill once.",
+		State:       SettingStateInternal,
+	},
+	{
+		Key: "backfill.search_key_rev", Type: SettingTypeInt, Default: "0",
+		Description: "Revision of the search key normalizer the startup backfill last ran at (the search key normalizer). Bindery compares it with the current revision at every start and re-runs the backfill only when they differ. Removing the row is harmless but makes the next start repeat the backfill once.",
+		State:       SettingStateInternal,
+	},
+	{
+		Key: "backfill.sort_key_rev", Type: SettingTypeInt, Default: "0",
+		Description: "Revision of the author sort key normalizer the startup backfill last ran at (the author sort key normalizer). Bindery compares it with the current revision at every start and re-runs the backfill only when they differ. Removing the row is harmless but makes the next start repeat the backfill once.",
+		State:       SettingStateInternal,
 	},
 	{
 		Key: "calibre.last_import_at", Type: SettingTypeString, Default: "",
@@ -468,15 +540,13 @@ var settingDescriptors = []SettingDescriptor{
 	// Google Books.
 	{
 		Key: SettingGoogleBooksAPIKey, Type: SettingTypeString, Default: "",
-		Description:     "Google Books API key, used to enrich metadata. The enricher is wired at startup, so a newly added key does nothing until Bindery restarts.",
-		RestartRequired: true,
-		State:           SettingStateActive,
+		Description: "Google Books API key, used to enrich metadata. Saving a key adds the Google Books enricher straight away, without a restart; with no key Google Books is not asked at all.",
+		State:       SettingStateActive,
 	},
 	{
 		Key: LegacySettingGoogleBooksAPIKey, Type: SettingTypeString, Default: "",
-		Description:     "Original spelling of googlebooks.apiKey, still read as a fallback for installs that stored the key under it.",
-		RestartRequired: true,
-		State:           SettingStateActive,
+		Description: "Original spelling of googlebooks.apiKey, still read as a fallback for installs that stored the key under it.",
+		State:       SettingStateActive,
 	},
 
 	// Auth. Every key here is classified secret, so the generic settings API

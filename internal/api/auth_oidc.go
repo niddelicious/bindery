@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -717,9 +718,32 @@ type providerWithStatus struct {
 	Status *oidc.Status `json:"status,omitempty"`
 }
 
-// GetProviders returns the configured OIDC provider list (id + name only,
-// no secrets) with a per-provider runtime status block. Used by the admin
-// settings UI; the public login page only needs id+name and ignores the rest.
+// publicProvider is what GET /auth/oidc/providers shows a caller who is not an
+// admin, which includes the signed out login page. It carries what the login
+// buttons need (id, name, and whether discovery worked) plus the non-secret
+// identifiers that already appear in the authorize redirect. It deliberately
+// has no allowed_groups and no discovery error text or timestamp: the error is
+// a raw lookup or connect failure that can name internal hosts and resolver
+// addresses, and the group list describes the operator's directory.
+type publicProvider struct {
+	ID       string                `json:"id"`
+	Name     string                `json:"name"`
+	Issuer   string                `json:"issuer"`
+	ClientID string                `json:"client_id"`
+	Scopes   []string              `json:"scopes"`
+	Status   *publicProviderStatus `json:"status,omitempty"`
+}
+
+type publicProviderStatus struct {
+	State string `json:"state"`
+}
+
+// GetProviders returns the configured OIDC provider list with a per-provider
+// runtime status block. The route is public so the login page can draw its
+// buttons, so what a caller sees depends on who they are: an admin (session,
+// API key, or an auth mode that admits them as the install's admin) gets the
+// full view for the settings screen, everyone else gets publicProvider. Never
+// any secret.
 // GET /api/v1/auth/oidc/providers
 func (h *OIDCHandler) GetProviders(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -733,6 +757,18 @@ func (h *OIDCHandler) GetProviders(w http.ResponseWriter, r *http.Request) {
 		writeServerError(w, r, err)
 		return
 	}
+	if !h.callerIsAdmin(r) {
+		out := make([]publicProvider, 0, len(ps))
+		for _, p := range ps {
+			pub := publicProvider{ID: p.ID, Name: p.Name, Issuer: p.Issuer, ClientID: p.ClientID, Scopes: p.Scopes}
+			if st := h.mgr.Status(p.ID); st != nil {
+				pub.Status = &publicProviderStatus{State: st.State}
+			}
+			out = append(out, pub)
+		}
+		writeOK(w, out)
+		return
+	}
 	out := make([]providerWithStatus, 0, len(ps))
 	for _, p := range ps {
 		out = append(out, providerWithStatus{
@@ -741,6 +777,26 @@ func (h *OIDCHandler) GetProviders(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeOK(w, out)
+}
+
+// callerIsAdmin reports whether the request acts as an admin on a route the
+// auth middleware lets through before it resolves the API key or the mode
+// grant. The role is stamped for a session or proxy identity; the mode grant
+// (disabled, local-only) and a valid API key are checked here because the
+// middleware returns early on public paths without stamping them.
+func (h *OIDCHandler) callerIsAdmin(r *http.Request) bool {
+	if requestHasAdminSemantics(r, h.settings) {
+		return true
+	}
+	key := r.Header.Get("X-Api-Key")
+	if key == "" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+		key = r.URL.Query().Get("apikey")
+	}
+	if key == "" {
+		return false
+	}
+	stored, _ := h.settings.Get(r.Context(), SettingAuthAPIKey)
+	return stored != nil && stored.Value != "" && subtle.ConstantTimeCompare([]byte(key), []byte(stored.Value)) == 1
 }
 
 // SetProviders stores the OIDC providers config and reloads the manager.

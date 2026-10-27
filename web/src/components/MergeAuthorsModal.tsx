@@ -1,7 +1,10 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useId, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useConfirmDialog } from './useConfirmDialog'
 import { api, Author } from '../api/client'
+import { useModal } from './useModal'
+import { primaryFill } from './buttons'
+import { errorText } from '../util/errorText'
 
 interface Props {
   authors: Author[]
@@ -18,6 +21,7 @@ interface Props {
 // target's book count so the user sees the "post-merge" total before
 // committing.
 export default function MergeAuthorsModal({ authors, initialTargetId, onClose, onMerged }: Props) {
+  const fid = useId()
   const { t } = useTranslation()
   const { confirm, confirmDialog } = useConfirmDialog()
   const [targetId, setTargetId] = useState<number | ''>(initialTargetId ?? '')
@@ -39,8 +43,12 @@ export default function MergeAuthorsModal({ authors, initialTargetId, onClose, o
     return () => { cancelled = true }
   }, [sourceId])
 
+  // The catalogue's own order, by last name (sortName), so the picker lists
+  // authors as the page it was opened from does (#2805).
   const sorted = useMemo(
-    () => [...authors].sort((a, b) => a.authorName.localeCompare(b.authorName)),
+    () => [...authors].sort((a, b) =>
+      (a.sortName || a.authorName).localeCompare(b.sortName || b.authorName) ||
+      a.authorName.localeCompare(b.authorName)),
     [authors],
   )
   const target = useMemo(() => authors.find(a => a.id === targetId), [authors, targetId])
@@ -67,33 +75,37 @@ export default function MergeAuthorsModal({ authors, initialTargetId, onClose, o
       onMerged()
       onClose()
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Merge failed')
+      setError(errorText(e, t('mergeAuthorsModal.failed', 'Merge failed')))
     } finally {
       setBusy(false)
     }
   }
 
+  const { titleId, panelProps } = useModal({ onClose, canClose: !busy })
+
   return (
-    <div className="fixed inset-0 bg-black/60 flex items-center justify-center p-4 z-50" onClick={onClose}>
+    <div className="modal-overlay fixed inset-0 bg-black/60 flex items-center justify-center p-4 z-50" onClick={onClose}>
       {confirmDialog}
       <div
-        className="bg-slate-100 dark:bg-zinc-900 border border-slate-300 dark:border-zinc-700 rounded-lg w-full max-w-lg shadow-2xl"
+        {...panelProps}
+        className="bg-slate-100 dark:bg-zinc-900 border border-slate-300 dark:border-zinc-700 rounded-lg w-full max-w-lg shadow-2xl modal-max-h overflow-y-auto"
         onClick={e => e.stopPropagation()}
       >
         <div className="p-4 border-b border-slate-200 dark:border-zinc-800">
-          <h3 className="text-lg font-semibold">{t('mergeAuthorsModal.title')}</h3>
-          <p className="text-xs text-slate-600 dark:text-zinc-500 mt-1">
+          <h3 id={titleId} className="text-lg font-semibold">{t('mergeAuthorsModal.title')}</h3>
+          <p className="text-xs text-fg-muted mt-1">
             {t('mergeAuthorsModal.description')}
           </p>
         </div>
 
         <div className="p-4 space-y-3">
           <div>
-            <label className="block text-xs text-slate-600 dark:text-zinc-400 mb-1">{t('mergeAuthorsModal.removeLabel')}</label>
+            <label htmlFor={`${fid}-remove`} className="block text-xs text-fg-muted mb-1">{t('mergeAuthorsModal.removeLabel')}</label>
             <select
+              id={`${fid}-remove`}
               value={sourceId}
               onChange={e => setSourceId(e.target.value ? Number(e.target.value) : '')}
-              className="w-full bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-emerald-500"
+              className="w-full bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded-md px-3 py-2 text-sm"
             >
               <option value="">—</option>
               {sorted.filter(a => a.id !== targetId).map(a => (
@@ -103,11 +115,12 @@ export default function MergeAuthorsModal({ authors, initialTargetId, onClose, o
           </div>
 
           <div>
-            <label className="block text-xs text-slate-600 dark:text-zinc-400 mb-1">{t('mergeAuthorsModal.keepLabel')}</label>
+            <label htmlFor={`${fid}-keep`} className="block text-xs text-fg-muted mb-1">{t('mergeAuthorsModal.keepLabel')}</label>
             <select
+              id={`${fid}-keep`}
               value={targetId}
               onChange={e => setTargetId(e.target.value ? Number(e.target.value) : '')}
-              className="w-full bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-emerald-500"
+              className="w-full bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded-md px-3 py-2 text-sm"
             >
               <option value="">—</option>
               {sorted.filter(a => a.id !== sourceId).map(a => (
@@ -121,9 +134,9 @@ export default function MergeAuthorsModal({ authors, initialTargetId, onClose, o
               <div>
                 <span className="font-medium">{source.authorName}</span> → <span className="font-medium">{target.authorName}</span>
               </div>
-              <div>{sourceBookCount === null ? 'Counting books…' : `${sourceBookCount} book(s) will move to the target.`}</div>
-              <div className="text-slate-500 dark:text-zinc-500">
-                Alias preserved: <span className="font-mono">{source.authorName}</span>
+              <div>{sourceBookCount === null ? t('mergeAuthorsModal.counting', 'Counting books…') : `${sourceBookCount} ${t('mergeAuthorsModal.willMove', 'book(s) will move to the target.')}`}</div>
+              <div className="text-fg-muted">
+                {t('mergeAuthorsModal.aliasPreserved', 'Alias preserved:')} <span className="font-mono">{source.authorName}</span>
                 {source.foreignAuthorId ? ` (${source.foreignAuthorId})` : ''}
               </div>
             </div>
@@ -139,14 +152,14 @@ export default function MergeAuthorsModal({ authors, initialTargetId, onClose, o
         <div className="p-4 border-t border-slate-200 dark:border-zinc-800 flex justify-end gap-2">
           <button
             onClick={onClose}
-            className="px-4 py-2 text-sm text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white"
+            className="px-4 py-2 text-sm text-fg-muted hover:text-slate-900 dark:hover:text-white"
           >
             {t('mergeAuthorsModal.cancel')}
           </button>
           <button
             onClick={submit}
             disabled={!canSubmit}
-            className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed rounded text-sm font-medium text-white"
+            className={`px-4 py-2 ${primaryFill} disabled:opacity-50 disabled:cursor-not-allowed rounded text-sm font-medium`}
           >
             {busy ? t('mergeAuthorsModal.merging') : t('mergeAuthorsModal.mergeButton')}
           </button>

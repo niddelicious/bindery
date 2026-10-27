@@ -54,6 +54,10 @@ func unitTime(t time.Time) string { return t.UTC().Format(unitTimeLayout) }
 type UnmatchedCandidate struct {
 	BookID int64   `json:"bookId"`
 	Score  float64 `json:"score"`
+	// FolderAuthorOnly marks, on a unit whose files name another author than
+	// their folder, a book offered only because the folder's author wrote it
+	// (#2942). It never sets the unit's top score.
+	FolderAuthorOnly bool `json:"folderAuthorOnly,omitempty"`
 }
 
 // UnmatchedUnitScan is what a library scan reports for one unit.
@@ -68,9 +72,12 @@ type UnmatchedUnitScan struct {
 	AuthorFolder string
 	ParsedTitle  string
 	ParsedAuthor string
-	Reason       string
-	MemberPaths  []string
-	Candidates   []UnmatchedCandidate
+	// FilesAuthor is the author the unit's files name when that is not its
+	// author folder's (#2942); "" when they agree or say nothing.
+	FilesAuthor string
+	Reason      string
+	MemberPaths []string
+	Candidates  []UnmatchedCandidate
 }
 
 // RegisteredFile is one book_files row an adoption inserted: its path and the
@@ -94,12 +101,14 @@ type UnmatchedUnit struct {
 	AuthorFolder    string
 	ParsedTitle     string
 	ParsedAuthor    string
+	FilesAuthor     string
 	Reason          string
 	MemberPaths     []string
 	Candidates      []UnmatchedCandidate
 	TopScore        float64
 	State           string
 	BookID          int64
+	PriorBookStatus string
 	CreatedBookID   int64
 	CreatedAuthorID int64
 	// CreatedBookFingerprint is BookFingerprint of the created book as the
@@ -165,10 +174,10 @@ func NewUnmatchedUnitRepo(database *sql.DB) *UnmatchedUnitRepo {
 const upsertUnmatchedUnitSQL = `
 INSERT INTO unmatched_units (
     unit_path, unit_kind, format, file_count, size_bytes, root_path, rel_path,
-    author_folder, parsed_title, parsed_author, reason, search_key,
+    author_folder, parsed_title, parsed_author, files_author, reason, search_key,
     member_paths_json, candidates_json, top_score, scan_generation,
     first_seen_at, last_seen_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(unit_path) DO UPDATE SET
     unit_kind = excluded.unit_kind,
     format = excluded.format,
@@ -179,6 +188,7 @@ ON CONFLICT(unit_path) DO UPDATE SET
     author_folder = excluded.author_folder,
     parsed_title = excluded.parsed_title,
     parsed_author = excluded.parsed_author,
+    files_author = excluded.files_author,
     reason = excluded.reason,
     search_key = excluded.search_key,
     member_paths_json = excluded.member_paths_json,
@@ -195,6 +205,8 @@ ON CONFLICT(unit_path) DO UPDATE SET
                  THEN 'pending' ELSE unmatched_units.state END,
     book_id = CASE WHEN unmatched_units.state = 'adopted' AND unmatched_units.resolved_at < ?
                    THEN NULL ELSE unmatched_units.book_id END,
+    prior_book_status = CASE WHEN unmatched_units.state = 'adopted' AND unmatched_units.resolved_at < ?
+                             THEN '' ELSE unmatched_units.prior_book_status END,
     created_book_id = CASE WHEN unmatched_units.state = 'adopted' AND unmatched_units.resolved_at < ?
                            THEN NULL ELSE unmatched_units.created_book_id END,
     created_author_id = CASE WHEN unmatched_units.state = 'adopted' AND unmatched_units.resolved_at < ?
@@ -311,18 +323,22 @@ func (r *UnmatchedUnitRepo) upsertChunk(ctx context.Context, chunk []UnmatchedUn
 		if err != nil {
 			return fmt.Errorf("unmatched units: encode candidates: %w", err)
 		}
+		// A folder author's look alike on a conflicting unit does not rank
+		// the unit as a close match (#2942).
 		var top float64
 		for _, c := range cands {
-			top = max(top, c.Score)
+			if !c.FolderAuthorOnly {
+				top = max(top, c.Score)
+			}
 		}
 		fileCount := max(u.FileCount, 1)
 		searchKey := textutil.FoldForSearch(u.ParsedTitle + " " + u.ParsedAuthor + " " + u.RelPath)
 		if _, err := stmt.ExecContext(ctx,
 			u.UnitPath, u.UnitKind, u.Format, fileCount, u.SizeBytes, u.RootPath, u.RelPath,
-			u.AuthorFolder, u.ParsedTitle, u.ParsedAuthor, u.Reason, searchKey,
+			u.AuthorFolder, u.ParsedTitle, u.ParsedAuthor, u.FilesAuthor, u.Reason, searchKey,
 			string(members), string(candJSON), top, generation,
 			nowText, nowText, nowText,
-			startedText, startedText, startedText, startedText, startedText, startedText, startedText,
+			startedText, startedText, startedText, startedText, startedText, startedText, startedText, startedText,
 		); err != nil {
 			return fmt.Errorf("unmatched units: upsert %q: %w", u.UnitPath, err)
 		}
@@ -400,8 +416,8 @@ func (r *UnmatchedUnitRepo) Summary(ctx context.Context) (UnmatchedSummary, erro
 }
 
 const unmatchedUnitColumns = `id, unit_path, unit_kind, format, file_count, size_bytes, root_path, rel_path,
-    author_folder, parsed_title, parsed_author, reason, member_paths_json, candidates_json, top_score,
-    state, book_id, created_book_id, created_author_id, registered_paths_json, created_book_fingerprint,
+    author_folder, parsed_title, parsed_author, files_author, reason, member_paths_json, candidates_json, top_score,
+    state, book_id, prior_book_status, created_book_id, created_author_id, registered_paths_json, created_book_fingerprint,
     scan_generation, first_seen_at, last_seen_at, resolved_at, claimed_at`
 
 func scanUnmatchedUnit(scan func(...any) error) (*UnmatchedUnit, error) {
@@ -410,8 +426,8 @@ func scanUnmatchedUnit(scan func(...any) error) (*UnmatchedUnit, error) {
 	var bookID, createdBook, createdAuthor sql.NullInt64
 	var first, last, resolved, claimed sql.NullString
 	if err := scan(&u.ID, &u.UnitPath, &u.UnitKind, &u.Format, &u.FileCount, &u.SizeBytes, &u.RootPath, &u.RelPath,
-		&u.AuthorFolder, &u.ParsedTitle, &u.ParsedAuthor, &u.Reason, &members, &cands, &u.TopScore,
-		&u.State, &bookID, &createdBook, &createdAuthor, &registered, &u.CreatedBookFingerprint,
+		&u.AuthorFolder, &u.ParsedTitle, &u.ParsedAuthor, &u.FilesAuthor, &u.Reason, &members, &cands, &u.TopScore,
+		&u.State, &bookID, &u.PriorBookStatus, &createdBook, &createdAuthor, &registered, &u.CreatedBookFingerprint,
 		&u.ScanGeneration, &first, &last, &resolved, &claimed); err != nil {
 		return nil, err
 	}
@@ -513,6 +529,7 @@ func (r *UnmatchedUnitRepo) ClaimState(ctx context.Context, id int64, from, to s
 // recovery reverses.
 type AdoptionRecord struct {
 	BookID                 int64
+	PriorBookStatus        string
 	CreatedBookID          int64
 	CreatedAuthorID        int64
 	CreatedBookFingerprint string
@@ -549,16 +566,16 @@ func (r *UnmatchedUnitRepo) writeAdoption(ctx context.Context, id int64, token s
 	}
 	now := unitTime(time.Now())
 	query := `UPDATE unmatched_units
-		SET book_id = ?, created_book_id = ?, created_author_id = ?, registered_paths_json = ?,
+		SET book_id = ?, prior_book_status = ?, created_book_id = ?, created_author_id = ?, registered_paths_json = ?,
 		    created_book_fingerprint = ?, updated_at = ?
 		WHERE id = ? AND state = 'adopting' AND claimed_at IS ?`
-	args := []any{nullID(rec.BookID), nullID(rec.CreatedBookID), nullID(rec.CreatedAuthorID), paths, rec.CreatedBookFingerprint, now, id, token}
+	args := []any{nullID(rec.BookID), rec.PriorBookStatus, nullID(rec.CreatedBookID), nullID(rec.CreatedAuthorID), paths, rec.CreatedBookFingerprint, now, id, token}
 	if complete {
 		query = `UPDATE unmatched_units
-			SET state = 'adopted', book_id = ?, created_book_id = ?, created_author_id = ?, registered_paths_json = ?,
+			SET state = 'adopted', book_id = ?, prior_book_status = ?, created_book_id = ?, created_author_id = ?, registered_paths_json = ?,
 			    created_book_fingerprint = ?, updated_at = ?, resolved_at = ?, claimed_at = NULL
 			WHERE id = ? AND state = 'adopting' AND claimed_at IS ?`
-		args = []any{nullID(rec.BookID), nullID(rec.CreatedBookID), nullID(rec.CreatedAuthorID), paths, rec.CreatedBookFingerprint, now, now, id, token}
+		args = []any{nullID(rec.BookID), rec.PriorBookStatus, nullID(rec.CreatedBookID), nullID(rec.CreatedAuthorID), paths, rec.CreatedBookFingerprint, now, now, id, token}
 	}
 	out, err := r.db.ExecContext(ctx, query, args...)
 	if err != nil {
@@ -574,7 +591,7 @@ func (r *UnmatchedUnitRepo) writeAdoption(ctx context.Context, id int64, token s
 func (r *UnmatchedUnitRepo) ResetToPending(ctx context.Context, id int64, from, token string) (bool, error) {
 	out, err := r.db.ExecContext(ctx, `
 		UPDATE unmatched_units
-		SET state = 'pending', book_id = NULL, created_book_id = NULL, created_author_id = NULL,
+		SET state = 'pending', book_id = NULL, prior_book_status = '', created_book_id = NULL, created_author_id = NULL,
 		    registered_paths_json = '[]', created_book_fingerprint = '', resolved_at = NULL, claimed_at = NULL,
 		    updated_at = ?
 		WHERE id = ? AND state = ? AND claimed_at IS ?`, unitTime(time.Now()), id, from, token)
@@ -710,4 +727,19 @@ func (r *UnmatchedUnitRepo) AuthorReferencedElsewhere(ctx context.Context, autho
 		return false, nil
 	}
 	return err == nil, err
+}
+
+// PriorBookStatusForBook returns the prior_book_status recorded by any other live
+// adoption for bookID, or empty string if none.
+func (r *UnmatchedUnitRepo) PriorBookStatusForBook(ctx context.Context, bookID, exceptID int64) (string, error) {
+	var status string
+	err := r.db.QueryRowContext(ctx,
+		`SELECT prior_book_status FROM unmatched_units
+		WHERE id <> ? AND book_id = ? AND state IN ('adopting', 'adopted') AND prior_book_status <> ''
+		LIMIT 1`,
+		exceptID, bookID).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return status, err
 }

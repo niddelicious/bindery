@@ -2,6 +2,7 @@ package importer
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -9,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/vavallee/bindery/internal/dirperm"
+	"github.com/vavallee/bindery/internal/importer/formatsniff"
 	"github.com/vavallee/bindery/internal/models"
 )
 
@@ -145,10 +148,17 @@ func (s *Scanner) proposedPathFor(ctx context.Context, book *models.Book, author
 		dest, err = s.destRenamer(ctx).AudiobookDestDir(root, author, book, seriesTitle, seriesNum)
 	} else {
 		root := s.effectiveLibraryDir(ctx, author)
-		dest, err = s.destRenamer(ctx).DestPath(root, author, book, seriesTitle, seriesNum, f.Path)
+		dest, err = s.destRenamer(ctx).DestPath(root, author, book, seriesTitle, seriesNum, s.ebookSourceName(ctx, book.ID, f.Path))
 	}
+	// An ebook with no extension that cannot get one back is reported after the
+	// on-disk check below, so one that is also gone from disk still reads as
+	// missing. dest stands in as the current path until then.
+	var noExtErr error
 	if err != nil {
-		return "", ReorgStatusError, err.Error()
+		if !errors.Is(err, ErrEbookNoExtension) {
+			return "", ReorgStatusError, err.Error()
+		}
+		noExtErr, dest = err, f.Path
 	}
 
 	// Mirror the import path's uniqueness handling for audiobook folders. Import
@@ -160,10 +170,20 @@ func (s *Scanner) proposedPathFor(ctx context.Context, book *models.Book, author
 	// than a false collision (or an endless (N)→(N+1) churn). Ebooks are single
 	// files and are not uniquified at import, so they skip this.
 	if audiobook {
-		dest = uniqueDirExcluding(dest, f.Path)
+		if isSingleFile(f.Path) {
+			if flattenedOntoFolderPath(f.Path, dest, s.windowsPaths) {
+				return dest, ReorgStatusError, flattenedOntoFolderMsg
+			}
+			dest = s.singleFileAudiobookDest(ctx, book, author, seriesTitle, seriesNum, dest, f.Path)
+		} else {
+			dest = uniqueDirExcluding(dest, f.Path, s.windowsPaths)
+		}
 	}
 
-	if filepath.Clean(dest) == filepath.Clean(f.Path) {
+	// On Windows a stored "H.R.H./x.epub" and a proposed "H.R.H/x.epub", or
+	// "WASTE LANDS FLIP" and "Waste Lands Flip", are one file (#3468), so they
+	// are a noop rather than a move onto itself or a false collision.
+	if noExtErr == nil && s.pathKey(dest) == s.pathKey(f.Path) {
 		return dest, ReorgStatusNoop, ""
 	}
 	// The source must still be on disk to move it.
@@ -172,6 +192,9 @@ func (s *Scanner) proposedPathFor(ctx context.Context, book *models.Book, author
 			return dest, ReorgStatusMissing, "tracked file is not on disk"
 		}
 		return dest, ReorgStatusError, err.Error()
+	}
+	if noExtErr != nil {
+		return "", ReorgStatusError, noExtErr.Error()
 	}
 	// A destination nested inside the source cannot be moved into: the folder
 	// move would have to copy the source into a subdirectory of itself, and the
@@ -200,12 +223,108 @@ func (s *Scanner) proposedPathFor(ctx context.Context, book *models.Book, author
 	return dest, ReorgStatusMove, ""
 }
 
+// ebookSourceName returns the name DestPath should take the extension from for
+// a tracked ebook. Normally that is the path itself. A file that has lost its
+// extension (#3217) gets it back from the bookRenamed history, which records
+// every Reorganize move as from/to: the extension of the path it was renamed
+// from, followed back through earlier renames, is the one it had before the
+// loss. History is exact where content is blind (azw3 and cbz look like mobi
+// and a bare zip), but content wins where it is conclusive: a file whose bytes
+// are a PDF never gets an .epub name because an old row says so. Only ebook
+// extensions are taken from history, so a stray .m4b can never be recovered.
+func (s *Scanner) ebookSourceName(ctx context.Context, bookID int64, path string) string {
+	if filepath.Ext(path) != "" || s.history == nil {
+		return path
+	}
+	hist := s.historyEbookName(ctx, bookID, path)
+	if hist == "" {
+		return path
+	}
+	histFormat := formatsniff.FromExtension(hist)
+	switch sniffed := sniffContent(path); sniffed {
+	case "":
+		return hist
+	case formatsniff.FormatMOBI:
+		// The Palm family: mobi, azw3 and azw all carry the same signature.
+		if histFormat == formatsniff.FormatMOBI || histFormat == formatsniff.FormatAZW3 || histFormat == "azw" {
+			return hist
+		}
+	}
+	return path
+}
+
+// historyEbookName follows the bookRenamed history back from path to the
+// earliest rename source that still has an ebook extension, or "" for none.
+func (s *Scanner) historyEbookName(ctx context.Context, bookID int64, path string) string {
+	events, err := s.history.ListByBook(ctx, bookID)
+	if err != nil {
+		return ""
+	}
+	cur := path
+	for range events {
+		moved := false
+		for _, e := range events {
+			if e.EventType != models.HistoryEventBookRenamed {
+				continue
+			}
+			var d struct{ From, To string }
+			if json.Unmarshal([]byte(e.Data), &d) != nil || d.To != cur || d.From == "" {
+				continue
+			}
+			if ebookExtensionFormats[formatsniff.FromExtension(d.From)] {
+				return d.From
+			}
+			cur, moved = d.From, true
+			break
+		}
+		if !moved {
+			break
+		}
+	}
+	return ""
+}
+
+func isSingleFile(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
+// singleFileAudiobookDest mirrors the single-file import branch: join the
+// book's own ebook folder (#2686), otherwise uniquify with the file's current
+// folder treated as available so a file already in place stays a noop. The
+// file is named the way the import names it (#2900): from the audiobook file
+// template when one is set, otherwise its own name.
+func (s *Scanner) singleFileAudiobookDest(ctx context.Context, book *models.Book, author *models.Author, seriesTitle, seriesNum, destDir, current string) string {
+	if existing, merging := s.existingEbookDir(ctx, book); !merging || s.pathKey(destDir) != s.pathKey(existing) {
+		destDir = uniqueDirExcluding(destDir, filepath.Dir(current), s.windowsPaths)
+	}
+	return filepath.Join(destDir, s.singleAudiobookFileName(ctx, author, book, seriesTitle, seriesNum, current))
+}
+
+const flattenedOntoFolderMsg = "this audiobook file sits where its folder belongs and has lost its extension (#2894). " +
+	"Move it into a folder and restore its extension, use Forget this file on the book for the old path, then run a library scan"
+
+// flattenedOntoFolderPath reports whether a tracked single audiobook file is
+// what Rename files left behind before #2894 was fixed: the file was moved onto
+// its templated folder path itself (or the " (N)" variant it uniquified to), so
+// it has the folder's name and no audio extension. Older releases read this as
+// a noop. Proposing a move from here would bury the extensionless file one
+// level down in a " (2)" folder, so it is reported instead and left for the
+// manual recovery the message describes.
+func flattenedOntoFolderPath(path, destDir string, windows bool) bool {
+	if IsAudioFile(path) {
+		return false
+	}
+	p, d := pathKey(path, windows), pathKey(destDir, windows)
+	return p == d || strings.HasPrefix(p, d+" (")
+}
+
 // uniqueDirExcluding mirrors UniqueDir but treats keep as if it were absent, so
 // resolving the destination for a file already parked at a uniquified location
 // returns that same location (a noop) instead of bumping to the next suffix.
-func uniqueDirExcluding(base, keep string) string {
-	keep = filepath.Clean(keep)
-	if filepath.Clean(base) == keep {
+func uniqueDirExcluding(base, keep string, windows bool) string {
+	keep = pathKey(keep, windows)
+	if pathKey(base, windows) == keep {
 		return base
 	}
 	if _, err := os.Stat(base); os.IsNotExist(err) {
@@ -213,7 +332,7 @@ func uniqueDirExcluding(base, keep string) string {
 	}
 	for i := 2; i < 1000; i++ {
 		candidate := fmt.Sprintf("%s (%d)", base, i)
-		if filepath.Clean(candidate) == keep {
+		if pathKey(candidate, windows) == keep {
 			return candidate
 		}
 		if _, err := os.Stat(candidate); os.IsNotExist(err) {
@@ -271,6 +390,7 @@ func (s *Scanner) applyOne(ctx context.Context, fileID int64) ReorganizeMove {
 		return m
 	}
 
+	singleFile := isSingleFile(file.Path)
 	if err := s.moveTrackedFile(ctx, file, proposed); err != nil {
 		m.Status = ReorgStatusFailed
 		m.Message = err.Error()
@@ -288,11 +408,12 @@ func (s *Scanner) applyOne(ctx context.Context, fileID int64) ReorganizeMove {
 		return m
 	}
 
-	// A single-file ebook leaves its metadata.opf behind when it moves out of a
-	// folder, which both strands a stale sidecar and blocks the prune below
-	// from reclaiming the now-empty folder. An audiobook moves as a whole
-	// directory, so its sidecar travels with it and there is nothing to clean.
-	if file.Format != models.MediaTypeAudiobook {
+	// A single file (an ebook, or a lone audiobook file) leaves its
+	// metadata.opf behind when it moves out of a folder, which both strands a
+	// stale sidecar and blocks the prune below from reclaiming the now-empty
+	// folder. An audiobook folder moves whole, so its sidecar travels with it
+	// and there is nothing to clean.
+	if singleFile {
 		removeOrphanedSidecar(filepath.Dir(file.Path), filepath.Dir(proposed))
 	}
 	pruneEmptyParents(filepath.Dir(file.Path), s.rootsForFormat(ctx, author, file.Format))
@@ -315,7 +436,7 @@ func (s *Scanner) applyOne(ctx context.Context, fileID int64) ReorganizeMove {
 	// feature that is off by default.
 	if s.opfSidecarEnabled(ctx) {
 		sidecarDir := proposed
-		if file.Format != models.MediaTypeAudiobook {
+		if singleFile {
 			sidecarDir = filepath.Dir(proposed)
 		}
 		edition := s.resolveCalibreEdition(ctx, nil, book)
@@ -332,7 +453,7 @@ func (s *Scanner) applyOne(ctx context.Context, fileID int64) ReorganizeMove {
 // (atomic commit + rollback across a same-fs rename or cross-fs copy), and
 // MoveDirCtx for an audiobook folder.
 func (s *Scanner) moveTrackedFile(ctx context.Context, file models.BookFile, dest string) error {
-	if err := os.MkdirAll(filepath.Dir(dest), 0o750); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dest), dirperm.Library()); err != nil {
 		return fmt.Errorf("create destination directory: %w", err)
 	}
 

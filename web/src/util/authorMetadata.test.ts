@@ -1,8 +1,16 @@
 import { describe, it, expect } from 'vitest'
 import type { Author } from '../api/client'
-import { canLinkAuthorMetadata } from './authorMetadata'
+import { authorProviderKey, canLinkAuthorMetadata } from './authorMetadata'
 
 const author = (over: Partial<Author>): Author => ({ id: 1, name: 'X', ...over }) as Author
+
+describe('authorProviderKey', () => {
+  it('routes national library ids by their prefix (#3144)', () => {
+    expect(authorProviderKey(author({ foreignAuthorId: 'bnf:author:11885918' }))).toBe('bnf')
+    expect(authorProviderKey(author({ foreignAuthorId: 'nb:author:90053882' }))).toBe('nb')
+    expect(authorProviderKey(author({ foreignAuthorId: 'dnb:118540238' }))).toBe('dnb')
+  })
+})
 
 describe('canLinkAuthorMetadata', () => {
   it('is true when unlinked or import-derived', () => {

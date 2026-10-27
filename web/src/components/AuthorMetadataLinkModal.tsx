@@ -2,6 +2,9 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 're
 import { useTranslation } from 'react-i18next'
 import { api, ApiError, Author, AuthorConflictBody, RelinkAuthorLinkCandidate } from '../api/client'
 import { metadataSourceLink } from '../util/metadataSource'
+import { useModal } from './useModal'
+import CoverImage from './CoverImage'
+import { primaryFill } from './buttons'
 
 interface Props {
   author: Author
@@ -14,6 +17,8 @@ function providerLabel(author: Author): string {
   if (provider === 'hardcover' || author.foreignAuthorId.startsWith('hc:')) return 'Hardcover'
   if (provider === 'openlibrary' || author.foreignAuthorId.startsWith('OL')) return 'OpenLibrary'
   if (provider === 'dnb' || author.foreignAuthorId.startsWith('dnb:')) return 'DNB'
+  if (provider === 'nb' || author.foreignAuthorId.startsWith('nb:')) return 'Nasjonalbiblioteket'
+  if (provider === 'bnf' || author.foreignAuthorId.startsWith('bnf:')) return 'BnF'
   if (provider) return provider
   return 'Metadata'
 }
@@ -99,28 +104,31 @@ export default function AuthorMetadataLinkModal({ author, onClose, onLinked }: P
     }
   }
 
+  const { titleId, panelProps } = useModal({ onClose, canClose: linking === null })
+
   return (
-    <div className="fixed inset-0 bg-black/60 flex items-center justify-center p-4 z-50" onClick={onClose}>
-      <div className="bg-slate-100 dark:bg-zinc-900 border border-slate-300 dark:border-zinc-700 rounded-lg w-full max-w-xl shadow-2xl max-h-[90vh] flex flex-col" onClick={e => e.stopPropagation()}>
+    <div className="modal-overlay fixed inset-0 bg-black/60 flex items-center justify-center p-4 z-50" onClick={onClose}>
+      <div {...panelProps} className="bg-slate-100 dark:bg-zinc-900 border border-slate-300 dark:border-zinc-700 rounded-lg w-full max-w-xl shadow-2xl modal-max-h flex flex-col" onClick={e => e.stopPropagation()}>
         <div className="p-4 border-b border-slate-200 dark:border-zinc-800">
-          <h3 className="text-lg font-semibold">{t('authorMetadataLink.title', 'Link metadata')}</h3>
+          <h3 id={titleId} className="text-lg font-semibold">{t('authorMetadataLink.title', 'Link metadata')}</h3>
         </div>
 
         <div className="p-4 flex-1 overflow-y-auto">
           <form onSubmit={search} className="flex gap-2">
             <input
+              enterKeyHint="search"
               value={query}
               onChange={event => setQuery(event.target.value)}
-              className="flex-1 bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-emerald-500"
-              placeholder={t('authorMetadataLink.searchPlaceholder', 'Search by author name...')}
+              className="flex-1 bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded-md px-3 py-2 text-sm"
+              placeholder={t('authorMetadataLink.searchPlaceholder', 'Search by author name…')}
               autoFocus
             />
             <button
               type="submit"
               disabled={searching || !query.trim()}
-              className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded-md text-sm font-medium"
+              className={`px-4 py-2 ${primaryFill} disabled:opacity-50 rounded-md text-sm font-medium`}
             >
-              {searching ? t('authorMetadataLink.searching', 'Searching...') : t('authorMetadataLink.search', 'Search')}
+              {searching ? t('authorMetadataLink.searching', 'Searching…') : t('authorMetadataLink.search', 'Search')}
             </button>
           </form>
 
@@ -145,13 +153,13 @@ export default function AuthorMetadataLinkModal({ author, onClose, onLinked }: P
                 className="flex items-center gap-3 justify-between p-3 rounded-md bg-slate-200/50 dark:bg-zinc-800/50"
               >
                 <div className="flex items-center gap-3 min-w-0">
-                  {candidate.imageUrl ? (
-                    <img src={candidate.imageUrl} alt={candidate.authorName} className="w-12 h-12 rounded-full object-cover flex-shrink-0" />
-                  ) : (
-                    <div className="w-12 h-12 rounded-full bg-slate-300 dark:bg-zinc-700 flex items-center justify-center text-sm font-bold text-slate-600 dark:text-zinc-300 flex-shrink-0">
-                      {candidate.authorName.charAt(0).toUpperCase()}
-                    </div>
-                  )}
+                  <CoverImage loading="lazy" decoding="async" src={candidate.imageUrl} alt={candidate.authorName} className="w-12 h-12 rounded-full object-cover flex-shrink-0"
+                    fallback={
+                      <div className="w-12 h-12 rounded-full bg-slate-300 dark:bg-zinc-700 flex items-center justify-center text-sm font-bold text-slate-600 dark:text-zinc-300 flex-shrink-0">
+                        {candidate.authorName.charAt(0).toUpperCase()}
+                      </div>
+                    }
+                  />
                   <div className="min-w-0">
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="font-medium text-sm truncate">{candidate.authorName}</span>
@@ -165,12 +173,12 @@ export default function AuthorMetadataLinkModal({ author, onClose, onLinked }: P
                         have never used.
                       */}
                       {candidate.previouslyLinked && (
-                        <span className="px-1.5 py-0.5 rounded border border-slate-400 dark:border-zinc-600 text-[10px] text-slate-600 dark:text-zinc-400">
+                        <span className="px-1.5 py-0.5 rounded border border-slate-400 dark:border-zinc-600 text-[10px] text-fg-muted">
                           {t('authorMetadataLink.previouslyLinked', 'previously linked')}
                         </span>
                       )}
                     </div>
-                    <div className="text-xs text-slate-600 dark:text-zinc-500 flex flex-wrap gap-x-3">
+                    <div className="text-xs text-fg-muted flex flex-wrap gap-x-3">
                       {candidate.disambiguation && <span>{candidate.disambiguation}</span>}
                       {candidate.statistics?.bookCount ? <span>{t('authorMetadataLink.books', { count: candidate.statistics.bookCount, defaultValue: '{{count}} books' })}</span> : null}
                       {candidate.ratingsCount ? <span>{t('authorMetadataLink.ratings', { count: candidate.ratingsCount, defaultValue: '{{count}} ratings' })}</span> : null}
@@ -202,14 +210,14 @@ export default function AuthorMetadataLinkModal({ author, onClose, onLinked }: P
                   type="button"
                   onClick={() => link(candidate)}
                   disabled={linking !== null}
-                  className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded text-xs font-medium flex-shrink-0"
+                  className={`px-3 py-1.5 ${primaryFill} disabled:opacity-50 rounded text-xs font-medium flex-shrink-0`}
                 >
-                  {linking === candidate.foreignAuthorId ? t('authorMetadataLink.linking', 'Linking...') : t('authorMetadataLink.link', 'Link')}
+                  {linking === candidate.foreignAuthorId ? t('authorMetadataLink.linking', 'Linking…') : t('authorMetadataLink.link', 'Link')}
                 </button>
               </div>
             ))}
             {!searching && visibleResults.length === 0 && !error && (
-              <p className="text-sm text-slate-600 dark:text-zinc-500 text-center py-6">
+              <p className="text-sm text-fg-muted text-center py-6">
                 {t('authorMetadataLink.noResults', 'No alternate metadata candidates found')}
               </p>
             )}
@@ -217,7 +225,7 @@ export default function AuthorMetadataLinkModal({ author, onClose, onLinked }: P
         </div>
 
         <div className="p-4 border-t border-slate-200 dark:border-zinc-800 flex justify-end">
-          <button onClick={onClose} className="px-4 py-2 text-sm text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white">{t('common.cancel')}</button>
+          <button onClick={onClose} className="px-4 py-2 text-sm text-fg-muted hover:text-slate-900 dark:hover:text-white">{t('common.cancel')}</button>
         </div>
       </div>
     </div>

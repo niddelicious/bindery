@@ -1,29 +1,37 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link, useLocation, useNavigate, useParams } from 'react-router'
 import { useTranslation } from 'react-i18next'
-import { api, BINDERY_BASE, Book, HistoryEvent, MediaType, SearchResult, SearchDebug, Series } from '../api/client'
+import { api, BINDERY_BASE, Book, BookSeriesExclusion, HistoryEvent, MediaType, SearchResult, SearchDebug, Series } from '../api/client'
 import SearchDebugPanel from '../components/SearchDebugPanel'
 import CoverPlaceholder from '../components/CoverPlaceholder'
+import BookRating from '../components/BookRating'
 import MarkdownDescription from '../components/MarkdownDescription'
 import MoreMenu from '../components/MoreMenu'
 import Section from '../components/Section'
 import Switch from '../components/Switch'
-import { btn, btnSize, dangerLink } from '../components/buttons'
+import { btn, btnSize, dangerLink, primaryFill } from '../components/buttons'
+import { useIsAdmin } from '../auth/AuthContext'
 import MediaBadge from '../components/MediaBadge'
 import CalibreDeliveryChip from '../components/CalibreDeliveryChip'
 import { bookStatusBadge } from '../components/bookStatus'
 import RebindModal from '../components/RebindModal'
 import RenameFilesModal from '../components/RenameFilesModal'
 import ConfirmDialog from '../components/ConfirmDialog'
+import { useConfirmDialog } from '../components/useConfirmDialog'
+import { grabWithForceConfirm } from '../util/forceGrab'
 import ClipboardManualFallback from '../components/ClipboardManualFallback'
 import { useClipboardCopy } from '../components/useClipboardCopy'
 import { isAutoGrabRefusal } from '../util/autoGrabRefusal'
 import { safeHref } from '../util/safeHref'
-import { metadataSourceLink, providerDisplayName, providerFromBookForeignId } from '../util/metadataSource'
+import { metadataRetrievedDate, metadataSourceLink, providerDisplayName, providerFromBookForeignId } from '../util/metadataSource'
 import FixMatchModal from '../components/FixMatchModal'
 import EditBookModal from '../components/EditBookModal'
 import { formatBytes } from '../util/format'
 import MetadataLinksMenu from '../components/MetadataLinksMenu'
+import { usePolling } from '../components/usePolling'
+import { languageName } from '../util/language'
+import CoverImage from '../components/CoverImage'
+import { decodeEntities } from '../util/decodeEntities'
 
 function formatDuration(seconds?: number): string {
   if (!seconds || seconds <= 0) return ''
@@ -31,29 +39,6 @@ function formatDuration(seconds?: number): string {
   const m = Math.floor((seconds % 3600) / 60)
   if (h > 0) return `${h}h ${m}m`
   return `${m}m`
-}
-
-// Maps ISO-639 language codes (both 639-1 two-letter and 639-2/B three-letter
-// forms) to a full English name. Codes outside this short list fall back to the
-// raw code — indexers and metadata providers only reliably tag a few majors.
-const LANGUAGE_NAMES: Record<string, string> = {
-  en: 'English', eng: 'English',
-  fr: 'French', fre: 'French', fra: 'French',
-  de: 'German', ger: 'German', deu: 'German',
-  nl: 'Dutch', dut: 'Dutch', nld: 'Dutch',
-  es: 'Spanish', spa: 'Spanish',
-  it: 'Italian', ita: 'Italian',
-  pt: 'Portuguese', por: 'Portuguese',
-  ja: 'Japanese', jpn: 'Japanese',
-  zh: 'Chinese', chi: 'Chinese', zho: 'Chinese',
-  ru: 'Russian', rus: 'Russian',
-  tl: 'Tagalog', tgl: 'Tagalog',
-  id: 'Indonesian', ind: 'Indonesian',
-}
-
-function languageName(code?: string): string | null {
-  if (!code) return null
-  return LANGUAGE_NAMES[code.toLowerCase()] ?? code
 }
 
 /** Final path segment, for labelling row-level controls. */
@@ -164,6 +149,58 @@ const resultRowCls = (approved?: boolean) =>
       : 'bg-slate-100 dark:bg-zinc-900 border-slate-200 dark:border-zinc-800'
   }`
 
+// ReleaseRow is one release with its Grab button. The main results and the
+// filtered section (#2334) both render it, so a filtered release is grabbed
+// by exactly the same path as any other.
+function ReleaseRow({
+  r,
+  fmt,
+  grabbing,
+  onGrab,
+}: {
+  r: SearchResult
+  fmt?: 'ebook' | 'audiobook'
+  grabbing: string | null
+  onGrab: (r: SearchResult) => void
+}) {
+  const { t } = useTranslation()
+  return (
+    <div className={resultRowCls(r.approved)}>
+      <div className="min-w-0 mr-3">
+        <div className="flex items-center gap-1.5 flex-wrap mb-0.5">
+          {fmt && <MediaBadge type={fmt} />}
+          <span className="truncate text-slate-800 dark:text-zinc-200">{r.title}</span>
+        </div>
+        <span className="text-fg-muted truncate block">
+          {r.indexerName} · {formatBytes(r.size)} · {t('search.grabs', { n: r.grabs, defaultValue: '{{n}} grabs' })}
+          {safeHref(r.infoUrl) && (
+            <>
+              {' · '}
+              <a
+                href={safeHref(r.infoUrl)}
+                target="_blank"
+                rel="noopener noreferrer"
+                onClick={e => e.stopPropagation()}
+                className="text-sky-600 dark:text-sky-400 hover:underline"
+              >
+                ↗ {t('search.indexerLink', 'indexer')}
+              </a>
+            </>
+          )}
+          {r.rejection && <span className="ml-2 text-amber-600 dark:text-amber-400">· {r.rejection}</span>}
+        </span>
+      </div>
+      <button
+        onClick={() => onGrab(r)}
+        disabled={grabbing !== null}
+        className={`px-3 py-2 ${primaryFill} disabled:opacity-50 rounded text-[11px] font-medium flex-shrink-0`}
+      >
+        {grabbing === r.guid ? t('search.grabbing', 'Grabbing…') : t('search.grab', 'Grab')}
+      </button>
+    </div>
+  )
+}
+
 export function SearchResultsSection({
   results,
   bookMediaType,
@@ -175,40 +212,9 @@ export function SearchResultsSection({
   grabbing: string | null
   onGrab: (r: SearchResult) => void
 }) {
+  const { t } = useTranslation()
   const renderRow = (r: SearchResult, fmt?: 'ebook' | 'audiobook') => (
-    <div key={r.guid} className={resultRowCls(r.approved)}>
-      <div className="min-w-0 mr-3">
-        <div className="flex items-center gap-1.5 flex-wrap mb-0.5">
-          {fmt && <MediaBadge type={fmt} />}
-          <span className="truncate text-slate-800 dark:text-zinc-200">{r.title}</span>
-        </div>
-        <span className="text-slate-500 dark:text-zinc-500 truncate block">
-          {r.indexerName} · {formatBytes(r.size)} · {r.grabs} grabs
-          {safeHref(r.infoUrl) && (
-            <>
-              {' · '}
-              <a
-                href={safeHref(r.infoUrl)}
-                target="_blank"
-                rel="noopener noreferrer"
-                onClick={e => e.stopPropagation()}
-                className="text-sky-600 dark:text-sky-400 hover:underline"
-              >
-                ↗ indexer
-              </a>
-            </>
-          )}
-          {r.rejection && <span className="ml-2 text-amber-600 dark:text-amber-400">· {r.rejection}</span>}
-        </span>
-      </div>
-      <button
-        onClick={() => onGrab(r)}
-        disabled={grabbing !== null}
-        className="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded text-[11px] font-medium flex-shrink-0"
-      >
-        {grabbing === r.guid ? 'Grabbing…' : 'Grab'}
-      </button>
-    </div>
+    <ReleaseRow key={r.guid} r={r} fmt={fmt} grabbing={grabbing} onGrab={onGrab} />
   )
 
   if (bookMediaType === 'both') {
@@ -218,13 +224,13 @@ export function SearchResultsSection({
       <>
         {ebooks.length > 0 && (
           <section className="mb-4">
-            <h3 className="text-sm font-semibold mb-2 text-slate-800 dark:text-zinc-200">Ebooks ({ebooks.length})</h3>
+            <h3 className="text-sm font-semibold mb-2 text-slate-800 dark:text-zinc-200">{t('bookDetail.results.ebooks', { n: ebooks.length, defaultValue: 'Ebooks ({{n}})' })}</h3>
             <div className="space-y-1">{ebooks.slice(0, 20).map(r => renderRow(r, 'ebook'))}</div>
           </section>
         )}
         {audiobooks.length > 0 && (
           <section className="mb-4">
-            <h3 className="text-sm font-semibold mb-2 text-slate-800 dark:text-zinc-200">Audiobooks ({audiobooks.length})</h3>
+            <h3 className="text-sm font-semibold mb-2 text-slate-800 dark:text-zinc-200">{t('bookDetail.results.audiobooks', { n: audiobooks.length, defaultValue: 'Audiobooks ({{n}})' })}</h3>
             <div className="space-y-1">{audiobooks.slice(0, 20).map(r => renderRow(r, 'audiobook'))}</div>
           </section>
         )}
@@ -234,8 +240,65 @@ export function SearchResultsSection({
 
   return (
     <section className="mb-6">
-      <h3 className="text-sm font-semibold mb-2 text-slate-800 dark:text-zinc-200">Results ({results.length})</h3>
+      <h3 className="text-sm font-semibold mb-2 text-slate-800 dark:text-zinc-200">{t('bookDetail.results.all', { n: results.length, defaultValue: 'Results ({{n}})' })}</h3>
       <div className="space-y-1">{results.slice(0, 20).map(r => renderRow(r))}</div>
+    </section>
+  )
+}
+
+// FilteredResultsSection lists the releases Bindery's relevance and language
+// filters removed (#2334), collapsed by default, each with the reason and the
+// same Grab button as any other release. Hidden when there are none. The filters
+// are right far more often than wrong, so the default view stays as it was;
+// this is the way out when one of them is wrong about a release you can see.
+export function FilteredResultsSection({
+  filtered,
+  total,
+  bookMediaType,
+  grabbing,
+  onGrab,
+}: {
+  filtered: SearchResult[]
+  total?: number
+  bookMediaType?: string
+  grabbing: string | null
+  onGrab: (r: SearchResult) => void
+}) {
+  const { t } = useTranslation()
+  const [open, setOpen] = useState(false)
+  if (filtered.length === 0) return null
+  return (
+    <section className="mb-6" data-testid="filtered-results">
+      <button
+        type="button"
+        onClick={() => setOpen(o => !o)}
+        aria-expanded={open}
+        className="text-sm font-semibold text-slate-800 dark:text-zinc-200 hover:underline"
+      >
+        <span aria-hidden className="inline-block w-4">{open ? '▾' : '▸'}</span>
+        {t('bookDetail.filteredHeading', { count: total ?? filtered.length })}
+      </button>
+      {open && (
+        <div className="mt-2">
+          <p className="text-xs text-fg-muted mb-2">
+            {t('bookDetail.filteredHint')}
+            {total !== undefined && total > filtered.length && (
+              <> {t('bookDetail.filteredCapped', { shown: filtered.length, total })}</>
+            )}
+          </p>
+          <div className="space-y-1">
+            {filtered.map(r => (
+              <ReleaseRow
+                key={r.guid}
+                r={r}
+                fmt={bookMediaType === 'both' && (r.mediaType === 'ebook' || r.mediaType === 'audiobook') ? r.mediaType : undefined}
+                grabbing={grabbing}
+                onGrab={onGrab}
+              />
+            ))}
+          </div>
+        </div>
+      )}
     </section>
   )
 }
@@ -279,6 +342,9 @@ export default function BookDetailPage() {
 
 function BookDetailPageInner() {
   const { t } = useTranslation()
+  // The page has its own ConfirmDialog states; this one only asks before a
+  // forced grab of a release Bindery already imported (#2289).
+  const { confirm: forceConfirm, confirmDialog: forceConfirmDialog } = useConfirmDialog()
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
   const location = useLocation()
@@ -292,7 +358,22 @@ function BookDetailPageInner() {
   const [autoSearching, setAutoSearching] = useState(false)
   const [autoSearchNotice, setAutoSearchNotice] = useState<string | null>(null)
   const [results, setResults] = useState<SearchResult[] | null>(null)
+  // Releases the relevance and language filters dropped (#2334).
+  const [filtered, setFiltered] = useState<SearchResult[]>([])
+  const [filteredTotal, setFilteredTotal] = useState<number | undefined>(undefined)
   const [searchDebug, setSearchDebug] = useState<SearchDebug | null>(null)
+  // #1636: the results of an interactive search render below the metadata
+  // sections, often well below the fold, and a sweep can take 10 to 18
+  // seconds. revealResults is set when a search finishes so the effect below
+  // can scroll the results region into view once React has rendered it.
+  const searchResultsRef = useRef<HTMLDivElement>(null)
+  const [revealResults, setRevealResults] = useState(false)
+  // Set when the reader scrolls on their own while the search runs. They
+  // went somewhere on purpose, so the finished search must not pull them
+  // back. Input events rather than 'scroll', because clearing the previous
+  // results shortens the page and the browser's own scroll clamp fires
+  // 'scroll' with no reader involved.
+  const userScrolledDuringSearch = useRef(false)
   const [hasIndexers, setHasIndexers] = useState<boolean | null>(null)
   const [grabbing, setGrabbing] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -313,7 +394,7 @@ function BookDetailPageInner() {
   // book; `paths` is exactly what the dialog shows, so the confirmation and
   // the request can never disagree.
   const [deleteTarget, setDeleteTarget] = useState<
-    { format?: 'ebook' | 'audiobook'; paths: string[] } | null
+    { format?: 'ebook' | 'audiobook'; paths: string[]; singlePath?: string } | null
   >(null)
   // The pending DB-only deregistration (#1692).
   const [deregisterTarget, setDeregisterTarget] = useState<FileRow | null>(null)
@@ -332,6 +413,9 @@ function BookDetailPageInner() {
   const [seriesBusy, setSeriesBusy] = useState(false)
   const [removeSeries, setRemoveSeries] = useState<{ id: number; title: string } | null>(null)
   const [seriesNonce, setSeriesNonce] = useState(0)
+  // Series the user took this book out of (#2554). Refreshes leave it out
+  // of these; Restore puts it back where it was.
+  const [keptOut, setKeptOut] = useState<BookSeriesExclusion[]>([])
 
   useEffect(() => {
     if (book?.title) {
@@ -351,6 +435,24 @@ function BookDetailPageInner() {
       .finally(() => { if (!cancelled) setLoading(false) })
     return () => { cancelled = true }
   }, [bookId, t])
+
+  // Live refresh while an import is in flight (#2423). It arms on the
+  // server's importInFlight flag: a download for this book that is still on
+  // its way into the library. The first version (#1161) armed on book statuses
+  // nothing ever wrote, so it never ran. Each tick reloads the book, and the
+  // reload that comes back with the flag cleared disarms the poll and pulls the
+  // history once more so the import shows up there too. The ASIN draft is left
+  // alone, since the user may be typing in it.
+  usePolling(() => {
+    api.getBook(bookId)
+      .then(b => {
+        setBook(b)
+        if (!b.importInFlight) {
+          api.listHistory({ bookId }).then(({ items }) => setEvents(items)).catch(() => {})
+        }
+      })
+      .catch(() => {})
+  }, 5000, Boolean(book?.importInFlight))
 
   // Series membership. There is no book→series endpoint, so this reuses the
   // author's series list and picks out this book's entries — deliberately not a
@@ -381,8 +483,32 @@ function BookDetailPageInner() {
         setSeries(mine)
       })
       .catch(() => { /* no series row */ })
+    api.getBookSeriesExclusions(id)
+      .then(list => { if (!cancelled) setKeptOut(list) })
+      .catch(() => { /* nothing to show */ })
     return () => { cancelled = true }
   }, [book?.authorId, book?.id, seriesNonce])
+
+  // Puts the book back in a series it was taken out of, at the position it
+  // had, as its primary series only when it has none. Linking by hand clears
+  // the exclusion on the server.
+  const restoreSeries = async (e: BookSeriesExclusion) => {
+    if (!book) return
+    setSeriesBusy(true)
+    setError(null)
+    try {
+      await api.linkBookToSeries(e.seriesId, { bookId: book.id, positionInSeries: e.position, primarySeries: !series.some(s => s.primary) })
+      setSeriesNonce(n => n + 1)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('bookDetail.series.restoreFailed'))
+    } finally {
+      setSeriesBusy(false)
+    }
+  }
+  // Series changes are admin only (#468): other users see the book's series
+  // without the controls, and nothing to restore.
+  const isAdmin = useIsAdmin()
+  const restorable = isAdmin ? keptOut.filter(e => e.seriesId > 0) : []
 
   // #2525: the renamer reads one series per book. When a book sits in both its
   // real series and an umbrella "Universe" one, these are how the user says
@@ -416,6 +542,22 @@ function BookDetailPageInner() {
     }
   }
 
+  // Sets the cover from an image the user picks (#3017). It replaces the
+  // current cover, and refresh only fills an empty one, so it stays.
+  const [uploadingCover, setUploadingCover] = useState(false)
+  const uploadCover = async (file: File | undefined) => {
+    if (!book || !file) return
+    setUploadingCover(true)
+    setError(null)
+    try {
+      setBook(await api.uploadBookCover(book.id, file))
+    } catch (e) {
+      setError(e instanceof Error ? e.message : t('bookDetail.cover.uploadFailed', 'Could not upload the cover'))
+    } finally {
+      setUploadingCover(false)
+    }
+  }
+
   const saveField = async (patch: Partial<Book>) => {
     if (!book) return
     setSaving(true)
@@ -435,6 +577,8 @@ function BookDetailPageInner() {
     if (!book) return
     setSearching(true)
     setResults(null)
+    setFiltered([])
+    setFilteredTotal(undefined)
     setSearchDebug(null)
     setError(null)
     // A leftover "automatic search started" banner over a fresh list of
@@ -447,13 +591,47 @@ function BookDetailPageInner() {
       ])
       setHasIndexers(indexers.length > 0)
       setResults(r.results)
+      setFiltered(r.filtered ?? [])
+      setFilteredTotal(r.filteredTotal)
       setSearchDebug(r.debug ?? null)
+      setRevealResults(true)
     } catch (e) {
       setError(e instanceof Error ? e.message : t('bookDetail.searchFailed'))
     } finally {
       setSearching(false)
     }
   }
+
+  useEffect(() => {
+    if (!searching) return
+    userScrolledDuringSearch.current = false
+    const scrollKeys = new Set(['ArrowDown', 'ArrowUp', 'PageDown', 'PageUp', 'Home', 'End', ' '])
+    const onScrollIntent = () => { userScrolledDuringSearch.current = true }
+    const onKey = (e: KeyboardEvent) => { if (scrollKeys.has(e.key)) onScrollIntent() }
+    window.addEventListener('wheel', onScrollIntent, { passive: true })
+    window.addEventListener('touchmove', onScrollIntent, { passive: true })
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('wheel', onScrollIntent)
+      window.removeEventListener('touchmove', onScrollIntent)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [searching])
+
+  useEffect(() => {
+    if (!revealResults) return
+    setRevealResults(false)
+    if (userScrolledDuringSearch.current) return
+    const el = searchResultsRef.current
+    // jsdom and some older engines have no scrollIntoView.
+    if (!el || typeof el.scrollIntoView !== 'function') return
+    // Already on screen: scrolling would only move the page for nothing.
+    const top = el.getBoundingClientRect().top
+    if (top >= 0 && top < window.innerHeight) return
+    const reduceMotion = typeof window.matchMedia === 'function'
+      && window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    el.scrollIntoView({ block: 'start', behavior: reduceMotion ? 'auto' : 'smooth' })
+  }, [revealResults])
 
   // #2668 (ThatDeltaGuy): the automatic counterpart of runSearch above. That
   // one is POST /book/{id}/search, which returns releases and grabs nothing,
@@ -494,7 +672,7 @@ function BookDetailPageInner() {
     setGrabbing(r.guid)
     setError(null)
     try {
-      await api.grab({
+      const dl = await grabWithForceConfirm({
         guid: r.guid,
         title: r.title,
         nzbUrl: r.nzbUrl,
@@ -502,11 +680,15 @@ function BookDetailPageInner() {
         bookId: book.id,
         indexerId: r.indexerId,
         protocol: r.protocol,
-        // The release's own detected type is authoritative — book.mediaType
-        // is 'both' for dual-format books, which tells a client nothing about
-        // which format this particular result actually is.
-        mediaType: r.mediaType ?? book.mediaType,
-      })
+        // The result's own media type, not the book's (#2933). A dual-format
+        // book is 'both', which matches no client category, so an audiobook
+        // grabbed from the Audiobooks group of a combined search landed in the
+        // ebook category. The groups above are built from r.mediaType, so
+        // this is the format the user picked; single-format searches leave it
+        // unset and the book's own type is the answer.
+        mediaType: r.mediaType || book.mediaType,
+      }, forceConfirm, t)
+      if (!dl) return
       // Refresh book + history
       const [b, h] = await Promise.all([
         api.getBook(book.id),
@@ -515,6 +697,8 @@ function BookDetailPageInner() {
       setBook(b)
       setEvents(h.items)
       setResults(null)
+      setFiltered([])
+      setFilteredTotal(undefined)
     } catch (e) {
       setError(e instanceof Error ? e.message : t('bookDetail.grabFailed'))
     } finally {
@@ -533,7 +717,9 @@ function BookDetailPageInner() {
     setDeletingFile(true)
     setError(null)
     try {
-      const params = deleteTarget.format ? `?format=${deleteTarget.format}` : ''
+      const params = deleteTarget.singlePath
+        ? `?path=${encodeURIComponent(deleteTarget.singlePath)}&delete=true`
+        : deleteTarget.format ? `?format=${deleteTarget.format}` : ''
       const updated = await api.deleteBookFile(book.id, params)
       setBook(updated)
       setDeleteTarget(null)
@@ -660,7 +846,7 @@ function BookDetailPageInner() {
           short. */}
       <button
         onClick={() => navigate(-backSteps)}
-        className="text-emerald-600 dark:text-emerald-400 hover:underline"
+        className="text-accent-text hover:underline"
       >
         {t('bookDetail.back')}
       </button>
@@ -695,7 +881,7 @@ function BookDetailPageInner() {
     return (
       <div className="max-w-7xl">
         {navRow}
-        <div className="text-slate-600 dark:text-zinc-500">{t('common.loading')}</div>
+        <div className="text-fg-muted">{t('common.loading')}</div>
       </div>
     )
   }
@@ -703,7 +889,7 @@ function BookDetailPageInner() {
     return (
       <div className="max-w-7xl">
         {navRow}
-        <div className="text-slate-600 dark:text-zinc-500">{t('bookDetail.notFound')}</div>
+        <div className="text-fg-muted">{t('bookDetail.notFound')}</div>
       </div>
     )
   }
@@ -744,6 +930,7 @@ function BookDetailPageInner() {
     return rows
   })()
   const sourceLinks = identityRows.flatMap(row => row.link ? [row.link] : [])
+  const bnfRetrieved = metadataRetrievedDate(book)
 
   // Display truth is the file inventory, never the declared media type.
   const rows = fileRows(book)
@@ -774,6 +961,10 @@ function BookDetailPageInner() {
         : t('bookDetail.searchEbookIndexers')
 
   const groupIsUntyped = (g: { rows: FileRow[] }) => g.rows.some(r => r.legacyUntyped)
+  // Format groups that hold at least one file, for the per-format deletes.
+  const filledGroups = groups.filter(g => g.rows.length > 0)
+  const mediaTypeName = (format: MediaType) =>
+    format === 'audiobook' ? t('common.audiobook') : format === 'both' ? t('common.both') : t('common.ebook')
 
   // Download is per ROW, not per format group (#2408).
   //
@@ -809,25 +1000,38 @@ function BookDetailPageInner() {
     // (7xl vs 4xl), so author → book collapsed the content by 384px and
     // left-aligned it mid-navigation.
     <div className="max-w-7xl">
+      {forceConfirmDialog}
       {navRow}
 
       {/* ===== Header: cover + metadata ===== */}
       <div className="flex flex-col sm:flex-row gap-6">
         <div className="w-32 flex-shrink-0">
-          {book.imageUrl ? (
-            <img src={book.imageUrl} alt={book.title} className="w-full rounded-lg" />
-          ) : (
-            <CoverPlaceholder id={book.id} title={book.title} className="aspect-[2/3] rounded-lg" />
-          )}
+          <CoverImage src={book.imageUrl} alt={book.title} className="w-full rounded-lg"
+            fallback={
+              <CoverPlaceholder id={book.id} title={book.title} className="aspect-[2/3] rounded-lg" />
+            }
+          />
+          <label className={`touch-target mt-2 block text-center text-xs text-accent-text hover:underline cursor-pointer has-[:focus-visible]:underline ${uploadingCover ? 'opacity-50 pointer-events-none' : ''}`}>
+            {uploadingCover
+              ? t('bookDetail.cover.uploading', 'Uploading…')
+              : book.imageUrl ? t('bookDetail.cover.change', 'Change cover') : t('bookDetail.cover.upload', 'Upload cover')}
+            <input
+              type="file"
+              accept="image/jpeg,image/png,image/webp,image/gif"
+              className="sr-only"
+              disabled={uploadingCover}
+              onChange={e => { void uploadCover(e.target.files?.[0]); e.target.value = '' }}
+            />
+          </label>
         </div>
         <div className="min-w-0 flex-1">
           <div className="flex items-start justify-between gap-3">
             <div className="min-w-0">
-              <h2 className="text-2xl font-semibold text-slate-900 dark:text-white">{book.title}</h2>
+              <h2 className="text-2xl font-semibold text-slate-900 dark:text-white [overflow-wrap:anywhere]">{book.title}</h2>
               {book.author?.authorName && (
                 <Link
                   to={`/author/${book.authorId}`}
-                  className="text-sm text-emerald-600 dark:text-emerald-400 hover:underline"
+                  className="text-sm text-accent-text hover:underline"
                 >
                   {book.author.authorName}
                 </Link>
@@ -856,59 +1060,71 @@ function BookDetailPageInner() {
               )
             })()}
             {/* The badge only reports monitoring; changing it meant going back
-                to the Books list and using the bulk action (#2417). No state
-                text next to the switch — the badge already carries it, and the
-                label matches the list's Monitor / Unmonitor wording. */}
+                to the Books list and using the bulk action (#2417). The switch
+                is labelled: unlabelled, it was "Monitored" only by inference
+                from the author page. */}
             <Switch
               checked={book.monitored}
               onChange={() => saveField({ monitored: !book.monitored })}
-              label={book.monitored ? t('common.unmonitor') : t('common.monitor')}
+              // The accessible name is the visible text, so "click Monitored"
+              // works by voice (WCAG 2.5.3); aria-checked carries on or off.
+              // The tooltip keeps saying what a click does.
+              label={t('bookDetail.monitoredLabel', 'Monitored')}
+              title={book.monitored ? t('common.unmonitor') : t('common.monitor')}
               disabled={saving}
               className="px-1"
-            />
+            >
+              {t('bookDetail.monitoredLabel', 'Monitored')}
+            </Switch>
             {book.excluded && (
-              <span className="inline-flex items-center px-2 py-0.5 rounded font-medium bg-amber-500/20 text-amber-700 dark:text-amber-400">
+              <span className="inline-flex items-center px-2 py-0.5 rounded font-medium bg-amber-500/20 text-amber-800 dark:text-amber-400">
                 {t('bookDetail.excludedBadge')}
               </span>
             )}
             <CalibreDeliveryChip bookId={book.id} />
             {publishedDate && (
               <>
-                <span aria-hidden className="text-slate-400 dark:text-zinc-600">·</span>
-                <span className="text-slate-600 dark:text-zinc-400">
+                <span aria-hidden className="text-fg-muted">·</span>
+                <span className="text-fg-muted">
                   {t('bookDetail.publishedDate', { date: publishedDate })}
                 </span>
               </>
             )}
-            <span aria-hidden className="text-slate-400 dark:text-zinc-600">·</span>
+            <span aria-hidden className="text-fg-muted">·</span>
             {lang ? (
-              <span className="text-slate-600 dark:text-zinc-400">{lang}</span>
+              <span className="text-fg-muted">{lang}</span>
             ) : (
               <span
-                className="inline-flex items-center px-2 py-0.5 rounded font-medium bg-amber-500/20 text-amber-700 dark:text-amber-400"
+                className="inline-flex items-center px-2 py-0.5 rounded font-medium bg-amber-500/20 text-amber-800 dark:text-amber-400"
                 title={t('bookDetail.languageUnknownHint')}
               >
                 {t('bookDetail.languageUnknown')}
               </span>
             )}
+            {book.averageRating && book.averageRating > 0 ? (
+              <>
+                <span aria-hidden className="text-fg-muted">·</span>
+                <BookRating book={book} withCount className="text-fg-muted" />
+              </>
+            ) : null}
             {book.narrator && (
               <>
-                <span aria-hidden className="text-slate-400 dark:text-zinc-600">·</span>
-                <span className="text-slate-600 dark:text-zinc-400">
+                <span aria-hidden className="text-fg-muted">·</span>
+                <span className="text-fg-muted">
                   {t('bookDetail.narratedBy', { narrator: book.narrator })}
                 </span>
               </>
             )}
             {book.durationSeconds ? (
               <>
-                <span aria-hidden className="text-slate-400 dark:text-zinc-600">·</span>
-                <span className="text-slate-600 dark:text-zinc-400">{formatDuration(book.durationSeconds)}</span>
+                <span aria-hidden className="text-fg-muted">·</span>
+                <span className="text-fg-muted">{formatDuration(book.durationSeconds)}</span>
               </>
             ) : null}
             {series.map(s => (
               <span key={s.id} className="contents">
-                <span aria-hidden className="text-slate-400 dark:text-zinc-600">·</span>
-                <span className="text-slate-600 dark:text-zinc-400">
+                <span aria-hidden className="text-fg-muted">·</span>
+                <span className="text-fg-muted">
                   {s.position
                     ? t('bookDetail.seriesPosition', {
                         series: s.title,
@@ -921,11 +1137,20 @@ function BookDetailPageInner() {
             ))}
             {sourceLinks.length > 0 && (
               <>
-                <span aria-hidden className="text-slate-400 dark:text-zinc-600">·</span>
+                <span aria-hidden className="text-fg-muted">·</span>
                 <MetadataLinksMenu links={sourceLinks} />
               </>
             )}
           </div>
+
+          {/* Genres were saved and editable but shown nowhere on the page. */}
+          {book.genres && book.genres.length > 0 && (
+            <ul className="flex flex-wrap gap-1.5 mt-2" aria-label={t('bookDetail.genresLabel', 'Genres')}>
+              {book.genres.map(g => (
+                <li key={g} className="px-2 py-0.5 rounded bg-slate-200 dark:bg-zinc-800 text-[11px] text-slate-700 dark:text-zinc-300">{g}</li>
+              ))}
+            </ul>
+          )}
 
           {/* Clamped with show more/less, matching AuthorDetailPage. max-w-prose
               keeps the line length readable now the page runs to 7xl. */}
@@ -942,7 +1167,7 @@ function BookDetailPageInner() {
               with the search action — not in the File card, which is about the
               file(s) actually on disk. */}
           <div className="mt-4 flex flex-wrap items-center gap-3">
-            <label htmlFor="book-media-type" className="text-xs text-slate-500 dark:text-zinc-500">
+            <label htmlFor="book-media-type" className="text-xs text-fg-muted">
               {t('bookDetail.mediaTypeLabel')}
             </label>
             <select
@@ -950,7 +1175,7 @@ function BookDetailPageInner() {
               value={mt}
               onChange={e => saveField({ mediaType: e.target.value as MediaType })}
               disabled={saving}
-              className="w-fit bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-2 py-1.5 text-sm focus:outline-none focus:border-slate-400 dark:focus:border-zinc-600 disabled:opacity-50"
+              className="w-fit bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-2 py-1.5 text-sm disabled:opacity-50"
               title={t('bookDetail.mediaTypeHint')}
             >
               <option value="ebook">📖 {t('common.ebook')}</option>
@@ -960,9 +1185,19 @@ function BookDetailPageInner() {
             <button
               onClick={runSearch}
               disabled={searching}
+              aria-busy={searching}
               className={`${btn.primary} ${btnSize.md}`}
             >
-              <span aria-hidden>🔍</span> {searchLabel}
+              {searching ? (
+                <span
+                  data-testid="search-spinner"
+                  aria-hidden
+                  className="inline-block h-3.5 w-3.5 align-[-2px] animate-spin rounded-full border-2 border-current border-t-transparent"
+                />
+              ) : (
+                <span aria-hidden>🔍</span>
+              )}{' '}
+              {searchLabel}
             </button>
             {canAutoSearch && (
               <button
@@ -995,9 +1230,10 @@ function BookDetailPageInner() {
           Only when a book is in more than one series. With a single membership
           there is nothing to choose and nothing to correct, so the meta row
           above already says everything. */}
-      {series.length > 1 && (
+      {(series.length > 1 || restorable.length > 0) && (
         <Section title={t('bookDetail.series.heading')}>
-          <p className="text-xs text-slate-500 dark:text-zinc-500">{t('bookDetail.series.explainer')}</p>
+          {series.length > 1 && (<>
+          <p className="text-xs text-fg-muted">{t('bookDetail.series.explainer')}</p>
           <ul className="mt-3 space-y-2">
             {series.map(s => (
               <li key={s.id} className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
@@ -1011,8 +1247,8 @@ function BookDetailPageInner() {
                     : s.title}
                 </span>
                 {s.primary ? (
-                  <span className="text-xs text-slate-500 dark:text-zinc-500">{t('bookDetail.series.namesFiles')}</span>
-                ) : (
+                  <span className="text-xs text-fg-muted">{t('bookDetail.series.namesFiles')}</span>
+                ) : isAdmin && (
                   <button
                     type="button"
                     className={`${btn.ghost} ${btnSize.sm}`}
@@ -1022,17 +1258,39 @@ function BookDetailPageInner() {
                     {t('bookDetail.series.useForNaming')}
                   </button>
                 )}
-                <button
-                  type="button"
-                  className={`${dangerLink} text-xs disabled:opacity-50`}
-                  disabled={seriesBusy}
-                  onClick={() => setRemoveSeries({ id: s.id, title: s.title })}
-                >
-                  {t('bookDetail.series.remove')}
-                </button>
+                {isAdmin && (
+                  <button
+                    type="button"
+                    className={`${dangerLink} text-xs disabled:opacity-50`}
+                    disabled={seriesBusy}
+                    onClick={() => setRemoveSeries({ id: s.id, title: s.title })}
+                  >
+                    {t('bookDetail.series.remove')}
+                  </button>
+                )}
               </li>
             ))}
           </ul>
+          </>)}
+          {restorable.length > 0 && (
+            <div className={series.length > 1 ? 'mt-4' : ''}>
+              <p className="text-xs text-fg-muted">{t('bookDetail.series.keptOutExplainer')}</p>
+              <ul className="mt-2 space-y-2" aria-label={t('bookDetail.series.keptOutHeading')}>
+                {restorable.map(e => (
+                  <li key={e.seriesForeignId} className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
+                    <span className="text-fg-muted line-through decoration-slate-400">
+                      {e.position
+                        ? t('bookDetail.seriesPosition', { series: e.seriesTitle, position: e.position, defaultValue: '{{series}} #{{position}}' })
+                        : e.seriesTitle}
+                    </span>
+                    <button type="button" className={`touch-target ${btn.ghost} ${btnSize.sm}`} disabled={seriesBusy} onClick={() => restoreSeries(e)}>
+                      {t('bookDetail.series.restore')}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
         </Section>
       )}
 
@@ -1043,7 +1301,7 @@ function BookDetailPageInner() {
             {/* The declared media type is what search and monitoring hunt for.
                 It is labelled as intent because the files below may disagree
                 with it, and when they do the files are the truth. */}
-            <span className="text-xs text-slate-500 dark:text-zinc-500">{t('bookDetail.wantedFormatLabel')}</span>
+            <span className="text-xs text-fg-muted">{t('bookDetail.wantedFormatLabel')}</span>
             <span className="w-fit">
               <MediaBadge type={mt} />
             </span>
@@ -1064,7 +1322,7 @@ function BookDetailPageInner() {
                     // dual-format book simply vanishes.
                     <div className="px-3 py-2 flex flex-wrap items-center gap-2">
                       <MediaBadge type={group.format} />
-                      <span className="text-xs text-slate-500 dark:text-zinc-500">
+                      <span className="text-xs text-fg-muted">
                         {t('bookDetail.formatNotOnDisk')}
                       </span>
                     </div>
@@ -1072,35 +1330,15 @@ function BookDetailPageInner() {
                     <>
                       <div className="px-3 py-2 flex flex-wrap items-center gap-2 border-b border-slate-200 dark:border-zinc-800">
                         <MediaBadge type={group.format} />
-                        <span className="text-xs text-slate-500 dark:text-zinc-500">
+                        <span className="text-xs text-fg-muted">
                           {t('bookDetail.fileCount', { count: group.rows.length })}
                         </span>
-                        {/* No Download here any more: a group of three epubs
-                            has no single file to hand back, which is exactly
-                            how #2408 shipped. Each row carries its own. Delete
-                            stays, because deleting the whole format IS a
-                            group-level action and the per-row Deregister in
-                            the overflow menu is a different thing. */}
-                        {/* Ghost-danger, not solid red. Deleting the file is
-                            reversible by re-downloading; solid red stays
-                            reserved for "Delete book + files" in the Danger
-                            zone, which is not. ?format=-scoped so the sibling
-                            format survives — except the bare legacy row,
-                            whose proxy format the server may contradict; that
-                            one goes format-less, exact because it is the only
-                            file (see FileRow.legacyUntyped). */}
-                        <button
-                          type="button"
-                          onClick={() => setDeleteTarget({
-                            format: groupIsUntyped(group) ? undefined : group.format,
-                            paths: group.rows.map(r => r.path),
-                          })}
-                          disabled={deletingFile || deregistering || deletingBook}
-                          className={`${btn.danger} ${btnSize.md}`}
-                        >
-                          <span aria-hidden>🗑 </span>
-                          {group.rows.length > 1 ? t('bookDetail.deleteFiles') : t('bookDetail.deleteFile')}
-                        </button>
+                        {/* No Download here: a group of three epubs has no
+                            single file to hand back, which is exactly how
+                            #2408 shipped. Each row carries its own. No Delete
+                            either: deleting a format lives in the section's
+                            More menu with every other delete, so one screen
+                            has one place to delete from instead of four. */}
                       </div>
 
                       <ul>
@@ -1110,13 +1348,13 @@ function BookDetailPageInner() {
                             className="px-3 py-2 flex items-center gap-2 min-w-0 border-t first:border-t-0 border-slate-100 dark:border-zinc-900"
                           >
                             <code
-                              className="font-mono text-xs text-slate-500 dark:text-zinc-500 truncate"
+                              className="min-w-0 font-mono text-xs text-fg-muted break-all sm:truncate"
                               title={row.path}
                             >
                               {row.path}
                             </code>
                             {!!row.sizeBytes && (
-                              <span className="shrink-0 text-xs text-slate-400 dark:text-zinc-600">
+                              <span className="shrink-0 text-xs text-fg-muted">
                                 {formatBytes(row.sizeBytes)}
                               </span>
                             )}
@@ -1135,7 +1373,7 @@ function BookDetailPageInner() {
                             <button
                               type="button"
                               onClick={() => copyPath(row.path)}
-                              className="shrink-0 text-slate-500 dark:text-zinc-400 hover:text-slate-700 dark:hover:text-zinc-200 text-xs border border-slate-300 dark:border-zinc-700 rounded px-1.5 py-0.5"
+                              className="shrink-0 text-fg-muted hover:text-slate-700 dark:hover:text-zinc-200 text-xs border border-slate-300 dark:border-zinc-700 rounded px-1.5 py-0.5"
                               aria-label={t('bookDetail.copyPath')}
                             >
                               <span aria-hidden>⧉</span>{' '}
@@ -1149,14 +1387,21 @@ function BookDetailPageInner() {
                               // as "More" are indistinguishable to a screen
                               // reader.
                               ariaLabel={t('bookDetail.rowMore', { name: baseName(row.path) })}
-                              buttonClassName="shrink-0 text-xs border border-slate-300 dark:border-zinc-700 rounded px-1.5 py-0.5 text-slate-500 dark:text-zinc-400"
+                              buttonClassName="shrink-0 text-xs border border-slate-300 dark:border-zinc-700 rounded px-1.5 py-0.5 text-fg-muted"
                               items={[
+                                // Fix match is about one file (which book it
+                                // belongs to), so it lives on the file's row
+                                // only. Re-bind, about the book's metadata
+                                // record, is in the Metadata source section.
                                 {
                                   label: t('bookDetail.fixMatch.button', 'Fix match'),
-                                  title: t('bookDetail.fixMatch.hint', 'Move this file to a different book'),
+                                  title: t('bookDetail.fixMatch.hint', 'Say which book this file really belongs to'),
                                   disabled: deletingFile || deregistering || deletingBook,
                                   onSelect: () => setFixMatchRow(row),
                                 },
+                                // With one file, deleting it is "Delete all
+                                // files" in the section menu; listing it here
+                                // too was a second place for the same action.
                                 {
                                   label: t('bookDetail.deregister.button'),
                                   title: row.tracked
@@ -1165,6 +1410,16 @@ function BookDetailPageInner() {
                                   disabled: !row.tracked || deletingFile || deregistering || deletingBook,
                                   onSelect: () => setDeregisterTarget(row),
                                 },
+                                ...(rows.length > 1 ? [{
+                                  label: t('bookDetail.deleteThisFile', 'Delete this file'),
+                                  title: t('bookDetail.deleteThisFileHint', 'Permanently delete only this file from disk'),
+                                  danger: true,
+                                  disabled: !row.tracked || deletingFile || deregistering || deletingBook,
+                                  onSelect: () => setDeleteTarget({
+                                    singlePath: row.path,
+                                    paths: [row.path],
+                                  }),
+                                }] : []),
                               ]}
                             />
                           </li>
@@ -1176,7 +1431,7 @@ function BookDetailPageInner() {
               ))}
             </div>
           ) : (
-            <p className="mt-4 text-xs text-slate-500 dark:text-zinc-500">{t('bookDetail.noFile')}</p>
+            <p className="mt-4 text-xs text-fg-muted">{t('bookDetail.noFile')}</p>
           )}
 
           {pathClipboard.status === 'manual' && (
@@ -1189,21 +1444,13 @@ function BookDetailPageInner() {
             className="mt-4 pt-4 border-t border-slate-200 dark:border-zinc-800 flex flex-wrap items-center gap-2"
             data-testid="file-section-actions"
           >
-            <button type="button" onClick={() => setShowRebind(true)} className={actionBtnCls}>
-              {t('bookDetail.rebind')}
-            </button>
-            {/* With exactly one file there is nothing to disambiguate, so keep
-                Fix match at the surface it used to live on instead of one
-                level down in the row menu. Multi-file books pick per row. */}
-            {rows.length === 1 && (
-              <button
-                type="button"
-                onClick={() => setFixMatchRow(rows[0])}
-                disabled={deletingFile || deregistering || deletingBook}
-                className={actionBtnCls}
-                title={t('bookDetail.fixMatch.hint', 'Move this file to a different book')}
-              >
-                {t('bookDetail.fixMatch.button', 'Fix match')}
+            {/* Re-bind changes which metadata record the book is, not which
+                book a file belongs to, so it sits with the Metadata source
+                below, whose sentence explains it. Here only when that section
+                has nothing to show. */}
+            {identityRows.length === 0 && (
+              <button type="button" onClick={() => setShowRebind(true)} className={actionBtnCls}>
+                {t('bookDetail.rebind')}
               </button>
             )}
             {/* Exclude and Rename files are the rarely-reached ones; keeping
@@ -1229,6 +1476,19 @@ function BookDetailPageInner() {
                   disabled: !hasAnyFile || deletingFile || deregistering || deletingBook,
                   onSelect: () => setShowRename(true),
                 },
+                // Delete one format's files, where the book has files in more
+                // than one format. ?format=-scoped so the sibling format
+                // survives (the bare legacy row goes format-less, exact
+                // because it is then the only file; see FileRow.legacyUntyped).
+                ...(filledGroups.length > 1 ? filledGroups.map(group => ({
+                  label: t('bookDetail.deleteFormatFiles', { format: mediaTypeName(group.format), defaultValue: 'Delete {{format}} files' }),
+                  danger: true,
+                  disabled: deletingFile || deregistering || deletingBook,
+                  onSelect: () => setDeleteTarget({
+                    format: groupIsUntyped(group) ? undefined : group.format,
+                    paths: group.rows.map(r => r.path),
+                  }),
+                })) : []),
                 {
                   // The only caller allowed to send a format-less DELETE.
                   // Kept out of the per-group controls so the wide delete is
@@ -1288,13 +1548,13 @@ function BookDetailPageInner() {
                     {t('bookDetail.metadataSource.current', 'Current')}
                   </span>
                 )}
-                <code className="font-mono text-xs text-slate-600 dark:text-zinc-400 select-all break-all">
+                <code className="font-mono text-xs text-fg-muted select-all break-all">
                   {row.foreignId}
                 </code>
                 <button
                   type="button"
                   onClick={() => copyId(row.foreignId)}
-                  className="shrink-0 text-slate-500 dark:text-zinc-400 hover:text-slate-700 dark:hover:text-zinc-200 text-xs border border-slate-300 dark:border-zinc-700 rounded px-1.5 py-0.5"
+                  className="shrink-0 text-fg-muted hover:text-slate-700 dark:hover:text-zinc-200 text-xs border border-slate-300 dark:border-zinc-700 rounded px-1.5 py-0.5"
                   aria-label={t('bookDetail.metadataSource.copyId', { id: row.foreignId, defaultValue: 'Copy {{id}}' })}
                 >
                   <span aria-hidden>⧉</span>{' '}
@@ -1307,10 +1567,17 @@ function BookDetailPageInner() {
                     href={row.link.url}
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="text-xs text-emerald-600 dark:text-emerald-400 hover:underline"
+                    className="text-xs text-accent-text hover:underline"
                   >
                     {t('common.viewOnSource', { source: row.link.label, defaultValue: 'View on {{source}} ↗' })}
                   </a>
+                )}
+                {/* BnF's Licence Ouverte asks for the source and the date
+                    wherever its data is shown (#3144). */}
+                {row.primary && row.provider === 'bnf' && bnfRetrieved && (
+                  <span className="text-xs text-fg-muted basis-full" data-testid="bnf-source-credit">
+                    {t('common.bnfSourceCredit', { date: bnfRetrieved, defaultValue: 'Data from the BnF, Licence Ouverte / Open Licence 2.0, retrieved {{date}}' })}
+                  </span>
                 )}
               </li>
             ))}
@@ -1320,9 +1587,14 @@ function BookDetailPageInner() {
               <ClipboardManualFallback text={idClipboard.manualText} />
             </div>
           )}
-          <p className="mt-3 text-xs text-slate-500 dark:text-zinc-500">
-            {t('bookDetail.metadataSource.hint', 'Re-bind this book if the record above is the wrong one.')}
-          </p>
+          <div className="mt-3 flex flex-wrap items-center gap-3">
+            <button type="button" onClick={() => setShowRebind(true)} className={actionBtnCls}>
+              {t('bookDetail.rebind')}
+            </button>
+            <p className="text-xs text-fg-muted">
+              {t('bookDetail.metadataSource.hint', 'Re-bind this book if the record above is the wrong one.')}
+            </p>
+          </div>
         </Section>
       )}
 
@@ -1332,15 +1604,18 @@ function BookDetailPageInner() {
           <div>
             <div className="flex flex-col sm:flex-row sm:items-end gap-2">
               <div className="flex-1">
-                <label htmlFor="book-asin" className="block text-xs text-slate-600 dark:text-zinc-400 mb-1">
+                <label htmlFor="book-asin" className="block text-xs text-fg-muted mb-1">
                   {t('bookDetail.asinLabel')}
                 </label>
                 <input
                   id="book-asin"
+                  autoCapitalize="characters"
+                  autoCorrect="off"
+                  spellCheck={false}
                   value={asinDraft}
                   onChange={e => setAsinDraft(e.target.value.toUpperCase())}
                   placeholder="B08GB58KD5"
-                  className="w-full bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-slate-400 dark:focus:border-zinc-600"
+                  className="w-full bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-3 py-2 text-sm"
                 />
               </div>
               <button
@@ -1357,48 +1632,75 @@ function BookDetailPageInner() {
                 disabled={!book.asin || enriching}
                 className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded text-sm font-medium disabled:opacity-40"
                 title={book.asin ? t('bookDetail.enrichHint') : t('bookDetail.enrichHintNoAsin')}
+                aria-describedby={book.asin ? undefined : 'book-enrich-no-asin'}
               >
                 {enriching ? t('bookDetail.enriching') : t('bookDetail.enrich')}
               </button>
             </div>
+            {/* Why Enrich is disabled. The title tooltip says it with a mouse;
+                a disabled button gets no hover or tap on a touch screen, so
+                there the reason is written out under the row. */}
+            {!book.asin && (
+              <p id="book-enrich-no-asin" className="hidden pointer-coarse:block mt-1 text-xs text-fg-muted">
+                {t('bookDetail.enrichHintNoAsin')}
+              </p>
+            )}
           </div>
         </Section>
       )}
 
-      {/* ===== Search results ===== */}
-      {results !== null && results.length === 0 && (
-        <div className="mt-6 text-center py-6 text-sm text-slate-600 dark:text-zinc-500 border border-slate-200 dark:border-zinc-800 rounded-lg bg-slate-100 dark:bg-zinc-900">
-          {hasIndexers === false ? (
-            <>
-              {t('bookDetail.noIndexers')}{' '}
-              <Link to="/settings" className="underline">{t('nav.settings')}</Link>.
-            </>
-          ) : (
-            t('bookDetail.noResults')
-          )}
-        </div>
-      )}
+      {/* ===== Search results =====
+          One region so a finished search can scroll it into view (#1636).
+          scroll-mt clears the sticky header. */}
+      <div ref={searchResultsRef} data-testid="search-results-region" className="scroll-mt-20">
+        {results !== null && results.length === 0 && (
+          <div className="mt-6 text-center py-6 text-sm text-fg-muted border border-slate-200 dark:border-zinc-800 rounded-lg bg-slate-100 dark:bg-zinc-900">
+            {hasIndexers === false ? (
+              <>
+                {t('bookDetail.noIndexers')}{' '}
+                <Link to="/settings" className="underline">{t('nav.settings')}</Link>.
+              </>
+            ) : filtered.length > 0 ? (
+              t('bookDetail.noResultsFiltered', { count: filteredTotal ?? filtered.length })
+            ) : (
+              t('bookDetail.noResults')
+            )}
+          </div>
+        )}
 
-      {searchDebug && (
-        <div className="mt-6">
-          <SearchDebugPanel
-            debug={searchDebug}
-            resultCount={results?.length ?? 0}
-            defaultOpen={results !== null && results.length === 0}
-          />
-        </div>
-      )}
+        {searchDebug && (
+          <div className="mt-6">
+            <SearchDebugPanel
+              debug={searchDebug}
+              resultCount={results?.length ?? 0}
+              defaultOpen={results !== null && results.length === 0}
+            />
+          </div>
+        )}
 
-      {results !== null && results.length > 0 && (
-        <div className="mt-6">
-          <SearchResultsSection
-            results={results}
-            bookMediaType={book.mediaType}
-            grabbing={grabbing}
-            onGrab={grab}
-          />
-        </div>
-      )}
+        {results !== null && results.length > 0 && (
+          <div className="mt-6">
+            <SearchResultsSection
+              results={results}
+              bookMediaType={book.mediaType}
+              grabbing={grabbing}
+              onGrab={grab}
+            />
+          </div>
+        )}
+
+        {filtered.length > 0 && (
+          <div className="mt-2">
+            <FilteredResultsSection
+              filtered={filtered}
+              total={filteredTotal}
+              bookMediaType={book.mediaType}
+              grabbing={grabbing}
+              onGrab={grab}
+            />
+          </div>
+        )}
+      </div>
 
       {/* ===== History section ===== */}
       {events.length > 0 && (
@@ -1410,13 +1712,20 @@ function BookDetailPageInner() {
                   aria-hidden
                   className={`w-2 h-2 rounded-full flex-shrink-0 ${eventDotColors[ev.eventType] ?? 'bg-slate-400 dark:bg-zinc-600'}`}
                 />
-                <span className="font-medium text-slate-700 dark:text-zinc-300 flex-shrink-0">
-                  {t(`bookDetail.event.${ev.eventType}`, ev.eventType)}
+                {/* The event is the line you scan; the release name is detail,
+                    so it sits under it, smaller and muted, instead of beside it
+                    at the same weight. */}
+                <span className="flex flex-col min-w-0">
+                  <span className="font-medium text-slate-700 dark:text-zinc-300">
+                    {t(`bookDetail.event.${ev.eventType}`, ev.eventType)}
+                  </span>
+                  {ev.sourceTitle && (
+                    <span className="font-mono text-[11px] text-fg-muted truncate" title={decodeEntities(ev.sourceTitle)}>
+                      {decodeEntities(ev.sourceTitle)}
+                    </span>
+                  )}
                 </span>
-                <span className="font-mono text-xs text-slate-500 dark:text-zinc-500 truncate min-w-0">
-                  {ev.sourceTitle || '—'}
-                </span>
-                <span className="ml-auto text-xs text-slate-500 dark:text-zinc-500 whitespace-nowrap flex-shrink-0">
+                <span className="ml-auto text-xs text-fg-muted whitespace-nowrap flex-shrink-0">
                   {new Date(ev.createdAt).toLocaleString()}
                 </span>
               </div>
@@ -1430,6 +1739,8 @@ function BookDetailPageInner() {
           book={book}
           onClose={() => setShowEdit(false)}
           onSaved={updated => setBook(updated)}
+          onSeriesSaved={() => setSeriesNonce(n => n + 1)}
+          seriesExclusions={keptOut.length}
         />
       )}
       {showRebind && (
@@ -1471,9 +1782,11 @@ function BookDetailPageInner() {
           type while a format-less DELETE removed every file on the book. */}
       {deleteTarget && (
         <ConfirmDialog
-          title={deleteTarget.format
-            ? t('bookDetail.deleteFilesTitle', { format: t(`common.${deleteTarget.format}`) })
-            : t('bookDetail.deleteAllFiles.button')}
+          title={deleteTarget.singlePath
+            ? t('bookDetail.deleteThisFile', 'Delete this file')
+            : deleteTarget.format
+              ? t('bookDetail.deleteFilesTitle', { format: t(`common.${deleteTarget.format}`) })
+              : t('bookDetail.deleteAllFiles.button')}
           body={
             <div className="space-y-2">
               <p>{t('bookDetail.deleteFilesBody', { count: deleteTarget.paths.length })}</p>
@@ -1484,7 +1797,7 @@ function BookDetailPageInner() {
                   </li>
                 ))}
               </ul>
-              <p>{t('bookDetail.deleteFilesSiblingNote')}</p>
+              {!deleteTarget.singlePath && <p>{t('bookDetail.deleteFilesSiblingNote')}</p>}
               <p>{t('bookDetail.deleteFilesStatusNote')}</p>
             </div>
           }

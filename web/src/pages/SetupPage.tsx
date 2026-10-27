@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next'
 import { api } from '../api/client'
 import { useAuth } from '../auth/AuthContext'
 import { CardShell } from './LoginPage'
+import { literalInputAttrs } from '../util/inputAttrs'
 
 export default function SetupPage() {
   const { t } = useTranslation()
@@ -48,46 +49,47 @@ export default function SetupPage() {
 
   return (
     <CardShell title={t('setup.title')} subtitle={t('setup.subtitle')}>
-      <p className="text-xs text-slate-500 dark:text-zinc-500 mb-4 leading-relaxed">
+      <p className="text-xs text-fg-muted mb-4 leading-relaxed">
         {t('setup.description')}
       </p>
       <form onSubmit={submit} className="space-y-4">
         <label className="block">
-          <span className="block text-xs font-medium text-slate-600 dark:text-zinc-400 mb-1">{t('setup.username')}</span>
+          <span className="block text-xs font-medium text-fg-muted mb-1">{t('setup.username')}</span>
           <input
+            {...literalInputAttrs}
             type="text"
             name="username"
             id="username"
             autoComplete="username"
             defaultValue="admin"
             required
-            className="w-full bg-white dark:bg-zinc-900 border border-slate-300 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+            className="w-full bg-white dark:bg-zinc-900 border border-slate-300 dark:border-zinc-700 rounded-md px-3 py-2 text-sm"
           />
         </label>
         <label className="block">
-          <span className="block text-xs font-medium text-slate-600 dark:text-zinc-400 mb-1">{t('setup.password')}</span>
+          <span className="block text-xs font-medium text-fg-muted mb-1">{t('setup.password')}</span>
           <input
             type="password"
             name="password"
             id="password"
             autoComplete="new-password"
             required
-            className="w-full bg-white dark:bg-zinc-900 border border-slate-300 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+            className="w-full bg-white dark:bg-zinc-900 border border-slate-300 dark:border-zinc-700 rounded-md px-3 py-2 text-sm"
           />
         </label>
         <label className="block">
-          <span className="block text-xs font-medium text-slate-600 dark:text-zinc-400 mb-1">{t('setup.confirmPassword')}</span>
+          <span className="block text-xs font-medium text-fg-muted mb-1">{t('setup.confirmPassword')}</span>
           <input
             type="password"
             name="confirm"
             id="confirm-password"
             autoComplete="new-password"
             required
-            className="w-full bg-white dark:bg-zinc-900 border border-slate-300 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+            className="w-full bg-white dark:bg-zinc-900 border border-slate-300 dark:border-zinc-700 rounded-md px-3 py-2 text-sm"
           />
         </label>
         {error && (
-          <div className="text-sm text-red-600 dark:text-red-400 py-1">{error}</div>
+          <div className="text-sm text-red-700 dark:text-red-400 py-1">{error}</div>
         )}
         <button
           type="submit"

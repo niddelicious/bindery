@@ -47,12 +47,10 @@ func DiscoverMaxRedirects(n int) DiscoverOption {
 }
 
 // discoverTransport returns the RoundTripper the discovery client should use
-// under policy. It mirrors the image proxy and notifier transports: on the
-// direct path it clones the shared proxy transport and installs a per-dial
-// SSRF re-validation, and when an outbound proxy is configured it hands back
-// the shared transport unchanged, because the dial then targets the
-// operator-trusted proxy rather than the IdP and a per-dial check would reject
-// a LAN or loopback proxy.
+// under policy: a clone of the shared proxy transport with a per-dial SSRF
+// re-validation (httpsec.GuardedTransport). The dial to an operator-configured
+// outbound proxy is exempt, so a LAN or loopback proxy keeps working, while a
+// destination the proxy bypass rules send direct is checked.
 //
 // A nil policy returns nil, which http.Client reads as "use the default
 // transport". That is the documented no-guardrails mode DiscoverPolicy exists
@@ -61,16 +59,7 @@ func discoverTransport(policy *httpsec.Policy) http.RoundTripper {
 	if policy == nil {
 		return nil
 	}
-	base := httpsec.DefaultProxyTransport()
-	if httpsec.ProxyFunc() != nil {
-		return base
-	}
-	if t, ok := base.(*http.Transport); ok {
-		c := t.Clone()
-		c.DialContext = httpsec.NewDialContext(*policy)
-		return c
-	}
-	return &http.Transport{DialContext: httpsec.NewDialContext(*policy)}
+	return httpsec.GuardedTransport(*policy)
 }
 
 // DiscoveryDoc is the subset of the OIDC provider metadata document that the

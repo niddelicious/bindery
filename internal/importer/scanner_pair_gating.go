@@ -76,10 +76,7 @@ func siblingFormatOnDisk(book *models.Book, format string) bool {
 // if the sibling was held, it is released into the drop folder too so the pair
 // lands together. Returns true — it always takes ownership of the download.
 func (s *Scanner) dropPairGated(ctx context.Context, dl *models.Download, book *models.Book, author *models.Author, downloadPath string, bookFiles, explicitFiles []string, format, folder, layout, linkMode string) bool {
-	siblingFormat := models.MediaTypeAudiobook
-	if format == models.MediaTypeAudiobook {
-		siblingFormat = models.MediaTypeEbook
-	}
+	siblingFormat := siblingFormatOf(format)
 
 	heldSibling := s.findHeldSibling(ctx, book.ID, dl.ID, siblingFormat)
 	if !siblingFormatOnDisk(book, siblingFormat) && heldSibling == nil {
@@ -96,13 +93,27 @@ func (s *Scanner) dropPairGated(ctx context.Context, dl *models.Download, book *
 		return true
 	}
 
-	// Release the held sibling alongside it so the pair lands together.
+	// Release the held sibling alongside it so the pair lands together, into
+	// the sibling's own drop folder: audiobooks can have one of their own
+	// (#1632), and then the pair lands in two folders at once.
 	if heldSibling != nil {
-		s.releaseHeldSibling(ctx, heldSibling, book, author, siblingFormat, folder, layout, linkMode)
+		siblingFolder := s.dropFolderFor(ctx, siblingFormat)
+		if siblingFolder == "" {
+			siblingFolder = folder
+		}
+		s.releaseHeldSibling(ctx, heldSibling, book, author, siblingFormat, siblingFolder, layout, linkMode)
 	}
 
 	s.finishDrop(ctx, dl, layout, linkMode, format, dest)
 	return true
+}
+
+// siblingFormatOf returns the other format of a media_type=both pair.
+func siblingFormatOf(format string) string {
+	if format == models.MediaTypeAudiobook {
+		return models.MediaTypeEbook
+	}
+	return models.MediaTypeAudiobook
 }
 
 // parkHeldFormat holds a completed format under pair gating: it records the
@@ -143,7 +154,7 @@ func (s *Scanner) findHeldSibling(ctx context.Context, bookID, excludeID int64, 
 		if h.ID == excludeID || h.BookID == nil || *h.BookID != bookID {
 			continue
 		}
-		files := discoverBookFiles(h.ImportPath, nil)
+		files := discoverHeldBookFiles(h.ImportPath)
 		if len(files) == 0 {
 			continue
 		}
@@ -158,7 +169,7 @@ func (s *Scanner) findHeldSibling(ctx context.Context, bookID, excludeID int64, 
 // finishes it, re-discovering its files from the recorded path. Used when the
 // second format of a pair completes.
 func (s *Scanner) releaseHeldSibling(ctx context.Context, held *models.Download, book *models.Book, author *models.Author, format, folder, layout, linkMode string) {
-	files := discoverBookFiles(held.ImportPath, nil)
+	files := discoverHeldBookFiles(held.ImportPath)
 	if len(files) == 0 {
 		s.failImport(ctx, held, models.StateImportFailed,
 			"pair gating release: held download files are no longer present — retry the import")
@@ -195,12 +206,6 @@ func (s *Scanner) sweepHeldPairGating(ctx context.Context) {
 	if len(held) == 0 {
 		return
 	}
-	folder, layout, linkMode := s.dropSettings(ctx)
-	if folder == "" {
-		// No drop folder configured any more — nowhere to release to. Leave the
-		// held rows as-is; a manual retry can recover them.
-		return
-	}
 	timeout := s.dropPairGatingTimeout(ctx)
 	now := time.Now()
 	for i := range held {
@@ -218,8 +223,16 @@ func (s *Scanner) sweepHeldPairGating(ctx context.Context) {
 			slog.Warn("drop: pair gating timeout — held download has no matching book, skipping", "title", h.Title)
 			continue
 		}
-		files := discoverBookFiles(h.ImportPath, nil)
+		files := discoverHeldBookFiles(h.ImportPath)
 		format := detectDownloadFormat(files)
+		// The drop folder is per format (#1632). When this format no longer
+		// drops at all (no drop folder any more, or its import mode is no
+		// longer external) there is nowhere to release it to. Leave the held
+		// row as-is; a manual retry imports it under the current settings.
+		if !s.formatDrops(ctx, format) {
+			continue
+		}
+		folder, layout, linkMode := s.dropSettings(ctx, format)
 		slog.Warn("drop: pair gating timeout — releasing held format alone; its sibling never arrived",
 			"title", h.Title, "format", format, "held_for", age.Truncate(time.Minute).String(), "timeout", timeout.String())
 		if len(files) == 0 {
@@ -234,4 +247,18 @@ func (s *Scanner) sweepHeldPairGating(ctx context.Context) {
 		}
 		s.finishDrop(ctx, h, layout, linkMode, format, dest)
 	}
+}
+
+// discoverHeldBookFiles re-reads the files of a download parked by pair gating.
+// The hold was decided with the import's own context, which a later release or
+// sweep no longer has. An automatic import blocks a download holding only files
+// too small to be a book before it can be held, so a held path whose ebook
+// files are all that small was a manual import (#3224): they are kept. Beside a
+// real book, small files are still left out as notes.
+func discoverHeldBookFiles(path string) []string {
+	files, tooSmall := discoverBookFilesSized(path, nil, true)
+	if len(files) == 0 && len(tooSmall) > 0 {
+		files, _ = discoverBookFilesSized(path, nil, false)
+	}
+	return files
 }

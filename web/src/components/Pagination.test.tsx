@@ -4,7 +4,7 @@ import Pagination from './Pagination'
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
-    t: (key: string) => ({
+    t: (key: string, o?: Record<string, unknown>) => key === 'pagination.range' ? `${o?.start}–${o?.end} of ${o?.total}` : ({
       'pagination.previous': 'Previous',
       'pagination.next': 'Next',
       'pagination.jumpToPage': 'Jump to page',
@@ -92,6 +92,15 @@ describe('Pagination', () => {
     expect(gaps[0].querySelector('option')?.textContent).toBe('…')
   })
 
+  // The gap reads as a plain "…": no dropdown arrow drawn over it, and so no
+  // room reserved for one by index.css (#3148).
+  it('draws the jump dropdown without an arrow', () => {
+    render(<Pagination {...defaults} page={5} totalPages={10} />)
+    for (const gap of screen.getAllByRole('combobox', { name: 'Jump to page' })) {
+      expect(gap).toHaveClass('bg-none')
+    }
+  })
+
   // #2010: the gap used to be a dead "…", so reaching page 3 of 40 meant
   // stepping through Next one page at a time. Each gap now lists exactly the
   // pages it hides — the left one covers 2..(page-2), the right one
@@ -158,5 +167,26 @@ describe('Pagination', () => {
     const wrapper = container.firstChild as HTMLElement
     expect(wrapper.className).toContain('flex-col')
     expect(wrapper.className).toContain('sm:flex-row')
+  })
+})
+
+// The page buttons were 24px tall and about 28px wide on a phone, set 4px
+// apart. On touch each is at least 44px wide with a 44px hit area, and
+// wrapped rows sit far enough apart that the hit areas do not overlap.
+describe('Pagination on touch screens', () => {
+  it('gives every page control a 44px target', () => {
+    render(<Pagination {...defaults} page={6} totalPages={12} totalItems={300} />)
+    const controls = [
+      ...screen.getAllByRole('button'),
+      ...screen.getAllByRole('combobox', { name: 'Jump to page' }),
+    ]
+    expect(controls.length).toBeGreaterThan(6)
+    for (const el of controls) {
+      expect(el.className.split(/\s+/)).toEqual(expect.arrayContaining(['touch-target', 'pointer-coarse:min-w-11']))
+    }
+    for (const el of screen.getAllByRole('combobox')) {
+      expect(el.className.split(/\s+/)).toContain('pointer-coarse:min-h-11')
+    }
+    expect(screen.getByRole('button', { name: '1' }).parentElement?.className).toContain('pointer-coarse:gap-y-5')
   })
 })

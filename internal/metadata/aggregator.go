@@ -14,51 +14,46 @@ import (
 	"unicode"
 
 	"github.com/vavallee/bindery/internal/isbnutil"
-	"github.com/vavallee/bindery/internal/metadata/audible"
 	"github.com/vavallee/bindery/internal/metadata/audnex"
 	"github.com/vavallee/bindery/internal/models"
 	"github.com/vavallee/bindery/internal/textutil"
 )
 
-// Aggregator fans out requests to multiple providers and merges results.
-// OpenLibrary is always the primary source. Other providers enrich the data.
-type Aggregator struct {
+// aggregatorCore is one immutable configuration of the aggregator: the
+// primary provider, the enrichers in order, and the shared caches and
+// audiobook clients. Every lookup runs start to finish on a single core.
+//
+// Nothing writes a core's fields after it has been published through
+// Aggregator.cur. A reconfiguration builds a new core and swaps the pointer,
+// so a lookup that began on the old primary finishes on the old primary, and
+// a nested call (ResolveCanonicalAuthor calling GetAuthor, GetBookByISBN
+// asking the primary for a canonical record) stays on the core it started on,
+// because it is a method call on that same core and a core has no way to
+// reach the Aggregator that published it. The caches and the in-flight
+// request table are pointers shared by every core of one Aggregator; their
+// keys carry the provider set (see bindCacheProviders), so a core never
+// reads an entry that a different provider set wrote.
+type aggregatorCore struct {
 	primary   Provider
 	enrichers []Provider
-	audnex    AudnexBookClient
-	audible   audibleCatalogue
-	cache     *ttlCache
+	// authorEnrichers fill an author's empty photo and bio after GetAuthor
+	// (#3287). Empty unless one is switched on.
+	authorEnrichers []AuthorEnricher
+	audnex          AudnexBookClient
+	audible         audibleCatalogue
+	// audibleOff and audnexOff are the operator's switches for the two
+	// audiobook sources that are not enrichers (#1890, #2015). While set, the
+	// source is not contacted and nothing cached from it is served.
+	audibleOff bool
+	audnexOff  bool
+	cache      *ttlCache
+	requests   *requestCache
 }
 
 // AudnexBookClient is the narrow audnex capability the aggregator needs for
 // ASIN-based audiobook metadata lookup.
 type AudnexBookClient interface {
 	GetBook(ctx context.Context, asin string) (*audnex.Book, error)
-}
-
-// NewAggregator creates an aggregator with OpenLibrary as primary and optional enrichers.
-func NewAggregator(primary Provider, enrichers ...Provider) *Aggregator {
-	return &Aggregator{
-		primary:   primary,
-		enrichers: enrichers,
-		audnex:    audnex.New(""),
-		audible:   audible.New(),
-		cache:     newTTLCache(24 * time.Hour),
-	}
-}
-
-// WithAudnexClient replaces the default audnex client. Tests use this to keep
-// ASIN canonicalization deterministic without reaching the network.
-func (a *Aggregator) WithAudnexClient(client AudnexBookClient) *Aggregator {
-	a.audnex = client
-	return a
-}
-
-// WithAudibleCatalogue replaces the Audible client GetAuthorAudiobooks asks.
-// Tests outside this package use it to stand in for api.audible.com.
-func (a *Aggregator) WithAudibleCatalogue(catalogue audibleCatalogue) *Aggregator {
-	a.audible = catalogue
-	return a
 }
 
 // SearchAuthors queries the primary provider and every enricher in parallel,
@@ -68,7 +63,7 @@ func (a *Aggregator) WithAudibleCatalogue(catalogue audibleCatalogue) *Aggregato
 // surfaces authors the primary lacks and de-fragments OpenLibrary's habit of
 // returning several partial records for one author. Providers that error or
 // time out are skipped; an error is returned only when every provider fails.
-func (a *Aggregator) SearchAuthors(ctx context.Context, query string) ([]models.Author, error) {
+func (a *aggregatorCore) SearchAuthors(ctx context.Context, query string) ([]models.Author, error) {
 	authors, _, err := a.SearchAuthorsWithOutcome(ctx, query)
 	return authors, err
 }
@@ -79,14 +74,14 @@ func (a *Aggregator) SearchAuthors(ctx context.Context, query string) ([]models.
 // match, the CSV and Readarr importers) must use this one and consult
 // SearchOutcome.SafeToBind before writing a foreign ID, because the link they
 // write decides which provider that author syncs from forever (#2271, #2332).
-func (a *Aggregator) SearchAuthorsWithOutcome(ctx context.Context, query string) ([]models.Author, SearchOutcome, error) {
+func (a *aggregatorCore) SearchAuthorsWithOutcome(ctx context.Context, query string) ([]models.Author, SearchOutcome, error) {
 	primary := a.PrimaryProviderName()
 	providers := a.providers()
 	if len(providers) == 0 {
 		return nil, SearchOutcome{Primary: primary}, nil
 	}
 	results, failed, answered, firstErr := searchFanOutWithFailures(ctx, providers, func(c context.Context, p Provider) ([]models.Author, error) {
-		return p.SearchAuthors(c, query)
+		return a.searchProviderAuthors(c, p, query)
 	})
 	outcome := newSearchOutcome(primary, failed, answered, firstErr)
 	if len(answered) == 0 && firstErr != nil {
@@ -118,7 +113,7 @@ func (a *Aggregator) SearchAuthorsWithOutcome(ctx context.Context, query string)
 // deduped author search, so the OL record can't be collapsed away by another
 // provider. Returns nil when no confident OL record (BookCount > 0) exists. Used
 // to resolve the author of a name-only result (e.g. Google Books) when adding it.
-func (a *Aggregator) ResolveCanonicalAuthor(ctx context.Context, name string) (*models.Author, error) {
+func (a *aggregatorCore) ResolveCanonicalAuthor(ctx context.Context, name string) (*models.Author, error) {
 	var ol Provider
 	for _, p := range a.providers() {
 		if p != nil && normalizedProviderName(p.Name()) == "openlibrary" {
@@ -129,7 +124,7 @@ func (a *Aggregator) ResolveCanonicalAuthor(ctx context.Context, name string) (*
 	if ol == nil {
 		return nil, nil
 	}
-	results, err := ol.SearchAuthors(ctx, name)
+	results, err := a.searchProviderAuthors(ctx, ol, name)
 	if err != nil {
 		return nil, err
 	}
@@ -290,12 +285,22 @@ func authorBookCount(a models.Author) int {
 // occurrence. primaryProvider is the normalized name of the configured primary
 // metadata provider; pass "" to disable the preference. Records with an empty
 // name pass through untouched. Output order follows the kept records' positions.
+//
+// A kept record that reports no work count takes the largest one its collapsed
+// duplicates reported. Identity and count are separate questions: the primary
+// provider's record must win the first, but Hardcover, DNB and Google Books
+// rarely answer the second, and dropping OpenLibrary's count with its record
+// left the add dialog with nothing to show beside the author.
 func dedupeAuthorsByName(authors []models.Author, primaryProvider string) []models.Author {
 	best := make(map[string]int)
+	maxCount := make(map[string]int)
 	for i := range authors {
 		key := canonicalAuthorKey(authors[i].Name)
 		if key == "" {
 			continue
+		}
+		if n := authorBookCount(authors[i]); n > maxCount[key] {
+			maxCount[key] = n
 		}
 		if j, ok := best[key]; !ok || betterAuthorRecord(authors[i], authors[j], primaryProvider) {
 			best[key] = i
@@ -305,7 +310,18 @@ func dedupeAuthorsByName(authors []models.Author, primaryProvider string) []mode
 	for i := range authors {
 		key := canonicalAuthorKey(authors[i].Name)
 		if key == "" || best[key] == i {
-			out = append(out, authors[i])
+			kept := authors[i]
+			if n := maxCount[key]; n > 0 && authorBookCount(kept) == 0 {
+				// A fresh struct, so the provider's own record is not written
+				// through a shared pointer.
+				stats := models.AuthorStats{}
+				if kept.Statistics != nil {
+					stats = *kept.Statistics
+				}
+				stats.BookCount = n
+				kept.Statistics = &stats
+			}
+			out = append(out, kept)
 		}
 	}
 	return out
@@ -482,7 +498,7 @@ const searchProviderTimeout = 8 * time.Second
 // Hardcover. Providers that error or time out are skipped rather than failing
 // the search; an error is returned only when every provider fails. Duplicates
 // are collapsed across providers by ISBN, then by normalized title+author.
-func (a *Aggregator) SearchBooks(ctx context.Context, query string) ([]models.Book, error) {
+func (a *aggregatorCore) SearchBooks(ctx context.Context, query string) ([]models.Book, error) {
 	books, _, err := a.SearchBooksWithOutcome(ctx, query)
 	return books, err
 }
@@ -493,14 +509,14 @@ func (a *Aggregator) SearchBooks(ctx context.Context, query string) ([]models.Bo
 // reason SearchAuthorsWithOutcome gives: with the primary timed out, a
 // fallback's record comes back looking exactly like a genuine primary miss
 // (#2332).
-func (a *Aggregator) SearchBooksWithOutcome(ctx context.Context, query string) ([]models.Book, SearchOutcome, error) {
+func (a *aggregatorCore) SearchBooksWithOutcome(ctx context.Context, query string) ([]models.Book, SearchOutcome, error) {
 	primary := a.PrimaryProviderName()
 	providers := a.providers() // primary first, then enrichers
 	if len(providers) == 0 {
 		return []models.Book{}, SearchOutcome{Primary: primary}, nil
 	}
 	results, failed, answered, firstErr := searchFanOutWithFailures(ctx, providers, func(c context.Context, p Provider) ([]models.Book, error) {
-		return p.SearchBooks(c, query)
+		return a.searchProviderBooks(c, p, query)
 	})
 	outcome := newSearchOutcome(primary, failed, answered, firstErr)
 	// Only surface an error when no provider succeeded; otherwise return what we
@@ -767,99 +783,76 @@ func searchFormatKey(mediaType string) string {
 // GetAuthor returns an author profile from the provider that owns foreignID,
 // cached for 24 hours. A WithCacheBypass context skips the cached copy and
 // replaces it with the provider's answer (#2601).
-func (a *Aggregator) GetAuthor(ctx context.Context, foreignID string) (*models.Author, error) {
-	key := "author:" + foreignID
-	// Read, not consumed: the provider call below is the only lookup this
-	// makes, and leaving the flag on ctx lets tests and logs see it there.
-	fresh := CacheBypassed(ctx)
-	if !fresh {
-		if cached, ok := a.cache.get(key); ok {
-			return cached.(*models.Author), nil
-		}
-	}
-
+func (a *aggregatorCore) GetAuthor(ctx context.Context, foreignID string) (*models.Author, error) {
 	provider := a.providerForForeignID(foreignID)
 	if provider == nil {
 		return nil, nil
 	}
-	author, err := provider.GetAuthor(ctx, foreignID)
+	provider, scope := resolveCacheProvider(ctx, provider)
+	key := "author:" + scope + ":" + foreignID
+	// Read, not consumed: the provider call below is the only lookup this
+	// makes, and leaving the flag on ctx lets tests and logs see it there.
+	if CacheBypassed(ctx) {
+		author, err := provider.GetAuthor(ctx, foreignID)
+		if err != nil {
+			return nil, err
+		}
+		a.cache.set(key, cloneAuthor(author))
+		return author, nil
+	}
+	author, err := cachedRequest(ctx, a, a.cache, "author", key, func(ctx context.Context) (*models.Author, error) {
+		return provider.GetAuthor(ctx, foreignID)
+	}, cloneAuthor)
 	if err != nil {
 		return nil, err
 	}
-	a.cache.set(key, author)
 	return author, nil
 }
 
-func (a *Aggregator) GetBook(ctx context.Context, foreignID string) (*models.Book, error) {
-	key := "book:" + foreignID
-	if cached, ok := a.cache.get(key); ok {
-		return cached.(*models.Book), nil
-	}
-
+func (a *aggregatorCore) GetBook(ctx context.Context, foreignID string) (*models.Book, error) {
+	ctx, _ = a.bindCacheProviders(ctx)
 	provider := a.providerForForeignID(foreignID)
 	if provider == nil {
 		return nil, nil
 	}
-	book, err := provider.GetBook(ctx, foreignID)
-	if err != nil {
-		return nil, err
+	provider, scope := resolveCacheProvider(ctx, provider)
+	// Cache the provider response before enrichment, so a live enricher's
+	// configuration is checked on every call, including primary cache hits.
+	book, err := cachedRequest(ctx, a, a.cache, "book", "book:"+scope+":"+foreignID, func(ctx context.Context) (*models.Book, error) {
+		return provider.GetBook(ctx, foreignID)
+	}, cloneBook)
+	if err != nil || book == nil {
+		return book, err
 	}
-	if book == nil {
-		a.cache.set(key, book)
-		return nil, nil
-	}
-
-	// Enrich from secondary providers if description is sparse or cover is missing.
 	if len(book.Description) < 50 || book.ImageURL == "" {
 		a.enrichBook(ctx, book)
 	}
-
-	a.cache.set(key, book)
 	return book, nil
 }
 
-func (a *Aggregator) GetEditions(ctx context.Context, bookForeignID string) ([]models.Edition, error) {
-	key := "editions:" + bookForeignID
-	if cached, ok := a.cache.get(key); ok {
-		return cached.([]models.Edition), nil
-	}
-
+func (a *aggregatorCore) GetEditions(ctx context.Context, bookForeignID string) ([]models.Edition, error) {
 	provider := a.providerForForeignID(bookForeignID)
 	if provider == nil {
 		return nil, nil
 	}
-	editions, err := provider.GetEditions(ctx, bookForeignID)
-	if err != nil {
-		return nil, err
-	}
-	a.cache.set(key, editions)
-	return editions, nil
+	return a.providerEditions(ctx, provider, bookForeignID)
 }
 
 // GetEditionsFromProvider fetches editions from a named provider, bypassing
 // prefix-based routing. This is used when callers know the provider from UI
 // state but the stored foreign ID is an unprefixed provider-native value.
-func (a *Aggregator) GetEditionsFromProvider(ctx context.Context, providerName, bookForeignID string) ([]models.Edition, error) {
+func (a *aggregatorCore) GetEditionsFromProvider(ctx context.Context, providerName, bookForeignID string) ([]models.Edition, error) {
 	providerName = strings.TrimSpace(strings.ToLower(providerName))
 	bookForeignID = strings.TrimSpace(bookForeignID)
 	if providerName == "" || bookForeignID == "" {
 		return nil, nil
-	}
-	key := "editions-provider:" + providerName + ":" + bookForeignID
-	if cached, ok := a.cache.get(key); ok {
-		return cached.([]models.Edition), nil
 	}
 
 	for _, provider := range a.providers() {
 		if provider == nil || normalizedProviderName(provider.Name()) != normalizedProviderName(providerName) {
 			continue
 		}
-		editions, err := provider.GetEditions(ctx, bookForeignID)
-		if err != nil {
-			return nil, err
-		}
-		a.cache.set(key, editions)
-		return editions, nil
+		return a.providerEditions(ctx, provider, bookForeignID)
 	}
 	return nil, ErrProviderNotConfigured
 }
@@ -867,7 +860,7 @@ func (a *Aggregator) GetEditionsFromProvider(ctx context.Context, providerName, 
 // GetBookByISBN is GetBookByISBNWithOutcome for callers that only display or
 // match the record. A caller that shows the record for the user to add, or
 // writes its ids, needs the outcome instead.
-func (a *Aggregator) GetBookByISBN(ctx context.Context, isbn string) (*models.Book, error) {
+func (a *aggregatorCore) GetBookByISBN(ctx context.Context, isbn string) (*models.Book, error) {
 	book, _, err := a.GetBookByISBNWithOutcome(ctx, isbn)
 	return book, err
 }
@@ -882,12 +875,17 @@ func (a *Aggregator) GetBookByISBN(ctx context.Context, isbn string) (*models.Bo
 // Such a record is also not cached, so the next lookup asks the primary again
 // instead of serving the fallback's answer for the life of the cache entry. A
 // cache hit therefore never carries a primary failure.
-func (a *Aggregator) GetBookByISBNWithOutcome(ctx context.Context, isbn string) (*models.Book, SearchOutcome, error) {
+//
+// The cache key carries the bound provider scope, so an answer built under one
+// configuration (a Hardcover token, a primary switch) is not served after it
+// changes, and every caller gets its own copy of the cached book (#2869).
+func (a *aggregatorCore) GetBookByISBNWithOutcome(ctx context.Context, isbn string) (*models.Book, SearchOutcome, error) {
 	isbn = isbnutil.Normalize(isbn)
-	key := "isbn:" + isbn
+	ctx, scope := a.bindCacheProviders(ctx)
+	key := "isbn:" + scope + ":" + isbn
 	primaryName := a.PrimaryProviderName()
-	if cached, ok := a.cache.get(key); ok {
-		return cached.(*models.Book), SearchOutcome{Primary: primaryName}, nil
+	if cached, ok := a.cachedBook(key); ok {
+		return cached, SearchOutcome{Primary: primaryName}, nil
 	}
 
 	var (
@@ -915,8 +913,14 @@ func (a *Aggregator) GetBookByISBNWithOutcome(ctx context.Context, isbn string) 
 		if provider == nil {
 			continue
 		}
-		book, err := provider.GetBookByISBN(ctx, isbn)
+		bound, _ := resolveCacheProvider(ctx, provider)
+		book, err := bound.GetBookByISBN(ctx, isbn)
 		if err != nil {
+			// A held primary stops the lookup; a held enricher is just a failed
+			// provider, so the primary's answer and later fallbacks still count.
+			if idx == 0 && IsProviderHold(err) {
+				return nil, newSearchOutcome(primaryName, []string{normalizedProviderName(providerName(provider))}, answered, err), err
+			}
 			if errors.Is(err, ErrProviderNotConfigured) {
 				skippedUnconfigured = true
 				slog.Debug("isbn provider not configured", "provider", provider.Name())
@@ -971,16 +975,24 @@ func (a *Aggregator) GetBookByISBNWithOutcome(ctx context.Context, isbn string) 
 	return nil, outcome, nil
 }
 
-// cacheISBNBook fills in a thin ISBN record and, when store is true, caches it
-// under key.
-func (a *Aggregator) cacheISBNBook(ctx context.Context, key string, book *models.Book, store bool) *models.Book {
+// cacheISBNBook fills in a thin ISBN record and, when store is true, caches a
+// copy of it under key. A record filled in while a provider or enricher was
+// failing is incomplete, so it goes in the five minute cache rather than the
+// 24 hour one and the failing lookup is retried once per window (#2869).
+func (a *aggregatorCore) cacheISBNBook(ctx context.Context, key string, book *models.Book, store bool) *models.Book {
+	complete := true
 	if book != nil && len(book.Description) < 50 {
 		// Try fetching the full record from the provider before falling back to
 		// enrichers. ISBN search results are often lightweight (title + ForeignID
 		// only); GetBook returns the canonical description, cover, etc.
 		if book.ForeignID != "" {
 			if provider := a.providerForForeignID(book.ForeignID); provider != nil {
-				if full, err := provider.GetBook(ctx, book.ForeignID); err == nil && full != nil {
+				provider, _ = resolveCacheProvider(ctx, provider)
+				full, err := provider.GetBook(ctx, book.ForeignID)
+				if err != nil && !errors.Is(err, ErrProviderNotConfigured) {
+					complete = false
+				}
+				if err == nil && full != nil {
 					if len(full.Description) > len(book.Description) {
 						book.Description = full.Description
 					}
@@ -1000,21 +1012,48 @@ func (a *Aggregator) cacheISBNBook(ctx context.Context, key string, book *models
 				}
 			}
 		}
-		if len(book.Description) < 50 {
-			a.enrichBook(ctx, book)
+		if len(book.Description) < 50 && !a.enrichBook(ctx, book) {
+			complete = false
 		}
 	}
 	if store {
-		a.cache.set(key, book)
+		a.storeBook(ctx, key, book, complete)
 	}
 	return book
+}
+
+// cachedBook returns a copy of the book cached under key, from the 24 hour
+// cache or the five minute one. A cached nil (a lookup that found nothing) is
+// a hit too.
+func (a *aggregatorCore) cachedBook(key string) (*models.Book, bool) {
+	if cached, ok := a.cache.get(key); ok {
+		return cloneBook(cached.(*models.Book)), true
+	}
+	if cached, ok := a.requests.shortCache().get(key); ok {
+		return cloneBook(cached.(*models.Book)), true
+	}
+	return nil, false
+}
+
+// storeBook caches a copy of book under key, so the caller keeps sole use of
+// the pointer it returns. An incomplete book is kept for five minutes only. A
+// cancelled request stores nothing, since what it built may be partial.
+func (a *aggregatorCore) storeBook(ctx context.Context, key string, book *models.Book, complete bool) {
+	if ctx.Err() != nil {
+		return
+	}
+	if complete {
+		a.cache.set(key, cloneBook(book))
+		return
+	}
+	a.requests.shortCache().set(key, cloneBook(book))
 }
 
 // GetBookFromProvider fetches a single book by foreign ID from the named
 // provider ("openlibrary" or "hardcover"). It bypasses the TTL cache so the
 // rebind flow always gets a fresh record. Returns ErrProviderNotConfigured
 // when no matching provider is found.
-func (a *Aggregator) GetBookFromProvider(ctx context.Context, providerName, foreignID string) (*models.Book, error) {
+func (a *aggregatorCore) GetBookFromProvider(ctx context.Context, providerName, foreignID string) (*models.Book, error) {
 	providerName = strings.TrimSpace(strings.ToLower(providerName))
 	if a.primary.Name() == providerName {
 		return a.primary.GetBook(ctx, foreignID)
@@ -1046,7 +1085,7 @@ func (a *Aggregator) GetBookFromProvider(ctx context.Context, providerName, fore
 //
 // Only providers consulted up to the hit are reported, as failed or answered:
 // the walk stops there, so a later provider did neither.
-func (a *Aggregator) ResolveBookByISBNWithOutcome(ctx context.Context, isbn string) (*models.Book, SearchOutcome, error) {
+func (a *aggregatorCore) ResolveBookByISBNWithOutcome(ctx context.Context, isbn string) (*models.Book, SearchOutcome, error) {
 	var (
 		failed, answered []string
 		firstErr         error

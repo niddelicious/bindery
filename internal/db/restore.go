@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -46,15 +48,26 @@ var sqliteHeaderMagic = []byte("SQLite format 3\x00")
 // PendingRestorePath returns the staging path for dbPath.
 func PendingRestorePath(dbPath string) string { return dbPath + RestorePendingSuffix }
 
-// sqliteFileURI builds a `file:` DSN for path. The `file:` prefix is required:
-// modernc.org/sqlite only forwards DSN query parameters to sqlite3_open_v2
-// when the DSN is a URI, and truncates the DSN at the first "?" otherwise, so
-// a plain "<path>?mode=ro" silently opens read-write and creates the file if
-// it is missing. "?", "#" and "%" are percent-encoded because SQLite's own URI
-// parser gives them syntactic meaning inside the path.
-func sqliteFileURI(path, query string) string {
-	r := strings.NewReplacer("%", "%25", "?", "%3f", "#", "%23")
-	return "file:" + r.Replace(path) + "?" + query
+// SQLiteFileURI builds a `file:` DSN for path with the given query string
+// ("mode=ro&immutable=1"). The `file:` prefix is required: modernc.org/sqlite
+// only forwards DSN query parameters to sqlite3_open_v2 when the DSN is a URI,
+// and truncates the DSN at the first "?" otherwise, so a plain
+// "<path>?mode=ro" silently opens read-write and creates the file if it is
+// missing.
+//
+// The path goes through net/url so every character with syntactic meaning to
+// SQLite's URI parser ("?", "#", "%", and spaces) is percent-encoded and the
+// path is read back literally. Concatenating it let a directory named
+// "lib ?mode=rwc#x" cut the path at the "?" and supply its own parameters,
+// opening (and creating) a different file read-write. A Windows drive path
+// (C:\lib) becomes "/C:/lib", which is how SQLite spells it in a URI.
+func SQLiteFileURI(path, query string) string {
+	p := filepath.ToSlash(path)
+	if len(p) >= 2 && p[1] == ':' && (p[0]|0x20 >= 'a' && p[0]|0x20 <= 'z') {
+		p = "/" + p
+	}
+	u := url.URL{Scheme: "file", Path: p, RawQuery: query, OmitHost: true}
+	return u.String()
 }
 
 // CheckSQLiteFile reports whether path is a readable, structurally sound
@@ -83,7 +96,7 @@ func CheckSQLiteFile(ctx context.Context, path string) error {
 		return fmt.Errorf("%q is not a SQLite database file", path)
 	}
 
-	database, err := sql.Open("sqlite", sqliteFileURI(path, "mode=ro&_pragma=busy_timeout(5000)"))
+	database, err := sql.Open("sqlite", SQLiteFileURI(path, "mode=ro&_pragma=busy_timeout(5000)"))
 	if err != nil {
 		return fmt.Errorf("open %q read-only: %w", path, err)
 	}

@@ -2,6 +2,7 @@ package abs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -9,8 +10,10 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/vavallee/bindery/internal/db"
 	"github.com/vavallee/bindery/internal/models"
 	"github.com/vavallee/bindery/internal/pathmap"
+	"github.com/vavallee/bindery/internal/textutil"
 )
 
 type ownershipReconcileResult struct {
@@ -119,7 +122,14 @@ func (i *Importer) reconcileFormatPath(ctx context.Context, cfg ImportConfig, au
 		}
 		return false, false, fmt.Sprintf("%s path %q is outside Bindery storage%s; imported metadata only", format, cleanPath, unmappedPathHint(cfg)), false
 	}
-	info, err := os.Stat(cleanPath)
+	// Lstat, not Stat: a symlink is never registered as a book file, the same
+	// rule adoption and the library scan apply. A registered path is served
+	// by the download routes, and a link there could name any file on the
+	// host. Devices, fifos and sockets are refused for the same reason.
+	info, err := os.Lstat(cleanPath)
+	if err == nil && !info.Mode().IsRegular() && !info.IsDir() {
+		return false, false, fmt.Sprintf("%s path %q is a symlink or special file, not a regular file; imported metadata only", format, cleanPath), false
+	}
 	if err != nil {
 		if remappedPath != strings.TrimSpace(candidatePath) {
 			return false, false, fmt.Sprintf("%s path %q remapped to %q is not visible to Bindery; imported metadata only", format, strings.TrimSpace(candidatePath), cleanPath), true
@@ -140,6 +150,12 @@ func (i *Importer) reconcileFormatPath(ctx context.Context, cfg ImportConfig, au
 	}
 	if err := i.books.SetFormatFilePath(ctx, book.ID, format, cleanPath); err != nil {
 		slog.Warn("abs import: file reconciliation failed", "bookID", book.ID, "format", format, "path", cleanPath, "error", err)
+		// Another book already tracks the file (#2937). This used to be
+		// reported as reconciled while recording nothing.
+		var owned *db.PathOwnedError
+		if errors.As(err, &owned) {
+			return false, false, fmt.Sprintf("%s path %q is already tracked on %q (book %d); imported metadata only", format, cleanPath, owned.OwnerTitle, owned.OwnerBookID), false
+		}
 		return false, false, fmt.Sprintf("%s path %q could not be registered in Bindery; imported metadata only", format, cleanPath), false
 	}
 	i.pruneVanishedFormatPaths(ctx, book.ID, format, cleanPath)
@@ -216,7 +232,11 @@ func (i *Importer) inspectFormatPath(ctx context.Context, cfg ImportConfig, form
 		}
 		return false, fmt.Sprintf("%s path %q is outside Bindery storage%s", format, cleanPath, unmappedPathHint(cfg))
 	}
-	info, err := os.Stat(cleanPath)
+	// Lstat, matching reconcileFormatPath: a symlink is never a book file.
+	info, err := os.Lstat(cleanPath)
+	if err == nil && !info.Mode().IsRegular() && !info.IsDir() {
+		return false, fmt.Sprintf("%s path %q is a symlink or special file, not a regular file", format, cleanPath)
+	}
 	if err != nil {
 		if remappedPath != strings.TrimSpace(candidatePath) {
 			return false, fmt.Sprintf("%s path %q remapped to %q is not visible to Bindery", format, strings.TrimSpace(candidatePath), cleanPath)
@@ -227,6 +247,65 @@ func (i *Importer) inspectFormatPath(ctx context.Context, cfg ImportConfig, form
 		return false, fmt.Sprintf("%s path %q is a directory", format, cleanPath)
 	}
 	return true, ""
+}
+
+// findBookByItemFiles returns the existing book that already tracks one of the
+// item's files, with that book's author, or nil. The paths are the ones
+// reconcileFormatPath would record for the item: the ebook file and the
+// audiobook folder, after the path remap.
+//
+// A shared file is not proof on its own, so two guards apply.
+//
+//   - Owner. A book is offered only when it belongs to the importing owner, or
+//     to nobody. An import with no owner (the usual case: ABS authors are
+//     created without one) therefore only reaches books with no owner, and an
+//     import can never reach across tenants through a file (#1457).
+//   - Author. The book's author must be the item's author: the same row, or a
+//     name that MatchAuthorName auto matches. "Chapterhouse: Dune" by Brian
+//     Herbert is not claimed by an item that credits Frank Herbert, whatever
+//     file both point at. The caller keeps the book's own author and title.
+func (i *Importer) findBookByItemFiles(ctx context.Context, cfg ImportConfig, author *models.Author, item NormalizedLibraryItem) (*models.Book, *models.Author, error) {
+	if i.books == nil || i.authors == nil || author == nil {
+		return nil, nil, nil
+	}
+	candidates := []string{item.EbookPath}
+	if len(item.AudioFiles) > 0 {
+		candidates = append(candidates, item.Path)
+	}
+	for _, candidate := range candidates {
+		if strings.TrimSpace(candidate) == "" {
+			continue
+		}
+		cleanPath := filepath.Clean(i.remapABSPath(cfg, candidate))
+		if cleanPath == "." || cleanPath == "" {
+			continue
+		}
+		book, err := i.books.GetByTrackedPath(ctx, cleanPath)
+		if err != nil {
+			return nil, nil, err
+		}
+		if book == nil {
+			continue
+		}
+		if book.OwnerUserID != 0 && book.OwnerUserID != author.OwnerUserID {
+			continue
+		}
+		if book.AuthorID == author.ID {
+			return book, author, nil
+		}
+		bookAuthor, err := i.authors.GetByID(ctx, book.AuthorID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if bookAuthor == nil {
+			continue
+		}
+		switch textutil.MatchAuthorName(author.Name, bookAuthor.Name).Kind {
+		case textutil.AuthorMatchExact, textutil.AuthorMatchFuzzyAuto:
+			return book, bookAuthor, nil
+		}
+	}
+	return nil, nil, nil
 }
 
 func (i *Importer) remapABSPath(cfg ImportConfig, candidatePath string) string {
@@ -287,17 +366,25 @@ func (i *Importer) allowedRootsForBook(ctx context.Context, author *models.Autho
 	return dedupeCleanPaths(roots)
 }
 
+// settingDefaultAudiobookRootID is the audiobook twin of settingDefaultRootID
+// (#2166), kept beside its only reader.
+const settingDefaultAudiobookRootID = "library.defaultAudiobookRootFolderId"
+
 // effectiveAudiobookDir returns the audiobook root for the given author:
-// the per-author AudiobookRootFolderID when set (#579), else the global
-// audiobookDir. It deliberately does not consult the ebook RootFolderID so an
-// ebook root folder never widens audiobook acceptance into the ebook tree
-// (#421). author may be nil (e.g. inspectFormatPath has no author context),
-// in which case only the global dir applies.
+// the per-author AudiobookRootFolderID when set (#579), else the
+// library.defaultAudiobookRootFolderId setting (#2166), else the global
+// audiobookDir. It deliberately does not consult the ebook RootFolderID or the
+// ebook default so an ebook root folder never widens audiobook acceptance into
+// the ebook tree (#421). author may be nil (e.g. inspectFormatPath has no
+// author context), in which case only the defaults apply.
 func (i *Importer) effectiveAudiobookDir(ctx context.Context, author *models.Author) string {
 	if author != nil && author.AudiobookRootFolderID != nil && i.rootFolders != nil {
 		if root, err := i.rootFolders.GetByID(ctx, *author.AudiobookRootFolderID); err == nil && root != nil {
 			return root.Path
 		}
+	}
+	if path := i.defaultRootFolderPath(ctx, settingDefaultAudiobookRootID); path != "" {
+		return path
 	}
 	return i.audiobookDir
 }
@@ -308,16 +395,31 @@ func (i *Importer) effectiveLibraryDir(ctx context.Context, author *models.Autho
 			return root.Path
 		}
 	}
-	if i.settings != nil && i.rootFolders != nil {
-		if setting, err := i.settings.Get(ctx, settingDefaultRootID); err == nil && setting != nil && strings.TrimSpace(setting.Value) != "" {
-			if id, err := strconv.ParseInt(strings.TrimSpace(setting.Value), 10, 64); err == nil && id > 0 {
-				if root, err := i.rootFolders.GetByID(ctx, id); err == nil && root != nil {
-					return root.Path
-				}
-			}
-		}
+	if path := i.defaultRootFolderPath(ctx, settingDefaultRootID); path != "" {
+		return path
 	}
 	return i.libraryDir
+}
+
+// defaultRootFolderPath resolves a default root folder setting to its path,
+// or "" when it is unset, malformed, or names a deleted root folder.
+func (i *Importer) defaultRootFolderPath(ctx context.Context, key string) string {
+	if i.settings == nil || i.rootFolders == nil {
+		return ""
+	}
+	setting, err := i.settings.Get(ctx, key)
+	if err != nil || setting == nil || strings.TrimSpace(setting.Value) == "" {
+		return ""
+	}
+	id, err := strconv.ParseInt(strings.TrimSpace(setting.Value), 10, 64)
+	if err != nil || id <= 0 {
+		return ""
+	}
+	root, err := i.rootFolders.GetByID(ctx, id)
+	if err != nil || root == nil {
+		return ""
+	}
+	return root.Path
 }
 
 func pathUnderDir(path, dir string) bool {

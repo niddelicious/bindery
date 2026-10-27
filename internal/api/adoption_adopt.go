@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/vavallee/bindery/internal/db"
+	"github.com/vavallee/bindery/internal/importer"
 	"github.com/vavallee/bindery/internal/models"
 )
 
@@ -84,7 +86,8 @@ func (h *AdoptionHandler) Adopt(w http.ResponseWriter, r *http.Request) {
 	// The request context may be cancelled once work has started; releasing
 	// the claim and compensating must still happen.
 	work := context.WithoutCancel(ctx)
-	if err := h.adopt(work, id, token, req); err != nil {
+	message, err := h.adopt(work, id, token, req)
+	if err != nil {
 		var unfinished *unfinishedReversalError
 		if errors.As(err, &unfinished) {
 			// The claim and its record stay, so stale claim recovery can finish
@@ -100,42 +103,51 @@ func (h *AdoptionHandler) Adopt(w http.ResponseWriter, r *http.Request) {
 		h.writeAdoptionError(w, r, err)
 		return
 	}
-	h.writeUnit(w, r, id)
+	h.writeUnitWithMessage(w, r, id, message)
 }
 
-func (h *AdoptionHandler) adopt(ctx context.Context, id int64, token string, req adoptRequest) error {
+// alreadyHasFileMessage explains adopting into a book that already has a file
+// of the same format on disk. Suggestions offer such books (#2879), because an
+// untracked copy of a book already imported is common. The adopted files are
+// added alongside: book_files is additive, the file the book already shows
+// keeps showing, and nothing is deleted. Undo removes only what was added.
+const alreadyHasFileMessage = "This book already had a file of this format. The adopted files were added alongside it, and the book still shows its existing file."
+
+// adopt does the work of Adopt. The message it returns, when not empty,
+// explains an outcome that is not the obvious one.
+func (h *AdoptionHandler) adopt(ctx context.Context, id int64, token string, req adoptRequest) (string, error) {
 	unit, err := h.units.Get(ctx, id)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if unit == nil {
-		return refuse(http.StatusNotFound, "unmatched book not found")
+		return "", refuse(http.StatusNotFound, "unmatched book not found")
 	}
 	if req.Format != "" && req.Format != unit.Format {
-		return refuse(http.StatusBadRequest, "These files are "+unit.Format+" files, so they can only be adopted as "+unit.Format+".")
+		return "", refuse(http.StatusBadRequest, "These files are "+unit.Format+" files, so they can only be adopted as "+unit.Format+".")
 	}
 	format := unit.Format
 	paths, err := h.registrationPaths(ctx, unit)
 	if err != nil {
-		return err
+		return "", err
 	}
 	// Refuse before any side effect when a file already belongs to a book.
 	if err := h.checkOwnership(ctx, append(paths, unit.MemberPaths...), 0); err != nil {
-		return err
+		return "", err
 	}
 
 	var book *models.Book
 	var created addBookResult
 	if req.BookID > 0 {
 		if book, err = h.books.GetByID(ctx, req.BookID); err != nil {
-			return err
+			return "", err
 		}
 		if book == nil {
-			return refuse(http.StatusNotFound, "That book is no longer in your library.")
+			return "", refuse(http.StatusNotFound, "That book is no longer in your library.")
 		}
 	} else {
 		if h.adder == nil {
-			return refuse(http.StatusServiceUnavailable, "Adding books is not available.")
+			return "", refuse(http.StatusServiceUnavailable, "Adding books is not available.")
 		}
 		unmonitored := false
 		created, err = h.adder.addBookCore(ctx, addBookParams{
@@ -153,22 +165,40 @@ func (h *AdoptionHandler) adopt(ctx context.Context, id int64, token string, req
 			// Already in the library: adopt into that row, as if picked.
 			book = inLibrary.Book
 		case err != nil:
-			return err
+			return "", err
 		default:
 			book = created.Book
+		}
+	}
+
+	message := ""
+	if !created.BookCreated {
+		had, err := h.hasLiveFile(ctx, book.ID, format)
+		if err != nil {
+			return "", err
+		}
+		if had {
+			message = alreadyHasFileMessage
 		}
 	}
 
 	rec := db.AdoptionRecord{BookID: book.ID}
 	if created.BookCreated {
 		rec.CreatedBookID = book.ID
+	} else {
+		rec.PriorBookStatus = book.Status
+		if rec.PriorBookStatus != models.BookStatusSkipped {
+			if prior, err := h.units.PriorBookStatusForBook(ctx, book.ID, id); err == nil && prior == models.BookStatusSkipped {
+				rec.PriorBookStatus = prior
+			}
+		}
 	}
 	if created.AuthorCreated && created.Author != nil {
 		rec.CreatedAuthorID = created.Author.ID
 	}
 	// The created rows are on record before any file is registered.
 	if err := h.progress(ctx, id, token, rec); err != nil {
-		return h.failAdopt(ctx, id, rec, err)
+		return "", h.failAdopt(ctx, id, rec, err)
 	}
 
 	regErr := h.register(ctx, id, token, book.ID, format, paths, unit.MemberPaths, &rec)
@@ -191,18 +221,34 @@ func (h *AdoptionHandler) adopt(ctx context.Context, id int64, token string, req
 		}
 	}
 	if regErr != nil {
-		return h.failAdopt(ctx, id, rec, regErr)
+		return "", h.failAdopt(ctx, id, rec, regErr)
 	}
 	done, err := h.units.CompleteAdoption(ctx, id, token, rec)
 	if err != nil || !done {
 		if err == nil {
 			err = refuse(http.StatusConflict, "This book changed while it was being adopted. Try again.")
 		}
-		return h.failAdopt(ctx, id, rec, err)
+		return "", h.failAdopt(ctx, id, rec, err)
 	}
 	slog.Info("adoption: registered files in place", "unit", id, "book_id", book.ID,
-		"files", len(rec.Registered), "book_created", rec.CreatedBookID > 0, "author_created", rec.CreatedAuthorID > 0)
-	return nil
+		"files", len(rec.Registered), "book_created", rec.CreatedBookID > 0, "author_created", rec.CreatedAuthorID > 0,
+		"added_alongside_existing", message != "")
+	return message, nil
+}
+
+// hasLiveFile reports whether the book has a registered file of format that
+// still exists on disk.
+func (h *AdoptionHandler) hasLiveFile(ctx context.Context, bookID int64, format string) (bool, error) {
+	files, err := h.books.ListFiles(ctx, bookID)
+	if err != nil {
+		return false, err
+	}
+	for _, f := range files {
+		if f.Format == format && db.BookFilePathResolves(f.Path) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // failAdopt reverses a failed adopt's writes. If the reversal itself fails
@@ -253,6 +299,12 @@ func (h *AdoptionHandler) registrationPaths(ctx context.Context, unit *db.Unmatc
 		if _, ok := h.roots.ResolveContained(ctx, p); !ok {
 			return nil, refuse(http.StatusUnprocessableEntity, filepath.Base(p)+" is outside your library folders, so it cannot be adopted.")
 		}
+		// The list labels these and suggests nothing for them, but a row
+		// stored by an older scan, or a request made by hand, would still
+		// make a notes file a book's ebook (#2944).
+		if importer.TooSmallToBeABook(p, info.Size()) {
+			return nil, refuse(http.StatusBadRequest, fmt.Sprintf("%s is only %d bytes, too small to be a book, so it cannot be adopted.", filepath.Base(p), info.Size()))
+		}
 	}
 	if unit.UnitKind != db.UnmatchedKindFolder || unit.Format != models.MediaTypeAudiobook {
 		out := make([]string, len(unit.MemberPaths))
@@ -278,10 +330,11 @@ func (h *AdoptionHandler) registrationPaths(ctx context.Context, unit *db.Unmatc
 }
 
 // checkOwnership refuses when any path already belongs to a book other than
-// bookID (0 means any book at all).
+// bookID (0 means any book at all). A row left by a deleted book is not an
+// owner: registering the file takes that row over, as an import does (#2937).
 func (h *AdoptionHandler) checkOwnership(ctx context.Context, paths []string, bookID int64) error {
 	for _, p := range paths {
-		owned, err := h.books.PathOwnedByOtherBook(ctx, p, bookID)
+		owned, err := h.books.PathOwnedByLiveOtherBook(ctx, p, bookID)
 		if err != nil {
 			return err
 		}
@@ -302,6 +355,13 @@ func (h *AdoptionHandler) register(ctx context.Context, unitID int64, token stri
 	}
 	for _, p := range paths {
 		inserted, err := h.registerFile(ctx, bookID, format, p)
+		var owned *db.PathOwnedError
+		if errors.As(err, &owned) {
+			// Taken by another book between the check above and this write
+			// (#2937): the same refusal the check gives, and the caller
+			// reverses whatever this request already registered.
+			return refuse(http.StatusConflict, filepath.Base(p)+" already belongs to a book in your library.")
+		}
 		if err != nil {
 			return err
 		}

@@ -154,6 +154,52 @@ func TestSmoke(t *testing.T) {
 		}
 	})
 
+	// JSON 404 and 405 on the API trees, and the SPA fallback left alone.
+	t.Run("unknown API routes answer JSON errors", func(t *testing.T) {
+		for _, tc := range []struct {
+			method, path string
+			status       int
+			message      string
+			allow        string
+		}{
+			{http.MethodGet, "/api/v1/nope", http.StatusNotFound, "not found", ""},
+			{http.MethodGet, "/api/nope", http.StatusNotFound, "not found", ""},
+			{http.MethodPost, "/api/v1/health", http.StatusMethodNotAllowed, "method not allowed", "GET"},
+		} {
+			resp := do(t, mustReq(t, tc.method, base+tc.path, nil))
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			var got map[string]string
+			if resp.StatusCode != tc.status || json.Unmarshal(body, &got) != nil || got["error"] != tc.message ||
+				!strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json") {
+				t.Errorf("%s %s = %d %q (%s), want %d JSON error %q", tc.method, tc.path,
+					resp.StatusCode, body, resp.Header.Get("Content-Type"), tc.status, tc.message)
+			}
+			if resp.Header.Get("Allow") != tc.allow {
+				t.Errorf("%s %s Allow = %q, want %q", tc.method, tc.path, resp.Header.Get("Allow"), tc.allow)
+			}
+		}
+		// Unauthenticated probes still meet the auth layer first.
+		resp, err := http.Get(base + "/api/v1/nope")
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("unauthenticated unknown route = %d, want 401", resp.StatusCode)
+		}
+		// A client-side route still gets the SPA, not JSON.
+		resp, err = http.Get(base + "/books/12")
+		if err != nil {
+			t.Fatal(err)
+		}
+		page, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || !strings.Contains(strings.ToLower(string(page)), "<!doctype html") {
+			t.Errorf("/books/12 = %d %s, want the SPA", resp.StatusCode, truncate(page, 80))
+		}
+	})
+
 	// The requester allow list can only be proven against the real router,
 	// which main() builds inline: sign in as a requester and try routes on
 	// both API trees and OPDS.

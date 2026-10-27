@@ -1,10 +1,10 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { MemoryRouter } from 'react-router'
+import { MemoryRouter, useLocation, useNavigationType } from 'react-router'
 import QueuePage, { MatchBookControl } from './QueuePage'
 import { summarizeError, ERROR_SUMMARY_LEN } from './queueError'
 import { api } from '../api/client'
-import { acceptConfirm } from '../test-utils'
+import { acceptConfirm, clickBulkAction } from '../test-utils'
 import type { Download, PendingRelease, QueueItem, QueueListResponse } from '../api/client'
 
 vi.mock('../api/client', async importOriginal => {
@@ -33,6 +33,7 @@ vi.mock('react-i18next', () => ({
     t: (key: string, options?: Record<string, unknown>) => {
       if (key === 'queue.remaining') return `${String(options?.time)} remaining`
       if (key === 'queue.selectItem') return `Select ${String(options?.title)}`
+      if (key === 'queue.pendingHeading') return `Pending Releases (${String(options?.n)})`
       const labels: Record<string, string> = {
         'common.loading': 'Loading...',
         'queue.title': 'Queue',
@@ -76,6 +77,18 @@ vi.mock('react-i18next', () => ({
         'importHints.body': 'Bindery only auto-imports downloads it grabbed itself.',
         'importHints.manualImport': 'Import them',
         'importHints.scanLibrary': 'Scan Library',
+        'queue.pendingGrab': 'Grab Now',
+        'queue.importRequeued': 'Queued for another import attempt — the scanner picks it up on its next check.',
+        'common.dismiss': 'Dismiss',
+        'queue.pendingGrabbing': 'Grabbing…',
+        'queue.importBlockedHint': 'Import blocked — manual intervention required (check library path permissions)',
+        'queue.errorPrefix.importFailed': 'Import failed:',
+        'queue.errorPrefix.importBlocked': 'Import blocked:',
+        'queue.errorPrefix.error': 'Error:',
+      }
+      if (key.startsWith('queue.age.') && typeof options?.defaultValue === 'string') {
+        const vars = new Map(Object.entries(options))
+        return options.defaultValue.replace(/\{\{(\w+)\}\}/g, (_m, k: string) => String(vars.get(k)))
       }
       return labels[key] ?? key
     },
@@ -311,7 +324,7 @@ describe('QueuePage', () => {
     const b = screen.getByText('Flood B')
     fireEvent.click(within(b.closest('div')!.parentElement!).getByRole('checkbox'))
 
-    fireEvent.click(screen.getByRole('button', { name: 'Remove selected' }))
+    clickBulkAction('Remove selected')
     await acceptConfirm()
 
     // unmonitorBooks defaults ON (undo a mass import); deleteFiles defaults OFF.
@@ -329,8 +342,9 @@ describe('QueuePage', () => {
 
     await screen.findByText('A')
     fireEvent.click(screen.getByRole('checkbox', { name: 'Select all' }))
-    fireEvent.click(screen.getByRole('checkbox', { name: 'Delete downloaded files' }))
-    fireEvent.click(screen.getByRole('button', { name: 'Remove selected' }))
+    // The remove options are in the Remove confirmation, not the toolbar.
+    clickBulkAction('Remove selected')
+    fireEvent.click(within(await screen.findByTestId('confirm-dialog')).getByRole('checkbox', { name: 'Delete downloaded files' }))
     await acceptConfirm()
 
     await waitFor(() => expect(api.bulkDeleteQueue).toHaveBeenCalledWith([1, 2], { deleteFiles: true, unmonitorBooks: true }))
@@ -724,7 +738,7 @@ describe('QueuePage manual match (#1589)', () => {
     await screen.findByText('Failed Grab')
     fireEvent.click(screen.getByRole('checkbox', { name: 'Select Failed Grab' }))
     fireEvent.click(screen.getByRole('checkbox', { name: 'Select Failed Import' }))
-    fireEvent.click(screen.getByRole('button', { name: 'Retry selected' }))
+    clickBulkAction('Retry selected')
     await acceptConfirm()
 
     await waitFor(() => expect(api.bulkRetryQueue).toHaveBeenCalledWith([50, 51]))
@@ -741,8 +755,8 @@ describe('QueuePage manual match (#1589)', () => {
 
     await screen.findByText('Downloading Now')
     fireEvent.click(screen.getByRole('checkbox', { name: 'Select all' }))
-    expect(screen.getByRole('button', { name: 'Remove selected' })).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: 'Retry selected' })).not.toBeInTheDocument()
+    expect(screen.getByTestId('bulk-action-bar')).toBeInTheDocument()
+    expect(() => clickBulkAction('Retry selected')).toThrow()
   })
 
   it('offers Retry all failed when only blocked imports are queued (#2336)', async () => {
@@ -839,5 +853,197 @@ describe('MatchBookControl', () => {
     fireEvent.click(screen.getByText('queue.matchBookCancel'))
     expect(screen.getByText('queue.matchBook')).toBeInTheDocument()
     expect(screen.queryByLabelText('queue.matchBookSearch')).not.toBeInTheDocument()
+  })
+})
+
+// Phone layout. jsdom does no layout, so these check the classes that decide
+// it: below sm the actions take a full line under the content instead of a
+// column beside it, and the open picker is as wide as that line.
+describe('QueuePage on a phone', () => {
+  const failed = () => makeQueueItem({
+    id: 21,
+    title: 'A.Very.Long.Release.Name.With.No.Spaces.2026.EPUB',
+    status: 'importFailed',
+    errorMessage: 'could not match any book to this download',
+    addedAt: '2026-05-01T12:00:00Z',
+  })
+
+  it('puts the row actions on their own full width line below sm', async () => {
+    vi.mocked(api.listQueue).mockResolvedValue({ items: [failed()] })
+    renderQueuePage()
+    await screen.findByText('A.Very.Long.Release.Name.With.No.Spaces.2026.EPUB')
+    const actions = screen.getByTestId('queue-row-actions')
+    expect(actions).toHaveClass('basis-full', 'flex-wrap', 'sm:basis-auto', 'sm:flex-shrink-0')
+    expect(actions).not.toHaveClass('flex-shrink-0')
+    expect(actions.parentElement).toHaveClass('flex-wrap', 'sm:flex-nowrap')
+  })
+
+  it('opens the match picker at the full width of the row below sm', async () => {
+    vi.mocked(api.listQueue).mockResolvedValue({ items: [failed()] })
+    renderQueuePage()
+    await screen.findByText('A.Very.Long.Release.Name.With.No.Spaces.2026.EPUB')
+    fireEvent.click(screen.getByText('queue.matchBook'))
+    const input = screen.getByLabelText('queue.matchBookSearch')
+    expect(input).toHaveClass('min-w-0')
+    expect(input.parentElement?.parentElement).toHaveClass('w-full', 'sm:w-64')
+  })
+
+  it('wraps the full release name below sm instead of cutting it off', async () => {
+    vi.mocked(api.listQueue).mockResolvedValue({ items: [failed()] })
+    renderQueuePage()
+    const title = await screen.findByText('A.Very.Long.Release.Name.With.No.Spaces.2026.EPUB')
+    expect(title).toHaveClass('[overflow-wrap:anywhere]', 'sm:truncate')
+    expect(title).not.toHaveClass('truncate')
+  })
+
+  it('shows the exact time when the relative time is tapped', async () => {
+    vi.mocked(api.listQueue).mockResolvedValue({ items: [failed()] })
+    renderQueuePage()
+    await screen.findByText('A.Very.Long.Release.Name.With.No.Spaces.2026.EPUB')
+    const exact = new Date('2026-05-01T12:00:00Z').toUTCString()
+    const time = screen.getByRole('button', { name: /ago$/ })
+    expect(time).toHaveAttribute('aria-expanded', 'false')
+    expect(screen.queryByText(`(${exact})`)).not.toBeInTheDocument()
+    fireEvent.click(time)
+    expect(time).toHaveAttribute('aria-expanded', 'true')
+    expect(time).toHaveTextContent(exact)
+    fireEvent.click(time)
+    expect(time).not.toHaveTextContent(exact)
+  })
+})
+
+describe('QueuePage status view', () => {
+  // "29 failed" over a list with no visible active section left it unclear
+  // whether the queue held only failures.
+  it('splits the list into active and failed rows, with counts', async () => {
+    vi.mocked(api.listQueue).mockResolvedValue({ items: [
+      makeQueueItem({ id: 1, title: 'Going', status: 'downloading' }),
+      makeQueueItem({ id: 2, title: 'Broken', status: 'failed' }),
+    ] })
+    renderQueuePage()
+    await screen.findByText('Going')
+    const view = screen.getByRole('group', { name: 'queue.statusView' })
+    fireEvent.click(within(view).getByRole('button', { name: /queue\.viewFailed/ }))
+    expect(screen.queryByText('Going')).toBeNull()
+    expect(screen.getByText('Broken')).toBeInTheDocument()
+    fireEvent.click(within(view).getByRole('button', { name: /queue\.viewActive/ }))
+    expect(screen.getByText('Going')).toBeInTheDocument()
+    expect(screen.queryByText('Broken')).toBeNull()
+  })
+
+  // Rows selected under All and hidden by Failed must not be removed.
+  it('clears the selection when the view changes, so Remove only acts on shown rows', async () => {
+    vi.mocked(api.listQueue).mockResolvedValue({ items: [
+      makeQueueItem({ id: 1, title: 'Going', status: 'downloading' }),
+      makeQueueItem({ id: 2, title: 'Broken', status: 'failed' }),
+    ] })
+    vi.mocked(api.bulkDeleteQueue).mockResolvedValue({ results: {} })
+    renderQueuePage()
+    await screen.findByText('Going')
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select all' }))
+    expect(screen.getByTestId('bulk-action-bar')).toBeInTheDocument()
+    const view = screen.getByRole('group', { name: 'queue.statusView' })
+    fireEvent.click(within(view).getByRole('button', { name: /queue\.viewFailed/ }))
+    expect(screen.queryByTestId('bulk-action-bar')).toBeNull()
+    fireEvent.click(within(screen.getByText('Broken').closest('div')!.parentElement!).getByRole('checkbox'))
+    clickBulkAction('Remove selected')
+    await acceptConfirm()
+    await waitFor(() => expect(api.bulkDeleteQueue).toHaveBeenCalledWith([2], { deleteFiles: false, unmonitorBooks: true }))
+  })
+
+  // Page 3 of All clamped to the last page of Failed, so the first failures
+  // were never shown unless the reader paged back.
+  it('goes back to the first page when the view changes', async () => {
+    vi.mocked(api.listQueue).mockResolvedValue({ items: [
+      ...Array.from({ length: 60 }, (_, i) => makeQueueItem({ id: 100 + i, title: `Going ${i}`, status: 'downloading' })),
+      ...Array.from({ length: 60 }, (_, i) => makeQueueItem({ id: 200 + i, title: `Broken ${i}`, status: 'failed' })),
+    ] })
+    renderQueuePage()
+    await screen.findByText('Going 0')
+    fireEvent.click(screen.getByRole('button', { name: /pagination\.next/ }))
+    fireEvent.click(screen.getByRole('button', { name: /pagination\.next/ }))
+    expect(screen.getByText('Broken 59')).toBeInTheDocument()
+    const view = screen.getByRole('group', { name: 'queue.statusView' })
+    fireEvent.click(within(view).getByRole('button', { name: /queue\.viewFailed/ }))
+    expect(screen.getByText('Broken 0')).toBeInTheDocument()
+    expect(screen.queryByText('Broken 59')).toBeNull()
+  })
+
+  it('says so when the view has no rows, with a way back to All', async () => {
+    vi.mocked(api.listQueue).mockResolvedValue({ items: [
+      makeQueueItem({ id: 1, title: 'Going', status: 'downloading' }),
+    ] })
+    renderQueuePage()
+    await screen.findByText('Going')
+    const view = screen.getByRole('group', { name: 'queue.statusView' })
+    fireEvent.click(within(view).getByRole('button', { name: /queue\.viewFailed/ }))
+    expect(screen.getByText('queue.viewFailedEmpty')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'queue.viewShowAll' }))
+    expect(screen.getByText('Going')).toBeInTheDocument()
+  })
+
+  // A poll can move a selected row out of the view: a download fails while
+  // Active is shown. Remove must not act on the row the list no longer shows.
+  it('drops a selected row from Remove once a poll moves it out of the view', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      vi.mocked(api.listQueue)
+        .mockResolvedValueOnce({ items: [
+          makeQueueItem({ id: 1, title: 'Going', status: 'downloading' }),
+          makeQueueItem({ id: 2, title: 'Also going', status: 'downloading' }),
+        ] })
+        .mockResolvedValue({ items: [
+          makeQueueItem({ id: 1, title: 'Going', status: 'downloading' }),
+          makeQueueItem({ id: 2, title: 'Also going', status: 'failed' }),
+        ] })
+      vi.mocked(api.bulkDeleteQueue).mockResolvedValue({ results: {} })
+      render(<MemoryRouter initialEntries={['/queue?view=active']}><QueuePage /></MemoryRouter>)
+      await screen.findByText('Also going')
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Select all' }))
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+      await waitFor(() => expect(screen.queryByText('Also going')).toBeNull())
+      clickBulkAction('Remove selected')
+      await acceptConfirm()
+      await waitFor(() => expect(api.bulkDeleteQueue).toHaveBeenCalledWith([1], { deleteFiles: false, unmonitorBooks: true }))
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('opens on the view the URL names, and drops an unknown one', async () => {
+    vi.mocked(api.listQueue).mockResolvedValue({ items: [
+      makeQueueItem({ id: 1, title: 'Going', status: 'downloading' }),
+      makeQueueItem({ id: 2, title: 'Broken', status: 'failed' }),
+    ] })
+    let search = ''
+    function Loc() { search = useLocation().search; return null }
+    const { unmount } = render(<MemoryRouter initialEntries={['/queue?view=failed']}><QueuePage /><Loc /></MemoryRouter>)
+    await screen.findByText('Broken')
+    expect(screen.queryByText('Going')).toBeNull()
+    unmount()
+    render(<MemoryRouter initialEntries={['/queue?view=bogus']}><QueuePage /><Loc /></MemoryRouter>)
+    await screen.findByText('Going')
+    expect(screen.getByText('Broken')).toBeInTheDocument()
+    await waitFor(() => expect(search).toBe(''))
+  })
+
+  it('keeps the other query params when it drops an unknown view', async () => {
+    vi.mocked(api.listQueue).mockResolvedValue({ items: [makeQueueItem({ id: 1, title: 'Going', status: 'downloading' })] })
+    let search = ''
+    function Loc() { search = useLocation().search; return null }
+    render(<MemoryRouter initialEntries={['/queue?foo=1&view=bogus&bar=two']}><QueuePage /><Loc /></MemoryRouter>)
+    await screen.findByText('Going')
+    await waitFor(() => expect(search).toBe('?foo=1&bar=two'))
+  })
+
+  it('drops an unknown view by replacing the entry, so Back does not return to it', async () => {
+    vi.mocked(api.listQueue).mockResolvedValue({ items: [makeQueueItem({ id: 1, title: 'Going', status: 'downloading' })] })
+    let search = ''
+    let navType = ''
+    function Loc() { search = useLocation().search; navType = useNavigationType(); return null }
+    render(<MemoryRouter initialEntries={['/queue?view=bogus']}><QueuePage /><Loc /></MemoryRouter>)
+    await screen.findByText('Going')
+    await waitFor(() => expect(search).toBe(''))
+    expect(navType).toBe('REPLACE')
   })
 })

@@ -72,6 +72,47 @@ func (r *LogRepo) Insert(ctx context.Context, e LogEntry) error {
 	return err
 }
 
+// InsertBatch persists entries in order inside a single transaction, so a burst
+// of log lines costs one commit (one fsync-equivalent on the single pooled
+// connection) instead of one per line. Either every entry is written or none
+// is: on error the transaction is rolled back and the caller decides how to
+// salvage the batch.
+func (r *LogRepo) InsertBatch(ctx context.Context, entries []LogEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin log batch: %w", err)
+	}
+	stmt, err := tx.PrepareContext(ctx,
+		`INSERT INTO logs (ts, level, component, message, fields) VALUES (?, ?, ?, ?, ?)`)
+	if err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("prepare log batch: %w", err)
+	}
+	defer func() { _ = stmt.Close() }()
+	for _, e := range entries {
+		fields := e.Fields
+		if fields == nil {
+			fields = map[string]string{}
+		}
+		blob, err := json.Marshal(fields)
+		if err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("marshal log fields: %w", err)
+		}
+		if _, err := stmt.ExecContext(ctx, e.TS.UTC(), e.Level, e.Component, e.Message, string(blob)); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("insert log row: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit log batch: %w", err)
+	}
+	return nil
+}
+
 // Query returns log entries matching the filter, newest-first by default.
 func (r *LogRepo) Query(ctx context.Context, f LogFilter) ([]LogEntry, error) {
 	var conds []string

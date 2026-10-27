@@ -1,12 +1,12 @@
 import { useEffect } from 'react'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { act, render, screen, fireEvent, waitFor, within } from '@testing-library/react'
+import { act, cleanup, render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router'
 import AuthorDetailPage from './AuthorDetailPage'
 import { api, ApiError } from '../api/client'
 import type { Author, Book } from '../api/client'
 import '../i18n'
-import { acceptConfirm, cancelConfirm, confirmDialog } from '../test-utils'
+import { acceptConfirm, cancelConfirm, confirmDialog, clickBulkAction, mockMatchMedia } from '../test-utils'
 
 vi.mock('../api/client', async importOriginal => {
   const actual = await importOriginal<typeof import('../api/client')>()
@@ -21,6 +21,8 @@ vi.mock('../api/client', async importOriginal => {
       searchAuthorLinkCandidates: vi.fn(),
       relinkAuthorUpstream: vi.fn(),
       updateAuthor: vi.fn(),
+      uploadAuthorPhoto: vi.fn(),
+      clearAuthorPhoto: vi.fn(),
       deleteAuthor: vi.fn(),
       deleteAuthorAlias: vi.fn(),
       searchAuthorWanted: vi.fn(),
@@ -147,6 +149,30 @@ function mockElementOverflow(overflows: boolean): () => void {
   }
 }
 
+// The book filters are the shared FilterBar: Status is an inline segment, the
+// other facets are radio groups behind the Filters and Sort disclosures. These
+// pick a value by its data-value, opening the disclosure first when needed.
+function setFilter(group: string, value: string) {
+  const segment = screen.queryByRole('group', { name: group })
+  if (segment) {
+    fireEvent.click(segment.querySelector(`[data-value="${value}"]`)!)
+    return
+  }
+  if (!screen.queryByRole('radiogroup', { name: group })) {
+    fireEvent.click(screen.getByRole('button', { name: group === 'Sort' ? 'Sort' : /^Filters/ }))
+  }
+  fireEvent.click(screen.getByRole('radiogroup', { name: group }).querySelector(`[data-value="${value}"]`)!)
+}
+
+function filterValue(group: string): string | null {
+  const segment = screen.queryByRole('group', { name: group })
+  if (segment) return segment.querySelector('[aria-pressed="true"]')?.getAttribute('data-value') ?? null
+  if (!screen.queryByRole('radiogroup', { name: group })) {
+    fireEvent.click(screen.getByRole('button', { name: group === 'Sort' ? 'Sort' : /^Filters/ }))
+  }
+  return screen.getByRole('radiogroup', { name: group }).querySelector('[aria-checked="true"]')?.getAttribute('data-value') ?? null
+}
+
 describe('AuthorDetailPage', () => {
   it('loads the complete author catalogue via the paging fetch-all, and renders past 100 books (#1467)', async () => {
     const books = Array.from({ length: 150 }, (_, i) =>
@@ -172,7 +198,7 @@ describe('AuthorDetailPage', () => {
     renderAuthorDetailPage([makeBook({ id: 1, title: 'Visible Book', status: 'imported' })], 'table')
 
     await screen.findByText('Visible Book')
-    fireEvent.change(screen.getByLabelText('Status'), { target: { value: 'excluded' } })
+    setFilter('Status', 'excluded')
 
     await waitFor(() =>
       expect(api.listAllBooks).toHaveBeenCalledWith({ authorId: 42, includeExcluded: true }))
@@ -305,6 +331,191 @@ describe('AuthorDetailPage', () => {
     fireEvent.click(button)
 
     expect(api.searchAuthorWanted).not.toHaveBeenCalled()
+  })
+
+  // #3144: BnF's Licence Ouverte asks for the source and the date.
+  it('credits the BnF with the date of the last metadata refresh for a BnF author', async () => {
+    renderAuthorDetailPage([], 'grid', {
+      foreignAuthorId: 'bnf:author:11885918',
+      authorName: 'Lewis Carroll',
+      sortName: 'Carroll, Lewis',
+      metadataProvider: 'bnf',
+      createdAt: '2026-10-01T08:00:00Z',
+      lastMetadataRefreshAt: '2026-10-10T07:00:00Z',
+    })
+
+    const credit = await screen.findByTestId('bnf-source-credit')
+    expect(credit.textContent).toContain('BnF')
+    expect(credit.textContent).toContain('2026-10-10')
+  })
+
+  it('shows no BnF credit for an author from another provider', async () => {
+    renderAuthorDetailPage([], 'grid', { createdAt: '2026-10-01T08:00:00Z' })
+    await screen.findByRole('heading', { level: 2 })
+    expect(screen.queryByTestId('bnf-source-credit')).toBeNull()
+  })
+
+  // #3287: a photo or bio an author enricher filled in carries its credit.
+  it('credits an enriched photo and bio with their source, creator and licence', async () => {
+    renderAuthorDetailPage([], 'grid', {
+      foreignAuthorId: 'nb:author:90000001',
+      authorName: 'Kari Nordmann',
+      metadataProvider: 'nb',
+      imageUrl: 'https://upload.example/k.jpg',
+      imageSource: { provider: 'wikimedia-commons', url: 'https://commons.example/wiki/File:K.jpg', credit: 'Ola Nordmann', license: 'CC BY-SA 4.0' },
+      description: 'Kari Nordmann is a writer.',
+      descriptionSource: { provider: 'wikipedia', url: 'https://no.wikipedia.example/wiki/Kari_Nordmann', license: 'CC BY-SA 4.0' },
+    })
+
+    const photo = await screen.findByTestId('author-photo-credit')
+    expect(photo.textContent).toBe('Photo: Ola Nordmann, CC BY-SA 4.0, via Wikimedia Commons')
+    expect(photo).toHaveAttribute('href', 'https://commons.example/wiki/File:K.jpg')
+    const bio = screen.getByTestId('author-bio-credit')
+    expect(bio.textContent).toBe('Bio from Wikipedia, CC BY-SA 4.0')
+    expect(bio).toHaveAttribute('href', 'https://no.wikipedia.example/wiki/Kari_Nordmann')
+  })
+
+  // #3287: the photo upload mirrors the book cover upload (#3017).
+  it('uploads a photo picked from the author page and shows no credit for it', async () => {
+    const file = new File([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], 'photo.png', { type: 'image/png' })
+    vi.mocked(api.uploadAuthorPhoto).mockResolvedValue({ ...author, imageUrl: '/api/v1/images?url=bindery-cover%3Aabc', imageSource: { provider: 'user', url: '' } })
+    renderAuthorDetailPage([], 'grid', { imageUrl: '' })
+    const input = await screen.findByLabelText('Upload photo')
+    expect(input.closest('label')).toHaveClass('touch-target')
+    fireEvent.change(input, { target: { files: [file] } })
+    await waitFor(() => expect(api.uploadAuthorPhoto).toHaveBeenCalledWith(42, file))
+    expect(await screen.findByLabelText('Change photo')).toBeInTheDocument()
+    expect(screen.getByRole('img', { name: author.authorName })).toHaveAttribute('src', '/api/v1/images?url=bindery-cover%3Aabc')
+    // A photo the user chose is theirs: there is nobody to credit.
+    expect(screen.queryByTestId('author-photo-credit')).toBeNull()
+  })
+
+  it('reports a failed photo upload', async () => {
+    vi.mocked(api.uploadAuthorPhoto).mockRejectedValue(new Error('send a JPEG, PNG, WebP or GIF image'))
+    renderAuthorDetailPage([], 'grid', { imageUrl: '' })
+    const input = await screen.findByLabelText('Upload photo')
+    fireEvent.change(input, { target: { files: [new File(['x'], 'notes.txt', { type: 'text/plain' })] } })
+    expect(await screen.findByText('send a JPEG, PNG, WebP or GIF image')).toBeInTheDocument()
+  })
+
+  it('falls back to a plain message when the upload fails without an Error', async () => {
+    vi.mocked(api.uploadAuthorPhoto).mockRejectedValue('network down')
+    renderAuthorDetailPage([], 'grid', { imageUrl: '' })
+    const input = await screen.findByLabelText('Upload photo')
+    fireEvent.change(input, { target: { files: [new File(['x'], 'photo.png', { type: 'image/png' })] } })
+    expect(await screen.findByText('Could not upload the photo')).toBeInTheDocument()
+  })
+
+  // Removing an uploaded photo hands the field back: the answer carries the
+  // provider's photo, credited if an enricher found it.
+  it('removes an uploaded photo and shows the one that replaces it', async () => {
+    vi.mocked(api.clearAuthorPhoto).mockResolvedValue({ ...author, imageUrl: 'https://upload.example/k.jpg', imageSource: { provider: 'wikimedia-commons', url: 'https://commons.example/wiki/File:K.jpg', license: 'CC BY 2.5' } })
+    renderAuthorDetailPage([], 'grid', { imageUrl: '/api/v1/images?url=bindery-cover%3Aabc', imageSource: { provider: 'user', url: '' } })
+    fireEvent.click(await screen.findByRole('button', { name: 'Remove photo' }))
+    await waitFor(() => expect(api.clearAuthorPhoto).toHaveBeenCalledWith(42))
+    expect(await screen.findByTestId('author-photo-credit')).toHaveTextContent('Photo: CC BY 2.5, via Wikimedia Commons')
+    expect(screen.queryByRole('button', { name: 'Remove photo' })).toBeNull()
+  })
+
+  // A bio the user wrote is theirs: nobody to credit (#3287).
+  it('shows no bio credit for a bio the user wrote', async () => {
+    renderAuthorDetailPage([], 'grid', { description: 'Mine.', descriptionSource: { provider: 'user', url: '' } })
+    await screen.findByRole('heading', { level: 2 })
+    expect(screen.queryByTestId('author-bio-credit')).toBeNull()
+  })
+
+  it('accepts exactly the image types the server stores', async () => {
+    renderAuthorDetailPage([], 'grid', { imageUrl: '' })
+    expect(await screen.findByLabelText('Upload photo')).toHaveAttribute('accept', 'image/jpeg,image/png,image/webp,image/gif')
+  })
+
+  // While one photo request runs, neither control can start another.
+  it('disables both photo controls while uploading or removing', async () => {
+    const user = { imageUrl: '/api/v1/images?url=bindery-cover%3Aabc', imageSource: { provider: 'user', url: '' } }
+    vi.mocked(api.uploadAuthorPhoto).mockReturnValue(new Promise(() => {}))
+    renderAuthorDetailPage([], 'grid', user)
+    fireEvent.change(await screen.findByLabelText('Change photo'), { target: { files: [new File(['x'], 'p.png', { type: 'image/png' })] } })
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Remove photo' })).toBeDisabled())
+    expect(document.querySelector('input[type=file]')).toBeDisabled()
+    cleanup()
+
+    vi.mocked(api.clearAuthorPhoto).mockReturnValue(new Promise(() => {}))
+    renderAuthorDetailPage([], 'grid', user)
+    fireEvent.click(await screen.findByRole('button', { name: 'Remove photo' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Removing…' })).toBeDisabled())
+    expect(document.querySelector('input[type=file]')).toBeDisabled()
+  })
+
+  it('asks to reload when the author changed while removing the photo', async () => {
+    vi.mocked(api.clearAuthorPhoto).mockRejectedValue(new ApiError(409, { error: 'this author changed while you were saving; reload and try again' }, 'Conflict'))
+    renderAuthorDetailPage([], 'grid', { imageUrl: '/api/v1/images?url=bindery-cover%3Aabc', imageSource: { provider: 'user', url: '' } })
+    fireEvent.click(await screen.findByRole('button', { name: 'Remove photo' }))
+    expect(await screen.findByText('This author changed while you were saving. Reload the page and try again.')).toBeInTheDocument()
+  })
+
+  it('says why when the photo to remove was not one the user uploaded', async () => {
+    vi.mocked(api.clearAuthorPhoto).mockRejectedValue(new ApiError(409, { error: 'only a photo you uploaded can be removed', code: 'photo_not_uploaded' }, 'Conflict'))
+    renderAuthorDetailPage([], 'grid', { imageUrl: '/api/v1/images?url=bindery-cover%3Aabc', imageSource: { provider: 'user', url: '' } })
+    fireEvent.click(await screen.findByRole('button', { name: 'Remove photo' }))
+    expect(await screen.findByText('Only a photo you uploaded can be removed. Reload the page to see the current photo.')).toBeInTheDocument()
+  })
+
+  it('offers no Remove photo for a photo the user did not upload', async () => {
+    renderAuthorDetailPage([], 'grid', { imageUrl: 'https://covers.example/a.jpg' })
+    await screen.findByRole('heading', { level: 2 })
+    expect(screen.queryByRole('button', { name: 'Remove photo' })).toBeNull()
+  })
+
+  it('reports a failed photo removal', async () => {
+    vi.mocked(api.clearAuthorPhoto).mockRejectedValue('network down')
+    renderAuthorDetailPage([], 'grid', { imageUrl: '/api/v1/images?url=bindery-cover%3Aabc', imageSource: { provider: 'user', url: '' } })
+    fireEvent.click(await screen.findByRole('button', { name: 'Remove photo' }))
+    expect(await screen.findByText('Could not remove the photo')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Remove photo' })).toBeEnabled()
+  })
+
+  it('sends nothing when the file picker is cancelled', async () => {
+    renderAuthorDetailPage([], 'grid', { imageUrl: '' })
+    const input = await screen.findByLabelText('Upload photo')
+    fireEvent.change(input, { target: { files: [] } })
+    expect(api.uploadAuthorPhoto).not.toHaveBeenCalled()
+  })
+
+  // A Commons file that names no photographer is still credited, with its
+  // licence; a source the page has no label for is shown by its own name.
+  it('credits a photo with no named photographer, and an unknown source by name', async () => {
+    renderAuthorDetailPage([], 'grid', {
+      imageUrl: 'https://upload.example/k.jpg',
+      imageSource: { provider: 'wikimedia-commons', url: 'https://commons.example/wiki/File:K.jpg', license: 'CC BY 2.5' },
+      description: 'Kari Nordmann is a writer.',
+      descriptionSource: { provider: 'example-encyclopedia', url: 'https://encyclopedia.example/k' },
+    })
+    expect((await screen.findByTestId('author-photo-credit')).textContent).toBe('Photo: CC BY 2.5, via Wikimedia Commons')
+    // No licence stated: the credit still names the source, without a
+    // dangling separator.
+    expect(screen.getByTestId('author-bio-credit').textContent).toBe('Bio from example-encyclopedia')
+  })
+
+  // A credit URL comes from a third party: anything but http(s) keeps the
+  // credit text and drops the link.
+  it('does not link a credit whose URL is not http(s)', async () => {
+    renderAuthorDetailPage([], 'grid', {
+      imageUrl: 'https://upload.example/k.jpg',
+      imageSource: { provider: 'wikimedia-commons', url: 'javascript:alert(1)', license: 'CC BY 2.5' },
+      description: 'Kari Nordmann is a writer.',
+      descriptionSource: { provider: 'wikipedia', url: 'data:text/html,hi', license: 'CC BY-SA 4.0' },
+    })
+    const photo = await screen.findByTestId('author-photo-credit')
+    expect(photo.textContent).toBe('Photo: CC BY 2.5, via Wikimedia Commons')
+    expect(photo).not.toHaveAttribute('href')
+    expect(screen.getByTestId('author-bio-credit')).not.toHaveAttribute('href')
+  })
+
+  it('shows no enrichment credit for a photo and bio from the author\'s own provider', async () => {
+    renderAuthorDetailPage([], 'grid', { imageUrl: 'https://covers.example/a.jpg', description: 'From the provider.' })
+    await screen.findByRole('heading', { level: 2 })
+    expect(screen.queryByTestId('author-photo-credit')).toBeNull()
+    expect(screen.queryByTestId('author-bio-credit')).toBeNull()
   })
 
   it('shows link metadata for unlinked authors', async () => {
@@ -517,10 +728,10 @@ describe('AuthorDetailPage', () => {
     expect(within(table).getByRole('columnheader', { name: 'Status' })).toBeInTheDocument()
 
     // Cells: [0]=row checkbox (bulk select), [1]=title+inline metadata,
-    // [2]=published year, [3]=type, [4]=status. Checkbox column was added
-    // for #791 bulk multi-select.
+    // [2]=published year, [3]=rating, [4]=type, [5]=status. Checkbox column
+    // was added for #791 bulk multi-select.
     const firefightCells = within(rowForTitle('Firefight')).getAllByRole('cell')
-    expect(firefightCells).toHaveLength(5)
+    expect(firefightCells).toHaveLength(6)
     expect(within(firefightCells[0]).getByRole('checkbox')).toBeInTheDocument()
     expect(firefightCells[1]).toHaveTextContent('Wanted')
     expect(firefightCells[1]).toHaveTextContent('📖 Ebook')
@@ -528,26 +739,26 @@ describe('AuthorDetailPage', () => {
     expect(firefightCells[1]).not.toHaveTextContent('2008-01-01')
     expect(firefightCells[2]).toHaveTextContent('2008')
     expect(firefightCells[2]).not.toHaveTextContent('2008-01-01')
-    expect(firefightCells[3]).toHaveTextContent('📖 Ebook')
-    expect(firefightCells[4]).toHaveTextContent('Wanted')
+    expect(firefightCells[4]).toHaveTextContent('📖 Ebook')
+    expect(firefightCells[5]).toHaveTextContent('Wanted')
 
     const snapshotCells = within(rowForTitle('Snapshot')).getAllByRole('cell')
     expect(snapshotCells[1]).toHaveTextContent('Skipped')
     expect(snapshotCells[1]).toHaveTextContent('🎧 Audiobook')
     expect(snapshotCells[1]).toHaveTextContent('2023')
     expect(snapshotCells[2]).toHaveTextContent('2023')
-    expect(snapshotCells[3]).toHaveTextContent('🎧 Audiobook')
-    expect(snapshotCells[4]).toHaveTextContent('Skipped')
+    expect(snapshotCells[4]).toHaveTextContent('🎧 Audiobook')
+    expect(snapshotCells[5]).toHaveTextContent('Skipped')
 
     const dualFormatCells = within(rowForTitle('Dual Format')).getAllByRole('cell')
-    expect(dualFormatCells[1]).toHaveTextContent('Imported')
+    expect(dualFormatCells[1]).toHaveTextContent('In library')
     expect(dualFormatCells[1]).toHaveTextContent('📖🎧 Both')
     expect(dualFormatCells[1]).toHaveTextContent('2022')
     expect(dualFormatCells[1]).toHaveTextContent('Excluded')
     expect(dualFormatCells[2]).toHaveTextContent('2022')
-    expect(dualFormatCells[3]).toHaveTextContent('📖🎧 Both')
-    expect(dualFormatCells[4]).toHaveTextContent('Imported')
-    expect(dualFormatCells[4]).toHaveTextContent('Excluded')
+    expect(dualFormatCells[4]).toHaveTextContent('📖🎧 Both')
+    expect(dualFormatCells[5]).toHaveTextContent('In library')
+    expect(dualFormatCells[5]).toHaveTextContent('Excluded')
   })
 
   it('bulk-excludes selected books via /book/bulk', async () => {
@@ -569,12 +780,69 @@ describe('AuthorDetailPage', () => {
     fireEvent.click(within(row1).getByRole('checkbox'))
     fireEvent.click(within(row2).getByRole('checkbox'))
 
-    const excludeBtn = await screen.findByRole('button', { name: 'Exclude' })
-    fireEvent.click(excludeBtn)
+    clickBulkAction('Exclude')
     await acceptConfirm()
 
     await waitFor(() => {
       expect(api.bulkActionBooks).toHaveBeenCalledWith([101, 102], 'exclude', undefined)
+    })
+  })
+
+  // #3454: Exclude was offered on every selection and the Excluded view had
+  // no way back. There the bar swaps it for Un-exclude, with no confirmation:
+  // it undoes a hiding rather than hiding anything.
+  it('offers Un-exclude instead of Exclude in the Excluded view (#3454)', async () => {
+    vi.mocked(api.bulkActionBooks).mockResolvedValue({
+      results: { '201': { ok: true }, '202': { ok: true } },
+    })
+    const kept = makeBook({ id: 200, title: 'Still Here', status: 'imported' })
+    const gone1 = makeBook({ id: 201, title: 'Hidden One', status: 'wanted', excluded: true })
+    const gone2 = makeBook({ id: 202, title: 'Hidden Two', status: 'wanted', excluded: true })
+    renderAuthorDetailPage([kept, gone1, gone2], 'table')
+
+    await screen.findByText('Still Here')
+    fireEvent.click(within(rowForTitle('Still Here')).getByRole('checkbox'))
+    // Past the inline cap, so it sits in the More menu.
+    fireEvent.click(await screen.findByRole('button', { name: 'More bulk actions' }))
+    expect(screen.getByRole('menuitem', { name: 'Exclude' })).toBeInTheDocument()
+    expect(screen.queryByRole('menuitem', { name: 'Un-exclude' })).toBeNull()
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: 'Escape' })
+    fireEvent.click(screen.getByRole('button', { name: 'Clear' }))
+
+    setFilter('Status', 'excluded')
+    await screen.findByText('Hidden One')
+    fireEvent.click(within(rowForTitle('Hidden One')).getByRole('checkbox'))
+    fireEvent.click(within(rowForTitle('Hidden Two')).getByRole('checkbox'))
+
+    expect(screen.queryByRole('button', { name: 'Exclude' })).toBeNull()
+    expect(screen.queryByRole('menuitem', { name: 'Exclude' })).toBeNull()
+    fireEvent.click(await screen.findByRole('button', { name: 'Un-exclude' }))
+
+    await waitFor(() => {
+      expect(api.bulkActionBooks).toHaveBeenCalledWith([201, 202], 'unexclude', undefined)
+    })
+  })
+
+  // #2267: searching the selected books, not every wanted book of the author.
+  it('bulk-searches only the selected books', async () => {
+    vi.mocked(api.bulkActionBooks).mockResolvedValue({
+      results: { '101': { ok: true } },
+    })
+    renderAuthorDetailPage(
+      [
+        makeBook({ id: 101, title: 'Find Me', status: 'wanted' }),
+        makeBook({ id: 102, title: 'Leave Me', status: 'wanted' }),
+      ],
+      'table',
+    )
+
+    await screen.findByText('Find Me')
+    fireEvent.click(within(rowForTitle('Find Me')).getByRole('checkbox'))
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Search' }))
+
+    await waitFor(() => {
+      expect(api.bulkActionBooks).toHaveBeenCalledWith([101], 'search', undefined)
     })
   })
 
@@ -597,7 +865,7 @@ describe('AuthorDetailPage', () => {
     fireEvent.click(within(rowForTitle('Mistagged One')).getByRole('checkbox'))
     fireEvent.click(within(rowForTitle('Mistagged Two')).getByRole('checkbox'))
 
-    fireEvent.click(await screen.findByRole('button', { name: '📖🎧 Set Both' }))
+    clickBulkAction('Both')
 
     await waitFor(() => {
       expect(api.bulkActionBooks).toHaveBeenCalledWith([301, 302], 'set_media_type', 'both')
@@ -640,7 +908,7 @@ describe('AuthorDetailPage', () => {
     await screen.findByText('Genuinely Wanted')
 
     // Apply the Wanted status filter.
-    fireEvent.change(screen.getByLabelText('Status'), { target: { value: 'wanted' } })
+    setFilter('Status', 'wanted')
 
     // Monitored wanted book stays; unmonitored "wanted" and imported drop out.
     expect(screen.getByText('Genuinely Wanted')).toBeInTheDocument()
@@ -666,21 +934,54 @@ describe('AuthorDetailPage', () => {
 
     // Type: Ebook + Status: Imported must include the dual-format book whose
     // ebook is on disk — the aggregate 'wanted' used to hide it.
-    fireEvent.change(screen.getByLabelText('Type'), { target: { value: 'ebook' } })
-    fireEvent.change(screen.getByLabelText('Status'), { target: { value: 'imported' } })
+    setFilter('Type', 'ebook')
+    setFilter('Status', 'imported')
     expect(screen.getByText('Dual Ebook Done')).toBeInTheDocument()
     expect(screen.getByText('Plain Ebook Imported')).toBeInTheDocument()
     expect(screen.queryByText('Plain Ebook Wanted')).not.toBeInTheDocument()
 
     // And its ebook is NOT wanted anymore, so the Wanted chip must drop it.
-    fireEvent.change(screen.getByLabelText('Status'), { target: { value: 'wanted' } })
+    setFilter('Status', 'wanted')
     expect(screen.queryByText('Dual Ebook Done')).not.toBeInTheDocument()
     expect(screen.getByText('Plain Ebook Wanted')).toBeInTheDocument()
 
     // The reverse direction: the audiobook side of the same book IS wanted.
-    fireEvent.change(screen.getByLabelText('Type'), { target: { value: 'audiobook' } })
+    setFilter('Type', 'audiobook')
     expect(screen.getByText('Dual Ebook Done')).toBeInTheDocument()
     expect(screen.queryByText('Plain Ebook Wanted')).not.toBeInTheDocument()
+  })
+
+  it('lists a partially owned dual-format book under Imported and counts it in library (#3132)', async () => {
+    renderAuthorDetailPage(
+      [
+        makeBook({
+          id: 621, title: 'Partly Owned', status: 'wanted', monitored: true,
+          mediaType: 'both', ebookFilePath: '/books/loop.epub', audiobookFilePath: '',
+        }),
+        makeBook({ id: 622, title: 'Nothing Owned', status: 'wanted', monitored: true, mediaType: 'both' }),
+      ],
+      'table',
+    )
+    await screen.findByText('Partly Owned')
+    const stats = await screen.findByTestId('author-stats')
+    expect(within(stats).getByText('In library').parentElement).toHaveTextContent('1')
+
+    setFilter('Status', 'imported')
+    expect(screen.getByText('Partly Owned')).toBeInTheDocument()
+    expect(screen.queryByText('Nothing Owned')).not.toBeInTheDocument()
+
+    // Still wanted too: one format is missing.
+    setFilter('Status', 'wanted')
+    expect(screen.getByText('Partly Owned')).toBeInTheDocument()
+    expect(screen.getByText('Nothing Owned')).toBeInTheDocument()
+
+    // With a format chip the file has to be of that format: the ebook only
+    // book is not in the audiobook library, matching the Books page.
+    setFilter('Status', 'imported')
+    setFilter('Type', 'audiobook')
+    expect(screen.queryByText('Partly Owned')).not.toBeInTheDocument()
+    setFilter('Type', 'ebook')
+    expect(screen.getByText('Partly Owned')).toBeInTheDocument()
   })
 
   it("includes 'both' books under either media-type chip (#1406)", async () => {
@@ -694,12 +995,12 @@ describe('AuthorDetailPage', () => {
     )
     await screen.findByText('Both Formats')
 
-    fireEvent.change(screen.getByLabelText('Type'), { target: { value: 'ebook' } })
+    setFilter('Type', 'ebook')
     expect(screen.getByText('Both Formats')).toBeInTheDocument()
     expect(screen.getByText('Ebook Only')).toBeInTheDocument()
     expect(screen.queryByText('Audio Only')).not.toBeInTheDocument()
 
-    fireEvent.change(screen.getByLabelText('Type'), { target: { value: 'audiobook' } })
+    setFilter('Type', 'audiobook')
     expect(screen.getByText('Both Formats')).toBeInTheDocument()
     expect(screen.queryByText('Ebook Only')).not.toBeInTheDocument()
     expect(screen.getByText('Audio Only')).toBeInTheDocument()
@@ -728,7 +1029,7 @@ describe('AuthorDetailPage', () => {
 
     // Now narrow to just the wanted book and Select all again: selection must
     // cover only the filtered (displayed) book, not the hidden imported one.
-    fireEvent.change(screen.getByLabelText('Status'), { target: { value: 'wanted' } })
+    setFilter('Status', 'wanted')
     expect(screen.queryByText('Imported Book')).not.toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: 'Select all' }))
@@ -815,8 +1116,8 @@ describe('AuthorDetailPage — toolbar and stats', () => {
 
   it('offers every StatusFilter value, including the one the chips never exposed', async () => {
     renderAuthorDetailPage([makeBook({ id: 1, title: 'A', status: 'imported' })])
-    const select = await screen.findByLabelText('Status')
-    const values = within(select).getAllByRole('option').map(o => (o as HTMLOptionElement).value)
+    const segment = await screen.findByRole('group', { name: 'Status' })
+    const values = within(segment).getAllByRole('button').map(b => b.getAttribute('data-value'))
     // skipped has been in the StatusFilter type all along but the chip row only
     // ever offered wanted/imported. 'downloading' and 'downloaded' were offered
     // here too until #2374 removed them: no book could ever hold either value,
@@ -833,19 +1134,190 @@ describe('AuthorDetailPage — toolbar and stats', () => {
     // heading and once inside the aria-hidden CoverPlaceholder — so query the
     // heading rather than the raw text.
     await screen.findByRole('heading', { name: 'Passed Book' })
-    fireEvent.change(screen.getByLabelText('Status'), { target: { value: 'skipped' } })
+    setFilter('Status', 'skipped')
     expect(screen.getByRole('heading', { name: 'Passed Book' })).toBeInTheDocument()
     expect(screen.queryByRole('heading', { name: 'Shelved Book' })).toBeNull()
   })
 
   it('persists the status filter across remounts', async () => {
     const { unmount } = renderAuthorDetailPage([makeBook({ id: 1, title: 'A', status: 'imported' })])
-    await screen.findByLabelText('Status')
-    fireEvent.change(screen.getByLabelText('Status'), { target: { value: 'skipped' } })
+    await screen.findByRole('group', { name: 'Status' })
+    setFilter('Status', 'skipped')
     unmount()
 
     renderAuthorDetailPage([makeBook({ id: 1, title: 'A', status: 'imported' })])
-    expect(await screen.findByLabelText('Status')).toHaveValue('skipped')
+    await screen.findByRole('group', { name: 'Status' })
+    expect(filterValue('Status')).toBe('skipped')
+  })
+
+  // Grid headings in document order — the order the user sees.
+  const shownTitles = (titles: string[]) =>
+    screen.getAllByRole('heading')
+      .map(h => h.textContent ?? '')
+      .filter(txt => titles.includes(txt))
+
+  it('sorts by title, publication date and date added from the Sort select', async () => {
+    renderAuthorDetailPage([
+      makeBook({ id: 1, title: 'Beta', status: 'imported', releaseDate: '2010-01-01T00:00:00Z', createdAt: '2024-03-01T00:00:00Z' }),
+      makeBook({ id: 2, title: 'Gamma', status: 'imported', releaseDate: '2020-01-01T00:00:00Z', createdAt: '2024-01-01T00:00:00Z' }),
+      makeBook({ id: 3, title: 'Alpha', status: 'imported', releaseDate: '2015-01-01T00:00:00Z', createdAt: '2024-02-01T00:00:00Z' }),
+    ])
+    const all = ['Alpha', 'Beta', 'Gamma']
+    await screen.findByRole('heading', { name: 'Beta' })
+    expect(shownTitles(all)).toEqual(['Beta', 'Gamma', 'Alpha'])
+
+    setFilter('Sort', 'title-az')
+    expect(shownTitles(all)).toEqual(['Alpha', 'Beta', 'Gamma'])
+    setFilter('Sort', 'title-za')
+    expect(shownTitles(all)).toEqual(['Gamma', 'Beta', 'Alpha'])
+    setFilter('Sort', 'date-new')
+    expect(shownTitles(all)).toEqual(['Gamma', 'Alpha', 'Beta'])
+    setFilter('Sort', 'date-old')
+    expect(shownTitles(all)).toEqual(['Beta', 'Alpha', 'Gamma'])
+    setFilter('Sort', 'added-new')
+    expect(shownTitles(all)).toEqual(['Beta', 'Alpha', 'Gamma'])
+    setFilter('Sort', 'added-old')
+    expect(shownTitles(all)).toEqual(['Gamma', 'Alpha', 'Beta'])
+  })
+
+  it('sorts undated books last in both date directions', async () => {
+    renderAuthorDetailPage([
+      makeBook({ id: 1, title: 'Undated', status: 'imported' }),
+      makeBook({ id: 2, title: 'Old', status: 'imported', releaseDate: '2001-01-01T00:00:00Z' }),
+      makeBook({ id: 3, title: 'New', status: 'imported', releaseDate: '2021-01-01T00:00:00Z' }),
+    ])
+    const all = ['Undated', 'Old', 'New']
+    await screen.findByRole('heading', { name: 'Undated' })
+    setFilter('Sort', 'date-old')
+    expect(shownTitles(all)).toEqual(['Old', 'New', 'Undated'])
+    setFilter('Sort', 'date-new')
+    expect(shownTitles(all)).toEqual(['New', 'Old', 'Undated'])
+  })
+
+  it('persists the sort and migrates the old Published-header setting', async () => {
+    localStorage.setItem('bindery.sort.author-detail.date', 'desc')
+    const { unmount } = renderAuthorDetailPage([makeBook({ id: 1, title: 'A', status: 'imported' })])
+    await screen.findByRole('group', { name: 'Status' })
+    expect(filterValue('Sort')).toBe('date-new')
+    setFilter('Sort', 'title-za')
+    unmount()
+
+    renderAuthorDetailPage([makeBook({ id: 1, title: 'A', status: 'imported' })])
+    await screen.findByRole('group', { name: 'Status' })
+    expect(filterValue('Sort')).toBe('title-za')
+  })
+
+  it('sorts from the Title and Published column headers in table view', async () => {
+    renderAuthorDetailPage([
+      makeBook({ id: 1, title: 'Beta', status: 'imported', releaseDate: '2010-01-01T00:00:00Z' }),
+      makeBook({ id: 2, title: 'Alpha', status: 'imported', releaseDate: '2020-01-01T00:00:00Z' }),
+    ], 'table')
+    await screen.findByText('Beta')
+    fireEvent.click(screen.getByRole('columnheader', { name: /Title/ }))
+    expect(filterValue('Sort')).toBe('title-az')
+    fireEvent.click(screen.getByRole('columnheader', { name: /Title/ }))
+    expect(filterValue('Sort')).toBe('title-za')
+    fireEvent.click(screen.getByRole('columnheader', { name: /Published/ }))
+    expect(filterValue('Sort')).toBe('date-old')
+  })
+
+  it('filters by monitored state', async () => {
+    renderAuthorDetailPage([
+      makeBook({ id: 1, title: 'Watched', status: 'wanted', monitored: true }),
+      makeBook({ id: 2, title: 'Ignored', status: 'wanted', monitored: false }),
+    ])
+    await screen.findByRole('heading', { name: 'Watched' })
+    setFilter('Monitored', 'unmonitored')
+    expect(screen.queryByRole('heading', { name: 'Watched' })).toBeNull()
+    expect(screen.getByRole('heading', { name: 'Ignored' })).toBeInTheDocument()
+    setFilter('Monitored', 'monitored')
+    expect(screen.getByRole('heading', { name: 'Watched' })).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Ignored' })).toBeNull()
+  })
+
+  it('offers a Language filter only when the books span more than one', async () => {
+    const { unmount } = renderAuthorDetailPage([
+      makeBook({ id: 1, title: 'English One', status: 'imported', language: 'eng' }),
+      makeBook({ id: 2, title: 'English Two', status: 'imported', language: 'eng' }),
+    ])
+    await screen.findByRole('heading', { name: 'English One' })
+    expect(screen.queryByLabelText('Language')).toBeNull()
+    unmount()
+
+    renderAuthorDetailPage([
+      makeBook({ id: 1, title: 'English One', status: 'imported', language: 'eng' }),
+      makeBook({ id: 2, title: 'Deutsch Eins', status: 'imported', language: 'ger' }),
+    ])
+    await screen.findByRole('heading', { name: 'English One' })
+    setFilter('Language', 'ger')
+    expect(screen.queryByRole('heading', { name: 'English One' })).toBeNull()
+    expect(screen.getByRole('heading', { name: 'Deutsch Eins' })).toBeInTheDocument()
+  })
+
+  it('treats "en" and "eng" as one language in the Language filter', async () => {
+    const { unmount } = renderAuthorDetailPage([
+      makeBook({ id: 1, title: 'Two Letter', status: 'imported', language: 'en' }),
+      makeBook({ id: 2, title: 'Three Letter', status: 'imported', language: 'eng' }),
+    ])
+    await screen.findByRole('heading', { name: 'Two Letter' })
+    // Both spellings are English, so there is nothing to choose between.
+    fireEvent.click(screen.getByRole('button', { name: /^Filters/ }))
+    expect(screen.queryByRole('radiogroup', { name: 'Language' })).toBeNull()
+    unmount()
+
+    renderAuthorDetailPage([
+      makeBook({ id: 1, title: 'Two Letter', status: 'imported', language: 'en' }),
+      makeBook({ id: 2, title: 'Three Letter', status: 'imported', language: 'eng' }),
+      makeBook({ id: 3, title: 'Deutsch', status: 'imported', language: 'de' }),
+    ])
+    await screen.findByRole('heading', { name: 'Two Letter' })
+    fireEvent.click(screen.getByRole('button', { name: /^Filters/ }))
+    expect(within(screen.getByRole('radiogroup', { name: 'Language' })).getAllByRole('radio').map(o => o.textContent?.replace('✓', ''))).toEqual(['All languages', 'English', 'German'])
+    setFilter('Language', 'eng')
+    expect(screen.getByRole('heading', { name: 'Two Letter' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Three Letter' })).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Deutsch' })).toBeNull()
+  })
+
+  it('shows a removable chip for each active filter and clears it', async () => {
+    renderAuthorDetailPage([
+      makeBook({ id: 1, title: 'English One', status: 'imported', language: 'eng', releaseDate: '2001-01-01T00:00:00Z' }),
+      makeBook({ id: 2, title: 'Deutsch Eins', status: 'imported', language: 'ger', mediaType: 'both', releaseDate: '2002-01-01T00:00:00Z' }),
+      makeBook({ id: 3, title: 'Future Book', status: 'wanted', language: 'ger', mediaType: 'both', monitored: false, releaseDate: '2999-01-01T00:00:00Z' }),
+    ])
+    await screen.findByRole('heading', { name: 'English One' })
+    setFilter('Type', 'ebook')
+    setFilter('Published', 'upcoming')
+    setFilter('Monitored', 'unmonitored')
+    setFilter('Language', 'ger')
+
+    const chipLabels = () =>
+      screen.getAllByText('Clear filter').map(x => x.closest('button')!.textContent!.replace('✕', '').replace('Clear filter', '').trim())
+    expect(chipLabels()).toEqual(['Ebook', 'Upcoming', 'Unmonitored', 'German'])
+    expect(screen.getByRole('heading', { name: 'Future Book' })).toBeInTheDocument()
+
+    for (let left = 4; left > 0; left--) {
+      fireEvent.click(screen.getAllByText('Clear filter')[0].closest('button')!)
+      if (left > 1) expect(chipLabels()).toHaveLength(left - 1)
+    }
+    expect(screen.queryByText('Clear filter')).toBeNull()
+    expect(screen.getByRole('heading', { name: 'English One' })).toBeInTheDocument()
+  })
+
+  it('selects and deselects every visible book from the table header', async () => {
+    renderAuthorDetailPage(
+      [
+        makeBook({ id: 1, title: 'Row One', status: 'wanted' }),
+        makeBook({ id: 2, title: 'Row Two', status: 'wanted' }),
+      ],
+      'table',
+    )
+    await screen.findByText('Row One')
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select all on this page' }))
+    expect(screen.getByRole('checkbox', { name: 'Select Row One' })).toBeChecked()
+    expect(screen.getByRole('checkbox', { name: 'Select Row Two' })).toBeChecked()
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select all on this page' }))
+    expect(screen.getByRole('checkbox', { name: 'Select Row One' })).not.toBeChecked()
   })
 
   it('keeps all four stat cells when a count is zero', async () => {
@@ -1195,12 +1667,38 @@ describe('AuthorDetailPage: manual refresh', () => {
     expect(vi.mocked(api.getAuthor).mock.calls.length).toBe(calls)
   })
 
-  it('gives up waiting after a minute and shows whatever the server has', async () => {
+  it('regroups by series after a refresh moves a book into one (#2554)', async () => {
+    // Grouped by series: before the refresh the book is in none, the refresh
+    // files it under one, and the page must regroup without a reload.
+    localStorage.setItem('bindery.group.author-detail.series', 'true')
+    const book = makeBook({ id: 7, title: 'Fjellvinden', status: 'imported' })
+    renderAuthorDetailPage([book], 'table')
+    await screen.findByRole('heading', { name: /Standalone/ })
+
+    vi.useFakeTimers()
+    const finishAt = Date.now() + 3000
+    const synced = () => Date.now() >= finishAt
+    vi.mocked(api.getAuthor).mockImplementation(async () => (synced() ? author : { ...author, syncInProgress: true }))
+    vi.mocked(api.listAuthorSeries).mockImplementation(async () => (synced()
+      ? [{ id: 3, foreignSeriesId: 's:3', title: 'Fjellserien', description: '', monitored: false, books: [{ seriesId: 3, bookId: 7, positionInSeries: '1' }] }]
+      : []))
+    vi.mocked(api.refreshAuthor).mockResolvedValue(undefined)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+    await advance(4000)
+    expect(screen.getByRole('heading', { name: /Fjellserien/ })).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: /Standalone/ })).toBeNull()
+  })
+
+  // Refresh frees its button after a minute, but a large catalogue outlasts
+  // that (#3058): the reload still sees the sync running, so the page keeps
+  // watching it and shows the result when it ends.
+  it('frees the button after a minute and keeps watching a longer sync', async () => {
     renderAuthorDetailPage(oldBooks, 'grid', { description: 'Old bio' })
     await screen.findByRole('heading', { name: 'Ancillary Justice' })
 
     vi.useFakeTimers()
-    serveSyncFinishingAt(Date.now() + 10 * 60 * 1000)
+    serveSyncFinishingAt(Date.now() + 3 * 60 * 1000)
     vi.mocked(api.refreshAuthor).mockResolvedValue(undefined)
 
     fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
@@ -1208,9 +1706,14 @@ describe('AuthorDetailPage: manual refresh', () => {
     expect(screen.getByRole('button', { name: 'Refreshing…' })).toBeDisabled()
     await advance(2000)
     expect(screen.getByRole('button', { name: 'Refresh' })).toBeEnabled()
+    expect(screen.getByRole('status')).toHaveTextContent('Fetching this author’s catalogue')
+
+    await advance(2 * 60 * 1000 + 10000)
+    expect(screen.getByRole('heading', { name: 'Translation State' })).toBeInTheDocument()
+    expect(screen.queryByRole('status')).toBeNull()
 
     const calls = vi.mocked(api.getAuthor).mock.calls.length
-    await advance(10000)
+    await advance(30000)
     expect(vi.mocked(api.getAuthor).mock.calls.length).toBe(calls)
   })
 
@@ -1316,7 +1819,7 @@ describe('AuthorDetailPage: manual refresh', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
     await advance(0)
-    fireEvent.change(screen.getByLabelText('Status'), { target: { value: 'excluded' } })
+    setFilter('Status', 'excluded')
     await advance(0)
 
     // The sync ends at 3 seconds; the poll at 4 seconds sees it and reloads.
@@ -1380,6 +1883,46 @@ describe('AuthorDetailPage — book link nav state (#2548, book side)', () => {
     fireEvent.click(link)
 
     await waitFor(() => expect(capturedState).toEqual({ ids: [10, 11], index: 1, hopDepth: 1 }))
+  })
+
+  // #3457: cleaning up a library meant leaving the author page to hunt for the
+  // series by name. The heading opens it on the Series page, the same state
+  // the Authors page and the header search hand over.
+  it('links a series heading to the Series page with that series open (#3457)', async () => {
+    vi.mocked(api.getAuthor).mockResolvedValue(author)
+    vi.mocked(api.listAllBooks).mockResolvedValue([
+      makeBook({ id: 10, title: 'Elantris', status: 'imported' }),
+      makeBook({ id: 11, title: 'The Final Empire', status: 'imported' }),
+    ])
+    vi.mocked(api.listAuthorSeries).mockResolvedValue([
+      { id: 7, foreignSeriesId: 'OL-MB', title: 'Mistborn', description: '', monitored: true, books: [{ seriesId: 7, bookId: 11, positionInSeries: '1' }] },
+    ])
+    localStorage.setItem('bindery.view.author-detail', 'table')
+
+    let path = ''
+    let capturedState: unknown
+    render(
+      <MemoryRouter initialEntries={['/author/42']}>
+        <LocationProbe onLocation={p => { path = p }} />
+        <StateProbe onState={s => { capturedState = s }} />
+        <Routes>
+          <Route path="/author/:id" element={<AuthorDetailPage />} />
+          <Route path="/series" element={<div>series page</div>} />
+        </Routes>
+      </MemoryRouter>,
+    )
+
+    await screen.findByText('Elantris')
+    fireEvent.click(screen.getByRole('switch', { name: 'Group by series' }))
+    // Standalone is not a series, so it stays plain text.
+    const standalone = await screen.findByRole('heading', { name: /Standalone/ })
+    expect(within(standalone).queryByRole('link')).toBeNull()
+
+    fireEvent.click(within(screen.getByRole('heading', { name: /Mistborn/ })).getByRole('link', { name: 'Mistborn' }))
+
+    await screen.findByText('series page')
+    expect(path).toBe('/series')
+    expect(capturedState).toEqual({ seriesId: 7 })
   })
 
   it('follows the seriesGroups order for the nav chain when Group by series is on', async () => {
@@ -1470,5 +2013,410 @@ describe('AuthorDetailPage — book link nav state (#2548, book side)', () => {
     fireEvent.click(row)
 
     await waitFor(() => expect(capturedState).toEqual({ ids: [11, 10], index: 0, hopDepth: 1 }))
+  })
+})
+
+// #2457: a bulk action used to clear the selection, so running two actions on
+// the same books meant picking them all again. #2456: while picking, a click
+// that missed the small checkbox opened the book and threw the selection away.
+describe('AuthorDetailPage — selection (#2456, #2457)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    installLocalStorageMock()
+    vi.mocked(api.listAuthorSeries).mockResolvedValue([])
+  })
+
+  function checkboxFor(title: string): HTMLInputElement {
+    return screen.getByRole('checkbox', { name: `Select ${title}` }) as HTMLInputElement
+  }
+
+  it('keeps the selection after a bulk action so a second action reuses it (#2457)', async () => {
+    vi.mocked(api.bulkActionBooks).mockResolvedValue({
+      results: { '501': { ok: true }, '502': { ok: true } },
+    })
+    renderAuthorDetailPage(
+      [
+        makeBook({ id: 501, title: 'Keep One', status: 'wanted' }),
+        makeBook({ id: 502, title: 'Keep Two', status: 'wanted' }),
+        makeBook({ id: 503, title: 'Not Picked', status: 'wanted' }),
+      ],
+      'table',
+    )
+    await screen.findByText('Keep One')
+    fireEvent.click(checkboxFor('Keep One'))
+    fireEvent.click(checkboxFor('Keep Two'))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Unmonitor' }))
+    await waitFor(() => expect(api.bulkActionBooks).toHaveBeenCalledWith([501, 502], 'unmonitor', undefined))
+    // Wait for the post-action reload, which is where the clear used to land.
+    await waitFor(() => expect(api.listAllBooks).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Monitor' })).not.toBeNull())
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Monitor' })).not.toBeDisabled())
+
+    expect(checkboxFor('Keep One')).toBeChecked()
+    expect(checkboxFor('Keep Two')).toBeChecked()
+    expect(checkboxFor('Not Picked')).not.toBeChecked()
+    expect(screen.getByText('2 selected')).toBeInTheDocument()
+
+    clickBulkAction('Both')
+    await waitFor(() => expect(api.bulkActionBooks).toHaveBeenLastCalledWith([501, 502], 'set_media_type', 'both'))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Clear' })).not.toBeDisabled())
+
+    // Clear is still the way out.
+    fireEvent.click(screen.getByRole('button', { name: 'Clear' }))
+    expect(screen.queryByText(/selected$/)).toBeNull()
+  })
+
+  it('drops deleted books from the selection and never sends them again (#2457)', async () => {
+    vi.mocked(api.bulkActionBooks).mockResolvedValueOnce({
+      results: { '601': { ok: true }, '602': { ok: false, error: 'locked' } },
+    })
+    renderAuthorDetailPage(
+      [
+        makeBook({ id: 601, title: 'Gone Book', status: 'wanted' }),
+        makeBook({ id: 602, title: 'Stuck Book', status: 'wanted' }),
+        makeBook({ id: 603, title: 'Other Book', status: 'wanted' }),
+      ],
+      'table',
+    )
+    await screen.findByText('Gone Book')
+    // After the delete the server no longer returns 601.
+    vi.mocked(api.listAllBooks).mockResolvedValue([
+      makeBook({ id: 602, title: 'Stuck Book', status: 'wanted' }),
+      makeBook({ id: 603, title: 'Other Book', status: 'wanted' }),
+    ])
+    fireEvent.click(checkboxFor('Gone Book'))
+    fireEvent.click(checkboxFor('Stuck Book'))
+
+    clickBulkAction('Delete', 'menu')
+    expect(within(await screen.findByTestId('confirm-dialog')).getByText(/Delete 2 book/)).toBeInTheDocument()
+    await acceptConfirm()
+    await waitFor(() => expect(api.bulkActionBooks).toHaveBeenCalledWith([601, 602], 'delete', undefined))
+    await waitFor(() => expect(screen.queryByText('Gone Book')).toBeNull())
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Clear' })).not.toBeDisabled())
+
+    // The book that failed to delete is still picked, so retrying is one click.
+    expect(checkboxFor('Stuck Book')).toBeChecked()
+    expect(screen.getByText('1 selected')).toBeInTheDocument()
+
+    vi.mocked(api.bulkActionBooks).mockResolvedValueOnce({ results: { '602': { ok: true } } })
+    clickBulkAction('Delete', 'menu')
+    expect(within(await screen.findByTestId('confirm-dialog')).getByText(/Delete 1 book/)).toBeInTheDocument()
+    await acceptConfirm()
+    await waitFor(() => expect(api.bulkActionBooks).toHaveBeenLastCalledWith([602], 'delete', undefined))
+  })
+
+  it('drops deleted books from the selection even when the reload fails (#2457)', async () => {
+    vi.mocked(api.bulkActionBooks).mockResolvedValue({
+      results: { '701': { ok: true } },
+    })
+    renderAuthorDetailPage(
+      [
+        makeBook({ id: 701, title: 'Doomed Book', status: 'wanted' }),
+        makeBook({ id: 702, title: 'Bystander', status: 'wanted' }),
+      ],
+      'table',
+    )
+    await screen.findByText('Doomed Book')
+    vi.mocked(api.listAllBooks).mockRejectedValue(new Error('offline'))
+    fireEvent.click(checkboxFor('Doomed Book'))
+
+    clickBulkAction('Delete', 'menu')
+    await acceptConfirm()
+    await waitFor(() => expect(api.bulkActionBooks).toHaveBeenCalledWith([701], 'delete', undefined))
+    // The stale row is still on screen, but it must not stay selected: a
+    // second action would send an id the server already deleted.
+    await waitFor(() => expect(screen.queryByText(/selected$/)).toBeNull())
+    expect(checkboxFor('Doomed Book')).not.toBeChecked()
+  })
+
+  it('toggles a grid card on click while a selection exists, and opens it otherwise (#2456)', async () => {
+    let seen = ''
+    renderAuthorDetailPage(
+      [
+        makeBook({ id: 801, title: 'First Card', status: 'wanted' }),
+        makeBook({ id: 802, title: 'Second Card', status: 'wanted' }),
+      ],
+      'grid',
+      {},
+      '/author/42',
+      loc => { seen = loc },
+    )
+    const second = await screen.findByRole('heading', { name: 'Second Card' })
+    fireEvent.click(checkboxFor('First Card'))
+
+    // Anywhere on the card (here the title, well away from the checkbox)
+    // adds it to the selection instead of opening the book.
+    fireEvent.click(second)
+    expect(checkboxFor('Second Card')).toBeChecked()
+    expect(seen).toBe('/author/42')
+
+    // And a second click takes it back out.
+    fireEvent.click(second)
+    expect(checkboxFor('Second Card')).not.toBeChecked()
+
+    // Ctrl-click is the browser's open-in-new-tab gesture; leave it alone.
+    fireEvent.click(second, { ctrlKey: true })
+    expect(checkboxFor('Second Card')).not.toBeChecked()
+
+    // With nothing selected, a click opens the book exactly as before.
+    fireEvent.click(checkboxFor('First Card'))
+    fireEvent.click(second)
+    await waitFor(() => expect(seen).toBe('/book/802'))
+  })
+
+  it('toggles a table row on click while a selection exists (#2456)', async () => {
+    let seen = ''
+    renderAuthorDetailPage(
+      [
+        makeBook({ id: 901, title: 'Row One', status: 'wanted' }),
+        makeBook({ id: 902, title: 'Row Two', status: 'wanted' }),
+      ],
+      'table',
+      {},
+      '/author/42',
+      loc => { seen = loc },
+    )
+    await screen.findByText('Row One')
+    fireEvent.click(checkboxFor('Row One'))
+
+    // The title link inside the row and the bare row both toggle.
+    fireEvent.click(screen.getByText('Row Two'))
+    expect(checkboxFor('Row Two')).toBeChecked()
+    fireEvent.click(rowForTitle('Row Two'))
+    expect(checkboxFor('Row Two')).not.toBeChecked()
+    expect(seen).toBe('/author/42')
+
+    fireEvent.click(checkboxFor('Row One'))
+    fireEvent.click(rowForTitle('Row Two'))
+    await waitFor(() => expect(seen).toBe('/book/902'))
+  })
+})
+
+// An author whose catalogue sync is still running when the page opens, which
+// is every author straight after an add, must not read as having no books
+// (#3058).
+describe('AuthorDetailPage: sync running on load', () => {
+  const books = [makeBook({ id: 1, title: 'Fjellvinden', status: 'wanted' })]
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    installLocalStorageMock()
+    vi.mocked(api.listAuthorSeries).mockResolvedValue([])
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  // One act per second, so React renders between ticks as it does in a
+  // browser (a single long act batches every update to its end).
+  async function advance(ms: number) {
+    for (let left = ms; left > 0; left -= 1000) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(Math.min(1000, left))
+      })
+    }
+  }
+
+  // Serves the author as syncing with no books until finishAt, then synced
+  // with the books it found.
+  function serveSyncFinishingAt(finishAt: number, found: Book[]) {
+    const synced = () => Date.now() >= finishAt
+    vi.mocked(api.getAuthor).mockImplementation(async () => ({ ...author, syncInProgress: !synced() }))
+    vi.mocked(api.listAllBooks).mockImplementation(async () => (synced() ? found : []))
+  }
+
+  function renderPage() {
+    return render(
+      <MemoryRouter initialEntries={['/author/42']}>
+        <Routes>
+          <Route path="/author/:id" element={<AuthorDetailPage />} />
+        </Routes>
+      </MemoryRouter>,
+    )
+  }
+
+  it('shows the sync instead of the empty state, then the books when it ends', async () => {
+    serveSyncFinishingAt(Date.now() + 5 * 60 * 1000, books)
+    renderPage()
+
+    expect(await screen.findByRole('status')).toHaveTextContent('Fetching this author’s catalogue')
+    expect(screen.queryByText('No books tracked for this author yet.')).toBeNull()
+
+    // No time limit: a catalogue that takes five minutes is still picked up.
+    await advance(5 * 60 * 1000 + 10000)
+    expect(screen.getByRole('heading', { name: 'Fjellvinden' })).toBeInTheDocument()
+    expect(screen.queryByRole('status')).toBeNull()
+
+    const calls = vi.mocked(api.getAuthor).mock.calls.length
+    await advance(30000)
+    expect(vi.mocked(api.getAuthor).mock.calls.length).toBe(calls)
+  })
+
+  it('backs off to one poll every ten seconds', async () => {
+    serveSyncFinishingAt(Date.now() + 60 * 60 * 1000, books)
+    renderPage()
+    await screen.findByRole('status')
+
+    await advance(2 * 60 * 1000)
+    const before = vi.mocked(api.getAuthor).mock.calls.length
+    await advance(60 * 1000)
+    expect(vi.mocked(api.getAuthor).mock.calls.length - before).toBe(6)
+  })
+
+  it('keeps polling through a failed poll', async () => {
+    serveSyncFinishingAt(Date.now() + 5000, books)
+    vi.mocked(api.getAuthor)
+      .mockResolvedValueOnce({ ...author, syncInProgress: true })
+      .mockRejectedValueOnce(new Error('network'))
+    renderPage()
+    await screen.findByRole('status')
+
+    await advance(15000)
+    expect(screen.getByRole('heading', { name: 'Fjellvinden' })).toBeInTheDocument()
+  })
+
+  it('shows the empty state once a sync ends having found nothing', async () => {
+    serveSyncFinishingAt(Date.now() + 1000, [])
+    renderPage()
+    await screen.findByRole('status')
+
+    await advance(3000)
+    expect(screen.getByText('No books tracked for this author yet.')).toBeInTheDocument()
+    expect(screen.queryByRole('status')).toBeNull()
+  })
+
+  it('keeps the spinner a circle on a narrow screen (shrink-0)', async () => {
+    serveSyncFinishingAt(Date.now() + 60 * 1000, books)
+    renderPage()
+    const status = await screen.findByRole('status')
+    expect(status.querySelector('span[aria-hidden="true"]')).toHaveClass('shrink-0')
+  })
+
+  it('keeps polling when the reload after the sync ends fails, until one succeeds', async () => {
+    // Poll 1 sees the sync end; the next two getAuthor calls (the reload) fail.
+    let calls = 0
+    vi.mocked(api.getAuthor).mockImplementation(async () => {
+      calls++
+      if (calls === 1) return { ...author, syncInProgress: true }
+      if (calls === 2) return { ...author, syncInProgress: false }
+      if (calls <= 4) throw new Error('boom')
+      return { ...author, syncInProgress: false }
+    })
+    vi.mocked(api.listAllBooks).mockResolvedValue(books)
+    renderPage()
+    await screen.findByRole('status')
+
+    await advance(60 * 1000)
+    expect(screen.getByRole('heading', { name: 'Fjellvinden' })).toBeInTheDocument()
+    expect(screen.queryByRole('status')).toBeNull()
+    expect(screen.queryByText('boom')).toBeNull()
+  })
+
+  it('gives up after a few failed reloads: the error shows, the fetching state does not, polling stops', async () => {
+    let calls = 0
+    vi.mocked(api.getAuthor).mockImplementation(async () => {
+      calls++
+      if (calls === 1) return { ...author, syncInProgress: true }
+      if (calls % 2 === 0) return { ...author, syncInProgress: false }
+      throw new Error('boom')
+    })
+    vi.mocked(api.listAllBooks).mockResolvedValue(books)
+    renderPage()
+    await screen.findByRole('status')
+
+    await advance(5 * 60 * 1000)
+    expect(screen.getByText('boom')).toBeInTheDocument()
+    expect(screen.queryByRole('status')).toBeNull()
+    const seen = vi.mocked(api.getAuthor).mock.calls.length
+    await advance(60 * 1000)
+    expect(vi.mocked(api.getAuthor).mock.calls.length).toBe(seen)
+  })
+
+  it('gives up after a few failed polls in a row', async () => {
+    vi.mocked(api.getAuthor)
+      .mockResolvedValueOnce({ ...author, syncInProgress: true })
+      .mockRejectedValue(new Error('network'))
+    vi.mocked(api.listAllBooks).mockResolvedValue([])
+    renderPage()
+    await screen.findByRole('status')
+
+    await advance(5 * 60 * 1000)
+    expect(screen.queryByRole('status')).toBeNull()
+    const seen = vi.mocked(api.getAuthor).mock.calls.length
+    expect(seen).toBe(4)
+    await advance(60 * 1000)
+    expect(vi.mocked(api.getAuthor).mock.calls.length).toBe(seen)
+  })
+
+  it.each([404, 403])('stops at once on a %i: the author is gone or not this user\'s', async status => {
+    vi.mocked(api.getAuthor)
+      .mockResolvedValueOnce({ ...author, syncInProgress: true })
+      .mockRejectedValue(new ApiError(status, { error: 'nope' }, 'Not Found'))
+    vi.mocked(api.listAllBooks).mockResolvedValue([])
+    renderPage()
+    await screen.findByRole('status')
+
+    await advance(3000)
+    expect(screen.queryByRole('status')).toBeNull()
+    const seen = vi.mocked(api.getAuthor).mock.calls.length
+    expect(seen).toBe(2)
+    await advance(60 * 1000)
+    expect(vi.mocked(api.getAuthor).mock.calls.length).toBe(seen)
+  })
+
+  describe('in a hidden tab', () => {
+    function setHidden(hidden: boolean) {
+      Object.defineProperty(document, 'hidden', { configurable: true, get: () => hidden })
+      document.dispatchEvent(new Event('visibilitychange'))
+    }
+    afterEach(() => { Reflect.deleteProperty(document, 'hidden') })
+
+    it('stops polling while hidden and catches up when the tab returns (#2360)', async () => {
+      serveSyncFinishingAt(Date.now() + 60 * 60 * 1000, books)
+      renderPage()
+      await screen.findByRole('status')
+
+      await act(async () => { setHidden(true) })
+      const hiddenAt = vi.mocked(api.getAuthor).mock.calls.length
+      await advance(2 * 60 * 1000)
+      expect(vi.mocked(api.getAuthor).mock.calls.length).toBe(hiddenAt)
+
+      await act(async () => { setHidden(false) })
+      expect(vi.mocked(api.getAuthor).mock.calls.length).toBe(hiddenAt + 1)
+    })
+  })
+
+  it('says books appear when it finishes only while there are none yet', async () => {
+    serveSyncFinishingAt(Date.now() + 60 * 1000, books)
+    renderPage()
+    expect(await screen.findByRole('status')).toHaveTextContent('Books appear here when it finishes')
+
+    // A scheduled refresh over an author who already has books.
+    vi.mocked(api.getAuthor).mockImplementation(async () => ({ ...author, syncInProgress: true }))
+    vi.mocked(api.listAllBooks).mockImplementation(async () => books)
+    cleanup()
+    renderPage()
+    await screen.findByRole('heading', { name: 'Fjellvinden' })
+    expect(screen.getByRole('status')).not.toHaveTextContent('Books appear here when it finishes')
+    expect(screen.getByRole('status')).toHaveTextContent('Fetching this author’s catalogue')
+  })
+})
+
+describe('AuthorDetailPage on a phone', () => {
+  it('folds Refresh and Edit into More so the action row stays on one line', async () => {
+    const restore = mockMatchMedia(q => q.includes('40rem'))
+    try {
+      renderAuthorDetailPage([makeBook({ id: 1, title: 'A', status: 'imported' })])
+      await screen.findByRole('heading', { name: 'A' })
+      expect(screen.queryByRole('button', { name: 'Edit' })).toBeNull()
+      fireEvent.click(screen.getByRole('button', { name: /^More/ }))
+      expect(screen.getByRole('menuitem', { name: 'Edit' })).toBeInTheDocument()
+      expect(screen.getByRole('menuitem', { name: 'Refresh' })).toBeInTheDocument()
+    } finally {
+      restore()
+    }
   })
 })

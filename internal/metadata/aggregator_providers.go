@@ -1,12 +1,13 @@
 package metadata
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/vavallee/bindery/internal/models"
 )
 
-func (a *Aggregator) providerForForeignID(foreignID string) Provider {
+func (a *aggregatorCore) providerForForeignID(foreignID string) Provider {
 	if a == nil {
 		return nil
 	}
@@ -67,7 +68,7 @@ func normalizedProviderName(name string) string {
 	}
 }
 
-func (a *Aggregator) providers() []Provider {
+func (a *aggregatorCore) providers() []Provider {
 	if a == nil {
 		return nil
 	}
@@ -79,13 +80,29 @@ func (a *Aggregator) providers() []Provider {
 	return providers
 }
 
+// providerSetKey identifies this core's provider set: every provider instance,
+// in the order the core asks them, primary first. A cache entry whose value
+// depends on more than one provider's answer (series search tries each in
+// turn) carries it, so an entry written under one primary is never served
+// after Reconfigure installs another. Instances are compared by address,
+// which is stable because cmd/bindery reuses the same client objects across
+// reconfigurations rather than rebuilding them.
+func (a *aggregatorCore) providerSetKey() string {
+	var b strings.Builder
+	for _, p := range a.providers() {
+		fmt.Fprintf(&b, "%T:%p;", p, p)
+	}
+	return b.String()
+}
+
 // PrimaryProviderName returns the normalized name of the provider wired as
 // primary ("openlibrary", "hardcover", ...), or "" when there is none. The
-// primary is fixed at boot (cmd/bindery), so this names the provider that
-// serves catalogue syncs for records carrying no other provider's prefix.
+// primary follows metadata.primary_provider (Reconfigure, #1771), so this
+// names the provider that serves catalogue syncs for records carrying no
+// other provider's prefix at the moment of the call.
 // Exported so the API layer can tell when a record being linked will sync
 // from somewhere other than the configured primary (#2237).
-func (a *Aggregator) PrimaryProviderName() string {
+func (a *aggregatorCore) PrimaryProviderName() string {
 	if a == nil {
 		return ""
 	}

@@ -425,6 +425,11 @@ func (i *Importer) runLibrary(ctx context.Context, cfg ImportConfig, authorMatch
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if i.meta != nil {
+			if err := i.meta.CheckQuota(ctx); err != nil {
+				return err
+			}
+		}
 		i.setProgress(func(p *ImportProgress) {
 			p.Message = importItemMessage(cfg.DryRun, firstNonEmpty(item.Title, item.ItemID))
 		})
@@ -437,6 +442,11 @@ func (i *Importer) runLibrary(ctx context.Context, cfg ImportConfig, authorMatch
 		result := i.importOne(itemCtx, cfg, run.ID, item, totalStats, allowImmediateImport(item), authorMatcher)
 		itemErr := itemCtx.Err()
 		cancelItem()
+		if i.meta != nil {
+			if err := i.meta.CheckQuota(ctx); err != nil {
+				return err
+			}
+		}
 		if err := ctx.Err(); err != nil {
 			// The run itself was cancelled (shutdown) while this item was in
 			// flight. Returning here, before the enumerator records the item
@@ -819,12 +829,21 @@ func (i *Importer) enrichAudiobookFromASIN(ctx context.Context, book *models.Boo
 	if book.MediaType != models.MediaTypeAudiobook && book.MediaType != models.MediaTypeBoth {
 		return
 	}
+	// Guard the write on the row as it was before the Audnex call, so an edit
+	// made during the call wins (#2926), as hydration does (#2758).
+	expectedUpdatedAt := book.UpdatedAtRaw
 	if err := i.meta.EnrichAudiobook(ctx, book); err != nil {
 		slog.Debug("abs import: audnex enrichment skipped", "bookID", book.ID, "asin", book.ASIN, "error", err)
 		return
 	}
-	if err := i.books.Update(ctx, book); err != nil {
+	updated, err := i.books.UpdateHydratedMetadata(ctx, book, expectedUpdatedAt)
+	if err != nil {
 		slog.Warn("abs import: persisting audnex enrichment failed", "bookID", book.ID, "asin", book.ASIN, "error", err)
+		return
+	}
+	if !updated {
+		// book now holds the concurrent edit; the rest of the import uses it.
+		slog.Debug("abs import: audnex enrichment discarded after concurrent book update", "bookID", book.ID, "asin", book.ASIN)
 	}
 }
 

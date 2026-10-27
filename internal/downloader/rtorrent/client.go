@@ -116,9 +116,13 @@ func New(host string, port int, username, password, urlBase string, useSSL bool)
 	}
 
 	c := &Client{
-		username:       username,
-		password:       password,
-		http:           &http.Client{Timeout: rpcTimeout},
+		username: username,
+		password: password,
+		// Control client: dialled directly (never via BINDERY_OUTBOUND_PROXY)
+		// with the dial checked so a rebound hostname cannot reach a
+		// link-local or metadata address. Redirects are pinned to the RPC
+		// target by checkRedirect below.
+		http:           &http.Client{Timeout: rpcTimeout, Transport: httpsec.DirectGuardedTransport(httpsec.PolicyService)},
 		fetchTransport: httpsec.GuardedTransport(httpsec.DownloadFetchPolicy()),
 		pollInterval:   addPollInterval,
 	}
@@ -784,11 +788,11 @@ func (c *Client) fetchTorrentContent(ctx context.Context, rawURL string) (*fetch
 	current := rawURL
 	for redirects := 0; redirects <= 5; redirects++ {
 		if err := c.validateTorrentFetchURL(current); err != nil {
-			return nil, fmt.Errorf("fetch torrent: %w", err)
+			return nil, fmt.Errorf("fetch torrent: %w", httpsec.RedactURLError(err))
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, current, nil)
 		if err != nil {
-			return nil, fmt.Errorf("fetch torrent: %w", err)
+			return nil, fmt.Errorf("fetch torrent: %w", httpsec.RedactURLError(err))
 		}
 		req.Header.Set("Accept", "application/x-bittorrent")
 		// Some indexers serve an anti-bot 403 to Go's default UA (#1053).
@@ -813,7 +817,7 @@ func (c *Client) fetchTorrentContent(ctx context.Context, rawURL string) (*fetch
 			}
 			next, err := req.URL.Parse(location)
 			if err != nil {
-				return nil, fmt.Errorf("fetch torrent: invalid redirect location: %w", err)
+				return nil, fmt.Errorf("fetch torrent: invalid redirect location: %w", httpsec.RedactURLError(err))
 			}
 			if next.Scheme != "http" && next.Scheme != "https" {
 				return nil, fmt.Errorf("fetch torrent: unsupported redirect scheme %q", next.Scheme)
@@ -829,7 +833,7 @@ func (c *Client) fetchTorrentContent(ctx context.Context, rawURL string) (*fetch
 		}
 		data, err := io.ReadAll(io.LimitReader(resp.Body, maxTorrentFileBytes+1))
 		if err != nil {
-			return nil, fmt.Errorf("fetch torrent: %w", err)
+			return nil, fmt.Errorf("fetch torrent: %w", httpsec.RedactURLError(err))
 		}
 		if int64(len(data)) > maxTorrentFileBytes {
 			return nil, fmt.Errorf("fetch torrent: response exceeds %d bytes", maxTorrentFileBytes)

@@ -2,7 +2,11 @@ package db
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -186,4 +190,241 @@ func TestLogSlogHandler_DropsOnFullChannel(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("handler blocked — should be non-blocking")
 	}
+}
+
+// sendPaced feeds n numbered records through Handle without ever overflowing
+// the 512 slot channel, so a test can reason about exact row counts.
+func sendPaced(t *testing.T, h *LogHandler, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		for len(h.ch) > logHandlerBufSize/2 {
+			time.Sleep(time.Millisecond)
+		}
+		rec := slog.NewRecord(time.Now(), slog.LevelInfo, fmt.Sprintf("m-%04d", i), 0)
+		if err := h.Handle(context.Background(), rec); err != nil {
+			t.Fatalf("Handle: %v", err)
+		}
+	}
+}
+
+func stopHandler(t *testing.T, h *LogHandler) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := h.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func openLogTestDB(t *testing.T) *LogRepo {
+	t.Helper()
+	database, err := OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	return NewLogRepo(database)
+}
+
+func countLogs(t *testing.T, repo *LogRepo, where string) int {
+	t.Helper()
+	var n int
+	if err := repo.db.QueryRow(`SELECT COUNT(*) FROM logs ` + where).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// 1,000 records must cost a bounded number of transactions, not 1,000.
+func TestLogHandler_BatchesIntoFewTransactions(t *testing.T) {
+	repo := openLogTestDB(t)
+	// maxWait is long so only the row limit closes batches: the count is exact.
+	h := newLogHandler(repo, slog.LevelDebug, 100, time.Minute)
+
+	sendPaced(t, h, 1000)
+	stopHandler(t, h)
+
+	if n := countLogs(t, repo, ""); n != 1000 {
+		t.Fatalf("persisted %d rows, want 1000", n)
+	}
+	// One transaction per 100 rows; allow slack for how the tail splits, but it
+	// must stay far below one per record.
+	if got := h.batches.Load(); got < 10 || got > 20 {
+		t.Errorf("1000 records took %d transactions, want 10 to 20", got)
+	}
+}
+
+// Rows land in the order they were logged.
+func TestLogHandler_PreservesOrder(t *testing.T) {
+	repo := openLogTestDB(t)
+	h := newLogHandler(repo, slog.LevelDebug, 7, time.Minute)
+
+	sendPaced(t, h, 250)
+	stopHandler(t, h)
+
+	rows, err := repo.db.Query(`SELECT message FROM logs ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	i := 0
+	for rows.Next() {
+		var m string
+		if err := rows.Scan(&m); err != nil {
+			t.Fatal(err)
+		}
+		if want := fmt.Sprintf("m-%04d", i); m != want {
+			t.Fatalf("row %d is %q, want %q", i, m, want)
+		}
+		i++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if i != 250 {
+		t.Fatalf("got %d rows, want 250", i)
+	}
+}
+
+// A partial batch is flushed by Stop even though neither limit was reached.
+func TestLogHandler_StopFlushesPartialBatch(t *testing.T) {
+	repo := openLogTestDB(t)
+	h := newLogHandler(repo, slog.LevelDebug, 100, time.Hour)
+
+	sendPaced(t, h, 5)
+	stopHandler(t, h)
+
+	if n := countLogs(t, repo, ""); n != 5 {
+		t.Errorf("Stop left %d rows, want 5", n)
+	}
+}
+
+// The wait limit writes a small batch without Stop or a full buffer.
+func TestLogHandler_FlushesAfterMaxWait(t *testing.T) {
+	repo := openLogTestDB(t)
+	h := newLogHandler(repo, slog.LevelDebug, 100, 40*time.Millisecond)
+	defer stopHandler(t, h)
+
+	sendPaced(t, h, 3)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		n := countLogs(t, repo, "")
+		if n == 3 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d of 3 rows written after 3s with a 40ms wait limit", n)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// While a batch is waiting to fill, the single pooled connection must stay
+// free for everyone else.
+func TestLogHandler_DoesNotHoldConnectionWhileWaiting(t *testing.T) {
+	repo := openLogTestDB(t)
+	h := newLogHandler(repo, slog.LevelDebug, 100, time.Hour)
+	defer stopHandler(t, h)
+
+	sendPaced(t, h, 1)
+	time.Sleep(50 * time.Millisecond) // let drain take the entry and start waiting
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	var one int
+	if err := repo.db.QueryRowContext(ctx, `SELECT 1`).Scan(&one); err != nil {
+		t.Fatalf("connection busy while the batch waits: %v", err)
+	}
+}
+
+// A row the database rejects must not take the rest of its batch with it, and
+// the failure is reported once on stderr.
+func TestLogHandler_FailedBatchIsSalvagedAndReportedOnce(t *testing.T) {
+	repo := openLogTestDB(t)
+	if _, err := repo.db.Exec(`CREATE TRIGGER reject_bad BEFORE INSERT ON logs
+		WHEN NEW.message LIKE 'bad%' BEGIN SELECT RAISE(ABORT, 'rejected'); END`); err != nil {
+		t.Fatal(err)
+	}
+	var buf lockedBuffer
+	old := logStderr
+	logStderr = &buf
+	defer func() { logStderr = old }()
+
+	// Two batches of five, each with one rejected row: eight rows must be
+	// salvaged, and the two failures are one run, so one report.
+	h := newLogHandler(repo, slog.LevelDebug, 5, time.Minute)
+	for _, m := range []string{"ok-1", "bad-1", "ok-2", "ok-3", "ok-4", "bad-2", "ok-5", "ok-6", "ok-7", "ok-8"} {
+		rec := slog.NewRecord(time.Now(), slog.LevelInfo, m, 0)
+		_ = h.Handle(context.Background(), rec)
+	}
+	stopHandler(t, h)
+
+	if n := countLogs(t, repo, `WHERE message LIKE 'ok-%'`); n != 8 {
+		t.Errorf("salvaged %d good rows, want 8", n)
+	}
+	out := buf.String()
+	if strings.Count(out, "log writer dropped") != 1 {
+		t.Errorf("want exactly one stderr report, got %q", out)
+	}
+	if !strings.Contains(out, "dropped 1 of 5") {
+		t.Errorf("report should say 1 of 5 was lost: %q", out)
+	}
+}
+
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+// BenchmarkLogWrite compares the old write path (one autocommit per record)
+// with the batched one (InsertBatch, 100 per transaction) on a file backed
+// database with the production pragmas. ns/op is per record.
+func BenchmarkLogWrite(b *testing.B) {
+	entry := LogEntry{
+		TS: time.Now(), Level: "INFO", Component: "bench", Message: "a representative log line",
+		Fields: map[string]string{"method": "GET", "path": "/api/v1/books", "status": "200"},
+	}
+	open := func(b *testing.B) *LogRepo {
+		b.Helper()
+		database, err := Open(filepath.Join(b.TempDir(), "bench.db"))
+		if err != nil {
+			b.Fatal(err)
+		}
+		b.Cleanup(func() { _ = database.Close() })
+		return NewLogRepo(database)
+	}
+	b.Run("autocommit_per_row", func(b *testing.B) {
+		repo := open(b)
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if err := repo.Insert(context.Background(), entry); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("batched_100", func(b *testing.B) {
+		repo := open(b)
+		batch := make([]LogEntry, 100)
+		for i := range batch {
+			batch[i] = entry
+		}
+		b.ResetTimer()
+		for i := 0; i < b.N; i += len(batch) {
+			if err := repo.InsertBatch(context.Background(), batch); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }

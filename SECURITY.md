@@ -70,7 +70,9 @@ CSP, cookie Secure auto-detect, container hardening, CI scans).
 ## Security controls currently in place
 
 - **Authentication**: API key + signed session cookie + argon2id passwords
-  (OWASP 2024 parameters) + per-IP login rate limit.
+  (OWASP 2024 parameters) + per-IP login rate limit. Logout revokes the
+  presented session server side, and at most four password hashes run at
+  once so a login flood queues rather than exhausting memory.
 - **SSRF**: outbound URLs for webhooks, indexers, and download clients pass
   through `internal/httpsec.ValidateOutboundURL` with policy-based blocking
   of loopback, link-local, cloud-metadata endpoints, and (for webhooks)
@@ -92,8 +94,11 @@ CSP, cookie Secure auto-detect, container hardening, CI scans).
   Hadolint, Grype, Syft SBOM, ZAP baseline, OpenSSF Scorecard, Checkov,
   helm-unittest — SARIF uploaded to the Security tab; weekly rerun on a cron.
 - **Supply chain**: SLSA build provenance via
-  `actions/attest-build-provenance`, verifiable with
-  `gh attestation verify`.
+  `actions/attest-build-provenance` for both the container image and the
+  release archives (plus their checksums file), verifiable with
+  `gh attestation verify <file> --repo vavallee/bindery`. From v1.40.1 the
+  archive attestation is also a release asset, `bindery_<version>.intoto.jsonl`,
+  usable with `--bundle` instead of the attestations API.
 
 ## Secrets
 

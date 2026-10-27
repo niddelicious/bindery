@@ -47,7 +47,7 @@ func TestSearchBookWithOutcomes_UsesOutcomesWhenAvailable(t *testing.T) {
 	}
 	s := &Scheduler{searcher: stub}
 
-	results, outcomes := s.searchBookWithOutcomes(context.Background(), nil, indexer.MatchCriteria{})
+	results, outcomes, _ := s.searchBookWithOutcomes(context.Background(), nil, indexer.MatchCriteria{})
 
 	if len(results) != 1 {
 		t.Errorf("results = %d, want 1", len(results))
@@ -64,7 +64,7 @@ func TestSearchBookWithOutcomes_FallsBackToPlainSearcher(t *testing.T) {
 	stub := &plainSearcherStub{}
 	s := &Scheduler{searcher: stub}
 
-	_, outcomes := s.searchBookWithOutcomes(context.Background(), nil, indexer.MatchCriteria{})
+	_, outcomes, _ := s.searchBookWithOutcomes(context.Background(), nil, indexer.MatchCriteria{})
 
 	if !stub.called {
 		t.Error("plain SearchBook was not called")
@@ -145,5 +145,33 @@ func TestHardFailures_IgnoresStaleErrorOnSkippedEntry(t *testing.T) {
 	}
 	if failed := indexer.HardFailures(outcomes); len(failed) != 0 {
 		t.Errorf("HardFailures = %+v, want none", failed)
+	}
+}
+
+// debugStub answers SearchBookWithDebug the way the real searcher does for a
+// search that dropped a release: one kept result and the dropped one in the
+// side field (#2334).
+type debugStub struct{ plainSearcherStub }
+
+func (debugStub) SearchBookWithDebug(context.Context, []models.Indexer, indexer.MatchCriteria) ([]newznab.SearchResult, *indexer.SearchDebug) {
+	return []newznab.SearchResult{{GUID: "kept", Title: "kept"}}, &indexer.SearchDebug{
+		Dropped: []indexer.DroppedRelease{{Result: newznab.SearchResult{GUID: "dropped", NZBURL: "https://x/dl?apikey=K"}, Stage: indexer.StageRelevance}},
+	}
+}
+
+// Auto-grab never sees a release the relevance or language filter dropped
+// (#2334): the results it acts on are the kept ones, and the audit trail the
+// scheduler files in the debug log does not hold the dropped releases' raw
+// download URLs.
+func TestSearchBookWithOutcomes_NeverCarriesDroppedReleases(t *testing.T) {
+	s := &Scheduler{searcher: &debugStub{}, debugLog: indexer.NewDebugLog()}
+
+	results, _, dbg := s.searchBookWithOutcomes(context.Background(), nil, indexer.MatchCriteria{})
+
+	if len(results) != 1 || results[0].GUID != "kept" {
+		t.Errorf("results = %+v, want only the kept release", results)
+	}
+	if dbg == nil || len(dbg.Dropped) != 0 {
+		t.Errorf("the scheduler's trail keeps dropped releases: %+v", dbg)
 	}
 }

@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/vavallee/bindery/internal/auth"
 	"github.com/vavallee/bindery/internal/db"
@@ -34,7 +35,7 @@ func fileFixture(t *testing.T) (*FileHandler, *db.BookRepo, *models.Author, cont
 	if err := authors.Create(ctx, author); err != nil {
 		t.Fatal(err)
 	}
-	// isAllowedPath fails closed when no roots are configured (security
+	// openServable fails closed when no roots are configured (security
 	// hardening sweep); fixture returns its TempDir as the configured root
 	// and the test stores book file paths under it.
 	root := t.TempDir()
@@ -79,7 +80,7 @@ func TestFileDownload_FileMissingOnDisk(t *testing.T) {
 		t.Fatal(err)
 	}
 	// FilePath set to a path under the allowed root but the file doesn't
-	// exist — isAllowedPath passes, os.Stat fails → 404.
+	// exist — openServable passes the root check, Lstat fails → 404.
 	if err := books.SetFilePath(ctx, book.ID, filepath.Join(tmp, "missing.epub")); err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +97,7 @@ func TestFileDownload_PathOutsideAllowedRoots(t *testing.T) {
 	if err := books.Create(ctx, book); err != nil {
 		t.Fatal(err)
 	}
-	// Path is outside the configured allowedRoots — isAllowedPath fails
+	// Path is outside the configured allowedRoots — openServable fails
 	// closed → 403, defending against tampered DB rows or importer bugs
 	// that point at /etc/passwd or anywhere else off the library tree.
 	if err := books.SetFilePath(ctx, book.ID, "/etc/passwd"); err != nil {
@@ -660,7 +661,7 @@ func TestFileDownload_PathParamUntrackedRefused(t *testing.T) {
 	}
 	// A real file, inside the allowed root, that this book simply does not own.
 	// Being under the root is the point: the refusal has to come from the
-	// book_files check, not from isAllowedPath.
+	// book_files check, not from openServable.
 	notMine := filepath.Join(tmp, "someone-elses.epub")
 	if err := os.WriteFile(notMine, []byte("not mine"), 0o644); err != nil {
 		t.Fatal(err)
@@ -787,5 +788,188 @@ func TestFileDownload_PathParamBeatsFormatParam(t *testing.T) {
 	}
 	if rec.Body.String() != "second bytes" {
 		t.Errorf("format= won over path=: got %q, want %q", rec.Body.String(), "second bytes")
+	}
+}
+
+// ── Streaming: write deadline, partial content, zip methods ────────────────
+
+// deadlineWriter is a ResponseWriter that, like net/http's own, accepts a
+// per-request write deadline through http.NewResponseController.
+type deadlineWriter struct {
+	*httptest.ResponseRecorder
+	calls    int
+	deadline time.Time
+}
+
+func (d *deadlineWriter) SetWriteDeadline(t time.Time) error {
+	d.calls++
+	d.deadline = t
+	return nil
+}
+
+// seedFileBook stores one book whose FilePath is path (a file or a folder).
+func seedFileBook(t *testing.T, books *db.BookRepo, author *models.Author, foreignID, path string) {
+	t.Helper()
+	book := &models.Book{ForeignID: foreignID, AuthorID: author.ID, Title: "T"}
+	if err := books.Create(context.Background(), book); err != nil {
+		t.Fatal(err)
+	}
+	if err := books.SetFilePath(context.Background(), book.ID, path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The server WriteTimeout is a deadline for the whole response, which a large
+// audiobook cannot meet on a slow link (it cut downloads off at 120 s). The
+// handler has to replace it with a rolling one for the file and zip responses,
+// and only for them.
+func TestFileDownload_ExtendsWriteDeadline(t *testing.T) {
+	for _, kind := range []string{"file", "zip"} {
+		t.Run(kind, func(t *testing.T) {
+			h, books, author, ctx, tmp := fileFixture(t)
+			_ = ctx
+			path := filepath.Join(tmp, "book.epub")
+			if kind == "zip" {
+				path = filepath.Join(tmp, "Title")
+				if err := os.MkdirAll(path, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(path, "a.mp3"), []byte("abc"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.WriteFile(path, []byte("epub bytes"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			seedFileBook(t, books, author, "OL-DL", path)
+
+			w := &deadlineWriter{ResponseRecorder: httptest.NewRecorder(), deadline: time.Now()}
+			h.Download(w, withURLParam(httptest.NewRequest(http.MethodGet, "/api/v1/book/1/file", nil), "id", "1"))
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", w.Code)
+			}
+			if w.calls == 0 || !w.deadline.After(time.Now().Add(downloadStallTimeout-time.Minute)) {
+				t.Fatalf("write deadline calls=%d value=%v, want pushed out by the stall timeout", w.calls, w.deadline)
+			}
+		})
+	}
+}
+
+// A writer that cannot move its deadline (httptest, a wrapper that hides the
+// server writer) must not break the download.
+func TestFileDownload_DeadlineUnsupportedStillServes(t *testing.T) {
+	h, books, author, _, tmp := fileFixture(t)
+	path := filepath.Join(tmp, "book.epub")
+	if err := os.WriteFile(path, []byte("epub bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	seedFileBook(t, books, author, "OL-DL2", path)
+	rec := httptest.NewRecorder()
+	h.Download(rec, withURLParam(httptest.NewRequest(http.MethodGet, "/api/v1/book/1/file", nil), "id", "1"))
+	if rec.Code != http.StatusOK || rec.Body.String() != "epub bytes" {
+		t.Fatalf("status=%d body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+// Resuming an interrupted download relies on Range support, so lifting the
+// deadline must not change what a Range request gets back.
+func TestFileDownload_RangeRequestIsPartialContent(t *testing.T) {
+	h, books, author, _, tmp := fileFixture(t)
+	path := filepath.Join(tmp, "book.m4b")
+	if err := os.WriteFile(path, []byte("0123456789"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	seedFileBook(t, books, author, "OL-RNG", path)
+
+	req := withURLParam(httptest.NewRequest(http.MethodGet, "/api/v1/book/1/file", nil), "id", "1")
+	req.Header.Set("Range", "bytes=3-6")
+	w := &deadlineWriter{ResponseRecorder: httptest.NewRecorder()}
+	h.Download(w, req)
+	if w.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206", w.Code)
+	}
+	if got := w.Body.String(); got != "3456" {
+		t.Fatalf("body = %q, want 3456", got)
+	}
+	if cr := w.Header().Get("Content-Range"); cr != "bytes 3-6/10" {
+		t.Fatalf("Content-Range = %q", cr)
+	}
+	if cl := w.Header().Get("Content-Length"); cl != "4" {
+		t.Fatalf("Content-Length = %q, want 4", cl)
+	}
+	if w.calls == 0 || !w.deadline.After(time.Now().Add(downloadStallTimeout-time.Minute)) {
+		t.Fatalf("deadline not extended on a ranged response (calls=%d)", w.calls)
+	}
+}
+
+// Audio, ebooks and images are compressed already, so deflating them burns CPU
+// for a few percent. Plain text compresses well and PDF is not reliably
+// compressed, so those stay deflated. Every entry has to round trip.
+func TestStreamZip_StoresAlreadyCompressedFormats(t *testing.T) {
+	h, books, author, _, tmp := fileFixture(t)
+	dir := filepath.Join(tmp, "Title")
+	if err := os.MkdirAll(filepath.Join(dir, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]uint16{
+		"part1.m4b":     zip.Store,
+		"part2.MP3":     zip.Store,
+		"part3.m4a":     zip.Store,
+		"part4.aac":     zip.Store,
+		"part5.flac":    zip.Store,
+		"part6.ogg":     zip.Store,
+		"part7.opus":    zip.Store,
+		"book.epub":     zip.Store,
+		"sub/cover.jpg": zip.Store,
+		"cover.png":     zip.Store,
+		"extra.zip":     zip.Store,
+		"book.pdf":      zip.Deflate,
+		"notes.txt":     zip.Deflate,
+		"disc.cue":      zip.Deflate,
+		"info.nfo":      zip.Deflate,
+		"noext":         zip.Deflate,
+	}
+	content := map[string][]byte{}
+	for name := range want {
+		body := bytes.Repeat([]byte(name+"|"), 500)
+		content[name] = body
+		if err := os.WriteFile(filepath.Join(dir, filepath.FromSlash(name)), body, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seedFileBook(t, books, author, "OL-ZIP", dir)
+
+	rec := httptest.NewRecorder()
+	h.Download(rec, withURLParam(httptest.NewRequest(http.MethodGet, "/api/v1/book/1/file", nil), "id", "1"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	zr, err := zip.NewReader(bytes.NewReader(rec.Body.Bytes()), int64(rec.Body.Len()))
+	if err != nil {
+		t.Fatalf("zip reader: %v", err)
+	}
+	if len(zr.File) != len(want) {
+		t.Fatalf("zip has %d entries, want %d", len(zr.File), len(want))
+	}
+	for _, f := range zr.File {
+		m, ok := want[f.Name]
+		if !ok {
+			t.Errorf("unexpected entry %q", f.Name)
+			continue
+		}
+		if f.Method != m {
+			t.Errorf("%s: method = %d, want %d", f.Name, f.Method, m)
+		}
+		rc, err := f.Open()
+		if err != nil {
+			t.Fatalf("open %s: %v", f.Name, err)
+		}
+		got, err := io.ReadAll(rc) // verifies the CRC too
+		rc.Close()
+		if err != nil {
+			t.Fatalf("read %s: %v", f.Name, err)
+		}
+		if !bytes.Equal(got, content[f.Name]) {
+			t.Errorf("%s: content did not round trip", f.Name)
+		}
 	}
 }

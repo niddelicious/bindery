@@ -18,6 +18,7 @@ import (
 	"github.com/vavallee/bindery/internal/concurrency"
 	"github.com/vavallee/bindery/internal/db"
 	"github.com/vavallee/bindery/internal/downloader"
+	"github.com/vavallee/bindery/internal/downloader/nethint"
 	"github.com/vavallee/bindery/internal/indexer"
 	"github.com/vavallee/bindery/internal/indexer/newznab"
 	"github.com/vavallee/bindery/internal/models"
@@ -37,7 +38,201 @@ const queueClientPollConcurrency = 4
 
 var queueClientPollTimeout = 1 * time.Second
 
+// queueImportedVisibleFor is how long a finished import stays on the queue
+// page. Imported is the one state with nothing left to do, so the queue lists
+// an import for this long (a week covers "what arrived over the weekend") and
+// then leaves it to the History page. Every other state is listed however old
+// it is; see db.DownloadRepo.ListActive for why.
+const queueImportedVisibleFor = 7 * 24 * time.Hour
+
 var errAlreadyGrabbed = errors.New("already grabbed")
+
+// errNoDownloadClient marks a grab or retry that no enabled download client
+// can take. It is a setup problem the user can fix, so the handlers answer 400
+// with the actionable text and a code the web app keys on, never a 502.
+var errNoDownloadClient = errors.New("no enabled download client configured")
+
+// noClientError is the actionable "no enabled download client" message
+// (see noProtocolClientError). Its text names the protocol and the clients the
+// user does have, and it matches errNoDownloadClient through errors.Is.
+type noClientError struct{ msg string }
+
+func (e *noClientError) Error() string { return e.msg }
+func (e *noClientError) Unwrap() error { return errNoDownloadClient }
+
+// errSendFailed marks a release the download client refused or could not be
+// reached for. The text of the underlying failure comes from the client, so it
+// stays in the log, the download row and the history; the API answers with
+// sendFailedMessage.
+var errSendFailed = errors.New("failed to send to downloader")
+
+// sendFailedMessage is what a client is told when errSendFailed happens.
+const sendFailedMessage = "failed to send the release to the download client"
+
+// sendError carries the download client's own failure for the logs and the
+// download row. Error() keeps the full text; only errSendFailed is matched by
+// errors.Is, so callers branch on the kind without relaying the cause.
+type sendError struct {
+	cause error
+	// pin is set when the client was the indexer's pinned one (#3080), so the
+	// failure can say no other client was tried.
+	pin *pinTarget
+}
+
+// pinTarget names the indexer and the client of a pinned grab.
+type pinTarget struct{ indexer, client string }
+
+func (e *sendError) Error() string   { return errSendFailed.Error() + ": " + e.cause.Error() }
+func (e *sendError) Unwrap() []error { return []error{errSendFailed, e.cause} }
+
+// sendFailedText is sendFailedMessage plus Bindery's own hint when the cause is
+// a network failure (refused, timed out, unknown container name). The hint is
+// fixed text chosen by the class of failure, so it names no host and no URL,
+// and it is what tells a user the client is down, not that the release is bad.
+func sendFailedText(ctx context.Context, err error) string {
+	text := sendFailedMessage + nethint.ForErr(err)
+	var se *sendError
+	if errors.As(err, &se) && se.pin != nil {
+		if isAdminCtx(ctx) {
+			text += fmt.Sprintf(". Indexer %q is pinned to download client %q, so no other client was tried", se.pin.indexer, se.pin.client)
+		} else {
+			text += fmt.Sprintf(". Indexer %q is pinned to one download client, so no other client was tried", se.pin.indexer)
+		}
+	}
+	return text
+}
+
+// isAdminCtx reports whether the request is an admin's. Auth disabled and API
+// key callers are stamped admin by the auth middleware.
+func isAdminCtx(ctx context.Context) bool {
+	return auth.UserRoleFromContext(ctx) == "admin"
+}
+
+// codeIndexerClientUnavailable is the code on the 400 for a grab whose
+// indexer's pinned download client cannot take it (#3080). It is not
+// codeNoDownloadClient on purpose: that code drives a "go add a client" setup
+// nudge, which would be wrong when clients exist and the pin is the problem.
+const codeIndexerClientUnavailable = "indexer_client_unavailable"
+
+// pinnedMessage renders a pin failure for the caller's role.
+func pinnedMessage(ctx context.Context, perr *db.PinnedClientError) string {
+	return perr.Message(isAdminCtx(ctx))
+}
+
+// writeGrabError answers an error from grab or resendRelease. A missing client
+// is a setup problem the user can fix (400, with a code the web app keys on);
+// a refused or unreachable client is a generic 502, since the text comes from
+// the client; anything else is a storage fault and a generic 500.
+func writeGrabError(w http.ResponseWriter, r *http.Request, err error) {
+	var perr *db.PinnedClientError
+	var aerr *ambiguousPinError
+	switch {
+	case errors.As(err, &aerr):
+		slog.Warn("grab: the release could not be tied to one indexer and a matching indexer is pinned", "method", r.Method, "path", r.URL.Path, "error", aerr.Error())
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": aerr.Message(isAdminCtx(r.Context())), "code": codeIndexerClientUnavailable})
+	case errors.As(err, &perr):
+		slog.Warn("grab: the indexer's pinned download client cannot take the release", "method", r.Method, "path", r.URL.Path, "error", perr.Error())
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": pinnedMessage(r.Context(), perr), "code": codeIndexerClientUnavailable})
+	case errors.Is(err, errNoDownloadClient):
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error(), "code": codeNoDownloadClient})
+	case strings.Contains(err.Error(), "no enabled download client is eligible for"):
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+	case errors.Is(err, errSendFailed):
+		slog.Warn("grab: download client did not take the release", "method", r.Method, "path", r.URL.Path, "error", err)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": sendFailedText(r.Context(), err)})
+	default:
+		writeServerError(w, r, err)
+	}
+}
+
+// codeNoDownloadClient is the machine readable code on a "no download client"
+// 400, matched by isNoDownloadClientError in web/src/api/core.ts.
+const codeNoDownloadClient = "no_download_client"
+
+// queueItemMessage is the per row message of a bulk queue response, which the
+// page shows verbatim. It follows the single-item routes: the messages the
+// handlers already treat as safe (a conflict, a missing book, no client) pass
+// through, a send failure is generic, and a storage fault is logged and
+// replaced.
+func queueItemMessage(ctx context.Context, err error) string {
+	var perr *db.PinnedClientError
+	var aerr *ambiguousPinError
+	switch {
+	case errors.As(err, &aerr):
+		return aerr.Message(isAdminCtx(ctx))
+	case errors.As(err, &perr):
+		return pinnedMessage(ctx, perr)
+	case errors.Is(err, errNoDownloadClient), errors.Is(err, errAlreadyGrabbed),
+		errors.Is(err, errRetryNotResendable), errors.Is(err, errGrabBookNotFound),
+		strings.Contains(err.Error(), "no enabled download client is eligible for"):
+		return err.Error()
+	case errors.Is(err, errSendFailed):
+		slog.Warn("bulk queue item: download client did not take the release", "error", err)
+		return sendFailedText(ctx, err)
+	default:
+		slog.Error("bulk queue item failed", "error", err)
+		return "internal server error"
+	}
+}
+
+// errRegrabForceable marks an "already grabbed" refusal the caller may
+// override by sending the grab again with force set (#2289). It is only ever
+// joined to errAlreadyGrabbed, never returned alone, and only for the caller's
+// own imported row: see forceRegrabbable.
+var errRegrabForceable = errors.New("grab it anyway to download it again")
+
+// forceRegrabbable reports whether a grab that sets force may reuse d even
+// though regrabbable refuses it (#2289).
+//
+// Only an imported row qualifies. Its download finished and its import ran,
+// so nothing is in flight that a re-grab could race or duplicate, and what
+// the refusal protects is the user fetching a book twice by accident. That is
+// the user's call to make, and before this the only ways to make it were to
+// delete the book or to delete the torrent in the download client, which on
+// a ratio tracked private tracker throws away the seeding history. The
+// reporter's release had been marked imported with no usable files, and
+// every Grab answered "already imported".
+//
+// Every other blocking state is live work (grabbed, downloading, completed,
+// importing) or work the scanner or an external tool still owns
+// (importFailed, importExternal, importHeld), and force does not open those.
+//
+// The row is reused in place, exactly as a dead row is. Nothing is removed
+// from the download client and no file is touched: the earlier import's
+// files stay with the book, and the history table keeps its record.
+func forceRegrabbable(d *models.Download) bool {
+	return d != nil && d.Status == models.StateImported
+}
+
+// foreignRowGrabbedDetail is the reason given when the release's download row
+// belongs to another user under tenancy. It says no more than that: the row's
+// state, book and history are that user's.
+const foreignRowGrabbedDetail = "another user already has this release in their queue"
+
+// foreignRowClaimable reports whether a grab may claim d, a download row that
+// belongs to another user, at now. It is the scheduler's rule for its own
+// automatic re-grab (scheduler.blockingRegrabReason): an orphaned import
+// whatever its age, or a failed row that has been dead for at least
+// models.DeadRegrabCooldown. db.DownloadRepo.RetryDeadForAutoGrab claims
+// exactly these rows and re-checks the cooldown in SQL.
+func foreignRowClaimable(d *models.Download, now time.Time) bool {
+	if d.BlocksAutoRegrab() {
+		return false
+	}
+	if d.IsOrphanedImport() {
+		return true
+	}
+	return !d.DeadSince().After(now.Add(-models.DeadRegrabCooldown))
+}
+
+// errGrabBookNotFound is returned when the book a grab names does not exist or
+// belongs to another user. The handlers answer 404 for both, as the book
+// handlers do, so a caller cannot tell the two apart.
+var errGrabBookNotFound = errors.New("book not found")
+
+// errReleaseNotSearched refuses a grab of a release no recent search returned,
+// from any caller but an API key. See SearchResultRegistry.
+var errReleaseNotSearched = errors.New("this search result has expired, search again")
 
 // regrabbableState reports whether an existing download row for the same GUID
 // may be reused by a fresh grab of that release.
@@ -146,6 +341,9 @@ type QueueHandler struct {
 	downloadDir          string
 	audiobookDownloadDir string
 	downloadPathRemap    string
+	// searchResults is what a non-admin grab is held to (see
+	// SearchResultRegistry). Nil refuses every non-admin grab.
+	searchResults *SearchResultRegistry
 }
 
 func NewQueueHandler(downloads *db.DownloadRepo, clients *db.DownloadClientRepo, books *db.BookRepo, history *db.HistoryRepo) *QueueHandler {
@@ -166,18 +364,19 @@ func (h *QueueHandler) WithIndexers(indexers *db.IndexerRepo) *QueueHandler {
 	return h
 }
 
-// resolveSeedRatio returns the seed-ratio override for the given indexer, or
-// nil when there is no indexer repo, no indexer id, the lookup fails, or the
-// indexer has no override. nil keeps the download client's global ratio rule.
-func (h *QueueHandler) resolveSeedRatio(ctx context.Context, indexerID *int64) *float64 {
+// resolveSeedLimits returns the seed ratio (#883) and seed time (#2206)
+// overrides for the given indexer. Each is nil when there is no indexer repo,
+// no indexer id, the lookup fails, or the indexer has no such override; nil
+// keeps the download client's own rule.
+func (h *QueueHandler) resolveSeedLimits(ctx context.Context, indexerID *int64) downloader.SeedLimits {
 	if h.indexers == nil || indexerID == nil || *indexerID == 0 {
-		return nil
+		return downloader.SeedLimits{}
 	}
 	idx, err := h.indexers.GetByID(ctx, *indexerID)
-	if err != nil || idx == nil {
-		return nil
+	if err != nil {
+		return downloader.SeedLimits{}
 	}
-	return idx.SeedRatio
+	return downloader.SeedLimitsFor(idx)
 }
 
 // signNZBURL restores the indexer apikey that the search and queue responses
@@ -283,10 +482,13 @@ func (h *QueueHandler) WithStoragePaths(downloadDir, audiobookDownloadDir string
 
 // WithDownloadPathRemap attaches the global BINDERY_DOWNLOAD_PATH_REMAP.
 //
-// Only "remove with data" on an rTorrent client reads it — rTorrent has no
-// delete-with-data command, so Bindery deletes the payload itself and has to
-// translate rTorrent's path the same way the importer does. Leaving it unset
-// simply falls back to the client's own PathRemap.
+// Two things read it. A manual grab runs the save path it sends to
+// qBittorrent or rTorrent through it when the client's own PathRemap does not
+// cover the download folder (#2665). "Remove with data" on an rTorrent client
+// uses it too: rTorrent has no delete-with-data command, so Bindery deletes
+// the payload itself and has to translate rTorrent's path the same way the
+// importer does. Leaving it unset simply falls back to the client's own
+// PathRemap.
 func (h *QueueHandler) WithDownloadPathRemap(remap string) *QueueHandler {
 	h.downloadPathRemap = remap
 	return h
@@ -336,14 +538,15 @@ func (h *QueueHandler) enrichedQueueItems(ctx context.Context) ([]enrichedQueueI
 		downloads []models.Download
 		err       error
 	)
+	importedSince := time.Now().Add(-queueImportedVisibleFor)
 	if auth.EnforceTenancy() && auth.UserRoleFromContext(ctx) != "admin" {
 		if uid := auth.UserIDFromContext(ctx); uid != 0 {
-			downloads, err = h.downloads.ListByUser(ctx, uid)
+			downloads, err = h.downloads.ListActiveByUser(ctx, uid, importedSince)
 		} else {
-			downloads, err = h.downloads.List(ctx)
+			downloads, err = h.downloads.ListActive(ctx, importedSince)
 		}
 	} else {
-		downloads, err = h.downloads.List(ctx)
+		downloads, err = h.downloads.ListActive(ctx, importedSince)
 	}
 	if err != nil {
 		return nil, nil, err
@@ -513,6 +716,8 @@ func (h *QueueHandler) List(w http.ResponseWriter, r *http.Request) {
 		// indexer credential, so exposing it in any user's queue leaks it (same
 		// reason SearchBook redacts). Retries re-sign server-side in grab().
 		items[i].NZBURL = newznab.RedactDownloadURL(items[i].NZBURL)
+		// A torznab GUID is often the download URL itself, credentials and all.
+		items[i].GUID = newznab.RedactDownloadURL(items[i].GUID)
 		if item.HasLive {
 			items[i].Percentage = item.Live.Percentage
 			items[i].TimeLeft = item.Live.TimeLeft
@@ -541,6 +746,31 @@ func (h *QueueHandler) List(w http.ResponseWriter, r *http.Request) {
 		Partial:      len(diagnostics) > 0,
 		StaleClients: diagnostics,
 	})
+}
+
+// failedStates are the download states the queue shows as failed: the ones
+// that need a retry or a removal. They match FAILED_STATUSES in
+// web/src/components/downloadStatus.ts.
+var failedStates = []models.DownloadState{models.StateFailed, models.StateImportFailed, models.StateImportBlocked}
+
+// FailedCount answers GET /queue/failed-count with {"failed": n}: the number
+// behind the nav's failed-downloads badge. It reads the downloads table only.
+// List also asks every download client for live progress, which is the wrong
+// cost for a badge on every page, and a count that only refreshed on a full
+// queue read went stale while the Queue page was closed. Scoped the same way
+// as List.
+func (h *QueueHandler) FailedCount(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	var uid int64
+	if auth.EnforceTenancy() && auth.UserRoleFromContext(ctx) != "admin" {
+		uid = auth.UserIDFromContext(ctx)
+	}
+	n, err := h.downloads.CountByStatuses(ctx, uid, failedStates...)
+	if err != nil {
+		writeServerError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"failed": n})
 }
 
 type arrQueueResponse struct {
@@ -800,16 +1030,36 @@ type grabRequest struct {
 	IndexerID *int64 `json:"indexerId"`
 	Protocol  string `json:"protocol"`
 	MediaType string `json:"mediaType"`
+	// Force re-grabs a release whose earlier download already imported,
+	// after the user confirmed it (#2289). See forceRegrabbable.
+	Force bool `json:"force"`
 }
 
 func (h *QueueHandler) Grab(w http.ResponseWriter, r *http.Request) {
 	var req grabRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.GUID == "" || req.NZBURL == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "guid and nzbUrl required"})
+		return
+	}
+	// A release a search returned is grabbed from the server's record, for
+	// every caller: the raw download URL, indexer, protocol, title and size
+	// replace the posted ones, so the grab never depends on what the client
+	// posts back (search responses redact the URL). A non-admin may grab
+	// nothing else. Bindery fetches the download URL itself and signs it with
+	// an indexer key when the host matches, so trusting a posted URL let a user
+	// read an indexer's API, or any LAN service, through the grab. Only API
+	// key callers fall back to the posted URL for a GUID the registry does not
+	// hold: a browser session posts back what a search response showed, which
+	// has its credentials stripped, so grabbing it would go out without its
+	// Jackett key or passkey and store a redacted GUID. See
+	// SearchResultRegistry.
+	if rel, ok := h.searchResults.lookup(req.GUID); ok {
+		rel.apply(&req)
+	} else if !callerMayPostDownloadURL(r.Context()) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": errReleaseNotSearched.Error()})
 		return
 	}
 
@@ -817,18 +1067,19 @@ func (h *QueueHandler) Grab(w http.ResponseWriter, r *http.Request) {
 	if errors.Is(err, errAlreadyGrabbed) {
 		// err carries alreadyGrabbedDetail's explanation; the search page shows
 		// this string verbatim, so send it rather than the bare sentinel (#1955).
-		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		// forceAvailable tells the UI it may offer to grab anyway (#2289).
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":          err.Error(),
+			"forceAvailable": errors.Is(err, errRegrabForceable),
+		})
+		return
+	}
+	if errors.Is(err, errGrabBookNotFound) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 		return
 	}
 	if err != nil {
-		status := http.StatusBadGateway
-		// Both "no enabled ... download client configured" (noProtocolClientError)
-		// and "no enabled download client is eligible for ..." (noEligibleMediaTypeError)
-		// are configuration problems, not a downloader-side failure — 400, not 502.
-		if strings.Contains(err.Error(), "no enabled") {
-			status = http.StatusBadRequest
-		}
-		writeJSON(w, status, map[string]string{"error": err.Error()})
+		writeGrabError(w, r, err)
 		return
 	}
 
@@ -1008,12 +1259,11 @@ func (h *QueueHandler) RetryDownload(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, errRetryNotResendable), errors.Is(err, errAlreadyGrabbed):
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
+	case errors.Is(err, errGrabBookNotFound):
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
 	case err != nil:
-		status := http.StatusBadGateway
-		if strings.Contains(err.Error(), "no enabled") && strings.Contains(err.Error(), "download client configured") {
-			status = http.StatusBadRequest
-		}
-		writeJSON(w, status, map[string]string{"error": err.Error()})
+		writeGrabError(w, r, err)
 		return
 	}
 
@@ -1106,7 +1356,7 @@ func (h *QueueHandler) BulkRetry(w http.ResponseWriter, r *http.Request) {
 			accepted, found, err := h.downloads.ResetImportRetry(ctx, id)
 			switch {
 			case err != nil:
-				setResult(id, queueRetryResult{Error: err.Error()})
+				setResult(id, queueRetryResult{Error: queueItemMessage(ctx, err)})
 			case !found:
 				setResult(id, queueRetryResult{Error: "download not found"})
 			case !accepted:
@@ -1118,7 +1368,7 @@ func (h *QueueHandler) BulkRetry(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if _, err := h.resendRelease(ctx, target); err != nil {
-			setResult(id, queueRetryResult{Error: err.Error()})
+			setResult(id, queueRetryResult{Error: queueItemMessage(ctx, err)})
 			return
 		}
 		setResult(id, queueRetryResult{OK: true, Action: retryActionResend})
@@ -1174,6 +1424,37 @@ func noEligibleMediaTypeError(mediaType string) error {
 	return fmt.Errorf("no enabled download client is eligible for %s — enable a download client for %s in Settings", label, label)
 }
 
+// clientForGrab picks the client for a grab. An indexer pinned to a download
+// client (#3080) gets exactly that client, whatever the protocol routing, media
+// type or priority would have chosen, or a *db.PinnedClientError when it cannot
+// be used: there is no fallback, because falling back is how a private
+// tracker's traffic reaches the public client. The returned pinTarget is
+// non-nil only for a pinned grab. An unpinned indexer, or no indexer, takes
+// selectClient exactly as before.
+func (h *QueueHandler) clientForGrab(ctx context.Context, indexerID *int64, protocol, mediaType string) (*models.DownloadClient, *pinTarget, error) {
+	if h.indexers != nil && indexerID != nil && *indexerID != 0 {
+		idx, err := h.indexers.GetByID(ctx, *indexerID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if idx != nil && idx.DownloadClientID != nil {
+			c, err := h.clients.ResolvePinnedClient(ctx, idx, protocol)
+			if err != nil {
+				return nil, nil, err
+			}
+			if len(db.FilterEligibleForMediaType([]models.DownloadClient{*c}, mediaType)) == 0 {
+				return nil, nil, noEligibleMediaTypeError(mediaType)
+			}
+			return c, &pinTarget{indexer: idx.Name, client: c.Name}, nil
+		}
+	}
+	candidates, err := h.selectClients(ctx, protocol, mediaType)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &candidates[0], nil, nil
+}
+
 // noProtocolClientError builds an actionable "no enabled download client" error.
 // If clients of the opposite protocol are enabled, it surfaces the mismatch
 // (e.g. the release is usenet but only torrent clients are enabled) and names
@@ -1184,15 +1465,15 @@ func (h *QueueHandler) noProtocolClientError(ctx context.Context, protocol strin
 	otherEnabled, err := h.clients.GetEnabledByProtocol(ctx, other)
 	if err != nil {
 		// Don't mask the real failure with a guess about other clients.
-		return fmt.Errorf("no enabled %s download client configured", protocolLabel(protocol))
+		return &noClientError{msg: fmt.Sprintf("no enabled %s download client configured", protocolLabel(protocol))}
 	}
 	if len(otherEnabled) == 0 {
-		return fmt.Errorf("no enabled download client configured — add a download client")
+		return &noClientError{msg: "no enabled download client configured — add a download client"}
 	}
-	return fmt.Errorf(
+	return &noClientError{msg: fmt.Sprintf(
 		"no enabled %s download client configured — this release is %s but your only enabled client(s) are %s; add a %s client (%s)",
 		protocolLabel(protocol), protocol, other, other, protocolClientSuggestions(protocol),
-	)
+	)}
 }
 
 // otherProtocol returns the protocol opposite to the one given. Anything that
@@ -1224,6 +1505,23 @@ func protocolClientSuggestions(protocol string) string {
 	return "SABnzbd/NZBGet"
 }
 
+// grabMediaType resolves the media type a grab is dispatched under.
+//
+// A concrete "ebook" or "audiobook" from the caller wins: the interactive
+// search classifies each result by the indexer category leg it came from,
+// which is a stronger signal than the release title. Anything else ("both"
+// from a dual-format book, or "" from a free-text grab) says nothing about the
+// release, so the format token in its title decides, the same inference
+// retryGrabRequest uses. A title with no token stays "", which every consumer
+// treats as "no preference" and sends with the client's default category.
+func grabMediaType(requested, title string) string {
+	switch requested {
+	case models.MediaTypeEbook, models.MediaTypeAudiobook:
+		return requested
+	}
+	return indexer.MediaTypeForFormat(indexer.ParseRelease(title).Format)
+}
+
 // grab executes the core grab logic: creates a download record and sends to the client.
 // It is called by both the HTTP Grab handler and PendingHandler.Grab.
 func (h *QueueHandler) grab(ctx context.Context, req grabRequest) (*models.Download, error) {
@@ -1234,19 +1532,35 @@ func (h *QueueHandler) grab(ctx context.Context, req grabRequest) (*models.Downl
 	if err != nil {
 		return nil, err
 	}
+	// The GUID lookup is global because the column is UNIQUE, so under tenancy
+	// the row it finds may be another user's. Such a row is claimed on the
+	// scheduler's terms and no others (foreignRowClaimable): a failed row once
+	// it has been dead for models.DeadRegrabCooldown, and an orphaned import
+	// (#2289). Inside the cooldown a failed row is still its owner's to Retry,
+	// an importBlocked row is its owner's to Retry import, and a live row is
+	// live work. The refusal does not describe the row, since it is not the
+	// caller's to see. A claimed foreign row is fully reset and lends the grab
+	// nothing (see below).
+	now := time.Now().UTC()
+	foreignRow := existing != nil && !auth.CheckOwnership(ctx, existing.OwnerUserID)
+	if foreignRow && !foreignRowClaimable(existing, now) {
+		return nil, fmt.Errorf("%w: %s", errAlreadyGrabbed, foreignRowGrabbedDetail)
+	}
+	// forced is a grab the user confirmed over the "already imported"
+	// refusal (#2289). A foreign row is never forced: the check above already
+	// refuses every foreign imported row that still has its book, and force
+	// is for the caller's own rows whatever the order of these checks.
+	forced := false
 	if existing != nil && !regrabbable(existing) {
-		return nil, fmt.Errorf("%w: %s", errAlreadyGrabbed, alreadyGrabbedDetail(existing.Status))
+		if foreignRow || !forceRegrabbable(existing) {
+			return nil, fmt.Errorf("%w: %s", errAlreadyGrabbed, alreadyGrabbedDetail(existing.Status))
+		}
+		if !req.Force {
+			return nil, fmt.Errorf("%w: %s; %w", errAlreadyGrabbed, alreadyGrabbedDetail(existing.Status), errRegrabForceable)
+		}
+		forced = true
 	}
 
-	candidates, err := h.selectClients(ctx, req.Protocol, req.MediaType)
-	if err != nil {
-		// selectClients already produced an actionable, protocol- or
-		// media-type-aware message (see noProtocolClientError /
-		// noEligibleMediaTypeError); propagate it rather than flattening it.
-		return nil, err
-	}
-
-	protocol := downloader.ProtocolForClient(candidates[0].Type)
 	// Coerce zero-valued BookID/IndexerID to nil. A caller that JSON-decodes
 	// into an older int64-typed grabRequest, or writes an explicit {"bookId":0},
 	// would otherwise insert 0 into the FK column and violate the constraint.
@@ -1260,7 +1574,9 @@ func (h *QueueHandler) grab(ctx context.Context, req grabRequest) (*models.Downl
 	}
 	editionID := (*int64)(nil)
 	indexerFlags := ""
-	if existing != nil {
+	// Only the caller's own row lends its book, indexer, edition and flags to
+	// the grab; a foreign orphaned import lends nothing.
+	if existing != nil && !foreignRow {
 		if bookID == nil {
 			bookID = existing.BookID
 		}
@@ -1270,6 +1586,28 @@ func (h *QueueHandler) grab(ctx context.Context, req grabRequest) (*models.Downl
 		editionID = existing.EditionID
 		indexerFlags = existing.IndexerFlags
 	}
+	// The book the release is grabbed for must be one the caller may act on,
+	// the same check every book handler makes, and the same 404 for a book
+	// that is someone else's as for one that does not exist.
+	var bookOwner int64
+	if bookID != nil {
+		b, err := h.books.GetByID(ctx, *bookID)
+		if err != nil {
+			return nil, err
+		}
+		if b == nil || !auth.CheckOwnership(ctx, b.OwnerUserID) {
+			return nil, errGrabBookNotFound
+		}
+		bookOwner = b.OwnerUserID
+	}
+
+	// The media type picks the client, its category and the download
+	// directory, so it has to name the release being sent, not the book it is
+	// for. A dual-format book is "both", which no client category matches, so
+	// an audiobook grabbed from the book page's combined search landed in the
+	// ebook category (#2933). See grabMediaType.
+	req.MediaType = grabMediaType(req.MediaType, req.Title)
+
 	// Tenancy (#1457): stamp from the request identity. API key and trusted
 	// local requests carry the first admin's id (auth.withOperatorUserID), so
 	// they own what they grab like any signed-in user. A request reaches here
@@ -1281,34 +1619,67 @@ func (h *QueueHandler) grab(ctx context.Context, req grabRequest) (*models.Downl
 	// it is now this grab's download. That includes unowned: the previous
 	// owner is never carried over.
 	grabOwner := auth.UserIDFromContext(ctx)
-	if grabOwner == 0 && bookID != nil {
-		if b, err := h.books.GetByID(ctx, *bookID); err == nil && b != nil {
-			grabOwner = b.OwnerUserID
-		}
+	if grabOwner == 0 {
+		grabOwner = bookOwner
 	}
 	// Re-attach the indexer apikey the search/queue responses strip out
 	// (SEC: the shared credential must not reach non-admin clients). The client
 	// hands back an apikey-less download URL plus the indexer id; sign it
 	// server-side here. No-op when the URL already carries a key (scheduler /
 	// retry paths) or its host does not match the indexer.
-	nzbURL, hostMatched := h.signNZBURL(ctx, req.NZBURL, indexerID)
-	// The host-match fallback knows which indexer signed the URL, so record it.
-	// Without this the row keeps a nil (or dangling) IndexerID for precisely the
-	// API callers the fallback exists for, and both the queue's indexer
-	// attribution and resolveSeedRatio's per-indexer override are lost (#2053).
-	if hostMatched != nil {
+	// One decision says which indexer the grab belongs to, before signing gets
+	// a say (#3080). Signing only counts indexers that can sign and picks by
+	// luck of who holds a key, so it may fill in an attribution the decision
+	// left open but never replaces or overrides one. See resolveGrabPin.
+	var decision grabPinDecision
+	if h.indexers != nil {
+		idxs, err := h.indexers.List(ctx)
+		if err != nil {
+			return nil, err
+		}
+		decision = resolveGrabPin(indexerID, req.NZBURL, idxs)
+	}
+	if decision.Kind == pinRefuse {
+		return nil, &ambiguousPinError{reason: decision.Reason, pinned: decision.Pinned}
+	}
+	signWith := indexerID
+	if decision.Kind == pinUseIndexer {
+		id := decision.IndexerID
+		signWith = &id
+	}
+	nzbURL, hostMatched := h.signNZBURL(ctx, req.NZBURL, signWith)
+	if decision.Kind == pinUseIndexer {
+		// The decided indexer is the row's indexer, whoever signed the URL.
+		id := decision.IndexerID
+		indexerID = &id
+	} else if hostMatched != nil {
+		// Nothing decided: the host-match fallback knows which indexer signed
+		// the URL, so record it. Without this the row keeps a nil (or dangling)
+		// IndexerID for precisely the API callers the fallback exists for, and
+		// both the queue's indexer attribution and resolveSeedLimits'
+		// per-indexer overrides are lost (#2053).
 		indexerID = hostMatched
 	}
-	// Tentative pick: the row exists before any network call is made (crash
-	// safety), attributed to the best-ranked candidate. If sending to it fails,
-	// the fallback loop below corrects DownloadClientID to whichever client
-	// actually accepted the release.
+	// The client is chosen only now, after the host match above has settled
+	// which indexer the release came from: an indexer pinned to a download
+	// client (#3080) must be found even when the caller sent no indexer id.
+	client, pin, err := h.clientForGrab(ctx, indexerID, req.Protocol, req.MediaType)
+	if err != nil {
+		// Both selectClient (see noProtocolClientError) and a failed pin
+		// produce an actionable message; propagate it rather than flattening
+		// it to the generic "no enabled download client configured".
+		return nil, err
+	}
+	if client == nil {
+		return nil, h.noProtocolClientError(ctx, req.Protocol)
+	}
+	protocol := downloader.ProtocolForClient(client.Type)
 	dl := &models.Download{
 		GUID:             req.GUID,
 		BookID:           bookID,
 		EditionID:        editionID,
 		IndexerID:        indexerID,
-		DownloadClientID: &candidates[0].ID,
+		DownloadClientID: &client.ID,
 		OwnerUserID:      grabOwner,
 		Title:            req.Title,
 		NZBURL:           nzbURL,
@@ -1320,24 +1691,39 @@ func (h *QueueHandler) grab(ctx context.Context, req grabRequest) (*models.Downl
 	}
 	if existing != nil {
 		dl.ID = existing.ID
-		ok, err := h.downloads.RetryFailed(ctx, dl)
+		var ok bool
+		switch {
+		case foreignRow:
+			// The scheduler's claim, with its cooldown re-checked in SQL, so a
+			// row that changed hands or died again since the read above is a
+			// refusal rather than a takeover.
+			ok, err = h.downloads.RetryDeadForAutoGrab(ctx, dl, now.Add(-models.DeadRegrabCooldown))
+		case forced:
+			// Claims the row only while it is still imported, so a row that
+			// moved on since the read above is a refusal, not a takeover.
+			ok, err = h.downloads.RetryImported(ctx, dl)
+		default:
+			ok, err = h.downloads.RetryFailed(ctx, dl)
+		}
 		if err != nil {
 			return nil, err
 		}
 		if !ok {
+			if foreignRow {
+				return nil, fmt.Errorf("%w: %s", errAlreadyGrabbed, foreignRowGrabbedDetail)
+			}
 			return nil, errAlreadyGrabbed
 		}
 	} else if err := h.downloads.Create(ctx, dl); err != nil {
 		return nil, err
 	}
 
-	client := &candidates[0]
 	sendRes, err := downloader.SendDownload(ctx, client, nzbURL, req.Title, downloader.SendOptions{
 		MediaType:            req.MediaType,
 		DownloadDir:          h.downloadDir,
 		AudiobookDownloadDir: h.audiobookDownloadDir,
-		SeedRatio:            h.resolveSeedRatio(ctx, indexerID),
-	})
+		GlobalRemap:          h.downloadPathRemap,
+	}.WithSeedLimits(h.resolveSeedLimits(ctx, indexerID)))
 	if err != nil {
 		slog.Error("failed to send download to eligible client", "client", client.Name, "error", err, "title", req.Title)
 		wrapped := fmt.Errorf("failed to send to eligible download client %s: %w", client.Name, err)
@@ -1348,7 +1734,7 @@ func (h *QueueHandler) grab(ctx context.Context, req grabRequest) (*models.Downl
 		if h.notif != nil {
 			h.notif.Send(ctx, notifier.EventDownloadFailed, map[string]any{"title": req.Title, "message": wrapped.Error()})
 		}
-		return nil, wrapped
+		return nil, &sendError{cause: err, pin: pin}
 	}
 	if remoteID := sendRes.RemoteID; remoteID != "" {
 		if sendRes.UsesTorrentID {
@@ -1391,6 +1777,7 @@ func (h *QueueHandler) grab(ctx context.Context, req grabRequest) (*models.Downl
 	// alongside these from reintroducing the leak by simply echoing the record,
 	// and makes the grab response agree with List, which redacts the same field.
 	dl.NZBURL = newznab.RedactDownloadURL(dl.NZBURL)
+	dl.GUID = newznab.RedactDownloadURL(dl.GUID)
 	return dl, nil
 }
 
@@ -1526,11 +1913,26 @@ func (o queueRemoveOptions) validate() error {
 // Everything other than the client call runs either way: the point of
 // RemoveFromClient=false is to forget the download, not to pretend it never
 // happened.
+//
+// The client call is skipped, deleteFiles included, while another download
+// row still uses the same torrent or job (downloader.ClientJobShared): a
+// torrent client adopts a torrent it already holds, so two grabs of one
+// release, by one user or two, can share it, and removing it for one row would
+// take it, and with deleteFiles its data, from the other. Only this row goes.
+//
+// The row is deleted BEFORE that check. A bulk remove runs items concurrently,
+// and two rows sharing a torrent would otherwise each see the other, both skip
+// the client, and leave the torrent behind with nothing tracking it. Deleting
+// first means whichever check runs last sees no other row and removes it.
 func (h *QueueHandler) removeQueueItem(ctx context.Context, target *models.Download, opts queueRemoveOptions) error {
+	if err := h.downloads.Delete(ctx, target.ID); err != nil {
+		return err
+	}
+
 	if opts.RemoveFromClient && target.DownloadClientID != nil {
 		client, err := h.clients.GetByID(ctx, *target.DownloadClientID)
 		if err == nil && client != nil {
-			if err := downloader.RemoveDownload(ctx, client, target, opts.DeleteFiles, h.downloadPathRemap); err != nil {
+			if _, err := downloader.RemoveDownloadUnlessShared(ctx, h.downloads, client, target, opts.DeleteFiles, h.downloadPathRemap, "queue remove"); err != nil {
 				slog.Warn("failed to remove download from client", "download_id", target.ID, "client_id", client.ID, "error", err)
 			}
 		} else if err != nil {
@@ -1554,7 +1956,7 @@ func (h *QueueHandler) removeQueueItem(ctx context.Context, target *models.Downl
 		}
 	}
 
-	return h.downloads.Delete(ctx, target.ID)
+	return nil
 }
 
 // bulkDeleteConcurrency bounds how many queue items a single bulk-remove fans
@@ -1629,7 +2031,7 @@ func (h *QueueHandler) BulkDelete(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := h.removeQueueItem(ctx, &target, opts); err != nil {
-			setResult(id, bulkItemResult{Error: err.Error()})
+			setResult(id, bulkItemResult{Error: queueItemMessage(ctx, err)})
 			return
 		}
 		setResult(id, bulkItemResult{OK: true})

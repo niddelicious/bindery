@@ -1,0 +1,81 @@
+import { describe, it, expect, beforeAll } from 'vitest'
+import postcss from 'postcss'
+import tailwindcss from '@tailwindcss/postcss'
+
+// Builds index.css through the PostCSS pipeline the production build uses
+// (postcss.config.js) and checks the rules that only matter on a phone or in
+// the dark theme. jsdom applies no media queries and does no layout, so the
+// built stylesheet is the place to check them.
+let built = ''
+
+beforeAll(async () => {
+  // Tailwind resolves the @import from disk relative to `from`, which postcss
+  // resolves against the working directory: tests run from web/, the same
+  // root the production build uses. (Importing the file with ?raw gives an
+  // empty string under vitest, and the web tsconfig has no node types.)
+  const result = await postcss([tailwindcss()]).process('@import "./index.css";', { from: 'src/indexCss.test.css' })
+  built = result.css
+}, 60_000)
+
+// How many blocks are open at index: 0 means a top-level rule, outside any
+// @media or @layer.
+function depthAt(source: string, index: number): number {
+  let depth = 0
+  for (const ch of source.slice(0, index)) {
+    if (ch === '{') depth += 1
+    else if (ch === '}') depth -= 1
+  }
+  return depth
+}
+
+// The body of the first block whose prelude matches, braces balanced.
+function block(source: string, prelude: RegExp): string {
+  const m = prelude.exec(source)
+  if (!m) return ''
+  let depth = 0
+  const start = source.indexOf('{', m.index)
+  for (let i = start; i < source.length; i++) {
+    if (source[i] === '{') depth += 1
+    else if (source[i] === '}') {
+      depth -= 1
+      if (depth === 0) return source.slice(start + 1, i)
+    }
+  }
+  return ''
+}
+
+describe('index.css', () => {
+  it('gives native controls the dark color scheme in the dark theme', () => {
+    expect(block(built, /html\.dark\s*\{(?=[^}]*color-scheme)/)).toMatch(/color-scheme:\s*dark/)
+    expect(block(built, /html:not\(\.dark\)\s*\{/)).toMatch(/color-scheme:\s*light/)
+  })
+
+  it('sets text fields, but not selects, to 16px on touch screens', () => {
+    const touch = block(built, /@media \(hover: none\) and \(pointer: coarse\)\s*\{/)
+    expect(touch).toMatch(/input,\s*textarea\s*\{[^}]*font-size:\s*16px/)
+    expect(touch).not.toMatch(/select[^{}]*\{[^}]*font-size/)
+  })
+
+  // Everywhere, not only on touch screens (#3148), and unlayered: inside a
+  // layer or a media query the px-* utilities on each select would win, or
+  // desktop would keep drawing the arrow over the value.
+  it('reserves room for the select arrow on every screen', () => {
+    const prelude = /select:not\(\[multiple\]\):not\(\[size\]\):not\(\.bg-none\)\s*\{/g
+    const rules = [...built.matchAll(prelude)].filter(m => depthAt(built, m.index) === 0)
+    expect(rules).toHaveLength(1)
+    expect(block(built.slice(rules[0].index), prelude)).toMatch(/padding-right:\s*calc\(1\.5em \+ 0?\.75rem\)/)
+  })
+
+  it('caps a select at the width of its container', () => {
+    const bases = [...built.matchAll(/@layer base\s*\{/g)].map(m => block(built.slice(m.index), /@layer base\s*\{/))
+    expect(bases.join('\n')).toMatch(/(^|[\s,}])select\s*\{[^}]*max-width:\s*100%/)
+  })
+
+  it('defines a 44px touch-target hit area under a coarse pointer', () => {
+    const components = block(built, /@layer components\s*\{/)
+    const coarse = block(components, /@media \(pointer: coarse\)\s*\{/)
+    expect(block(coarse, /\.touch-target::before\s*\{/)).toMatch(/height:\s*max\(100%, 44px\)/)
+    expect(block(coarse, /\.touch-target::before\s*\{/)).toMatch(/width:\s*max\(100%, 44px\)/)
+    expect(block(coarse, /\.touch-target\s*\{/)).toMatch(/position:\s*relative/)
+  })
+})

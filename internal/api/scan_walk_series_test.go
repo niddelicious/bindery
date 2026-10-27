@@ -130,7 +130,7 @@ func TestEnumerateImportUnits_SeriesVersusDiscSet(t *testing.T) {
 			for _, f := range tc.files {
 				writeTestFile(t, filepath.Join(root, filepath.FromSlash(f)))
 			}
-			units, truncated := enumerateImportUnits(root, 1000, nil)
+			units, truncated := enumerateImportUnits(root, 1000, nil, nil)
 			if truncated {
 				t.Fatalf("unexpected truncation for a small tree")
 			}

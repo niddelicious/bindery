@@ -111,4 +111,23 @@ describe('Primary metadata provider selector', () => {
     expect(hint!.textContent).toMatch(/restart/i)
     expect(hint!.textContent).toMatch(/already in your library/i)
   })
+
+  // #3144: BnF is opt in, and its Licence Ouverte asks for credit to the
+  // source and the retrieval date where the provider is chosen.
+  it('offers BnF, persists it, and credits the BnF when it is chosen', async () => {
+    render(<MetadataTab />)
+    const select = await primaryProviderSelect()
+    expect(screen.queryByTestId('bnf-credit')).toBeNull()
+    expect(select.parentElement!.textContent).toMatch(/Licence Ouverte/)
+
+    fireEvent.change(select, { target: { value: 'bnf' } })
+    await waitFor(() => {
+      expect(api.setSetting).toHaveBeenCalledWith('metadata.primary_provider', 'bnf')
+    })
+    const credit = await screen.findByTestId('bnf-credit')
+    expect(credit.textContent).toMatch(/Contains data from the Bibliothèque nationale de France/)
+    expect(credit.textContent).toMatch(/Licence Ouverte \/ Open Licence 2\.0/)
+    expect(credit.textContent).toMatch(/date each record was retrieved/)
+    expect(credit.textContent).toMatch(/does not endorse/)
+  })
 })

@@ -115,6 +115,22 @@ func reconciliationRequest(method, target string, authorID int64, body []byte) *
 	return req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
 }
 
+func assertIndeterminateRow(t *testing.T, got CatalogueReconciliation, book *models.Book, reason CatalogueReconciliationIndeterminateReason) {
+	t.Helper()
+	if got.Summary.Indeterminate != len(got.IndeterminateRows) {
+		t.Fatalf("summary indeterminate = %d, rows = %d", got.Summary.Indeterminate, len(got.IndeterminateRows))
+	}
+	for _, row := range got.IndeterminateRows {
+		if row.BookID == book.ID {
+			if row.Title != book.Title || row.MetadataProvider != bookProvider(book) || row.Reason != reason {
+				t.Fatalf("indeterminate row = %+v, want book=%+v reason=%q", row, book, reason)
+			}
+			return
+		}
+	}
+	t.Fatalf("indeterminate rows = %+v, want book %d with reason %q", got.IndeterminateRows, book.ID, reason)
+}
+
 func TestPreviewCatalogueReconciliation_ReportsOnlySafeCandidates(t *testing.T) {
 	provider := &stubMetaProvider{name: "hardcover", works: []models.Book{
 		{ForeignID: "hc:keep", Title: "Keep", Language: "eng", MetadataProvider: "hardcover"},
@@ -124,7 +140,7 @@ func TestPreviewCatalogueReconciliation_ReportsOnlySafeCandidates(t *testing.T) 
 	f := newReconciliationFixture(t, provider)
 	keep := f.createBook(t, "hc:keep", "Keep", "hardcover", models.BookStatusWanted)
 	spanish := f.createBook(t, "hc:spanish", "Spanish", "hardcover", models.BookStatusWanted)
-	f.createBook(t, "OL-stale", "Old OpenLibrary Work", "openlibrary", models.BookStatusWanted)
+	previousProvider := f.createBook(t, "OL-stale", "Old OpenLibrary Work", "openlibrary", models.BookStatusWanted)
 	missing := f.createBook(t, "hc:missing", "Removed Upstream", "hardcover", models.BookStatusWanted)
 	unknown := f.createBook(t, "hc:unknown", "Unknown", "hardcover", models.BookStatusWanted)
 	imported := f.createBook(t, "hc:owned", "Owned", "hardcover", models.BookStatusImported)
@@ -171,6 +187,8 @@ func TestPreviewCatalogueReconciliation_ReportsOnlySafeCandidates(t *testing.T) 
 	if got.Summary.Indeterminate != 2 {
 		t.Errorf("indeterminate = %d, want unknown-language and unmatched previous-provider rows", got.Summary.Indeterminate)
 	}
+	assertIndeterminateRow(t, got, unknown, reconcileIndeterminateReasonLanguageUnknown)
+	assertIndeterminateRow(t, got, previousProvider, reconcileIndeterminateReasonUnmatchedCrossProvider)
 	if got.Summary.Kept != 3 {
 		t.Errorf("kept = %d, want accepted, unknown-language, and unmatched previous-provider rows (%q and %q included)", got.Summary.Kept, keep.Title, unknown.Title)
 	}
@@ -188,8 +206,9 @@ func TestPreviewCatalogueReconciliation_UnmatchedCrossProviderRowsAreIndetermina
 		"Shallow River",
 		"Where’s Molly",
 	}
+	localBooks := make([]*models.Book, 0, len(titles))
 	for i, title := range titles {
-		f.createBook(t, fmt.Sprintf("audible:hdc-%d", i), title, "audible", models.BookStatusWanted)
+		localBooks = append(localBooks, f.createBook(t, fmt.Sprintf("audible:hdc-%d", i), title, "audible", models.BookStatusWanted))
 	}
 
 	preview, err := f.handler.buildCatalogueReconciliation(context.Background(), f.author)
@@ -201,6 +220,9 @@ func TestPreviewCatalogueReconciliation_UnmatchedCrossProviderRowsAreIndetermina
 	}
 	if preview.Summary.Kept != len(titles) || preview.Summary.Indeterminate != len(titles) {
 		t.Fatalf("summary = %+v, want %d kept and indeterminate rows", preview.Summary, len(titles))
+	}
+	for _, book := range localBooks {
+		assertIndeterminateRow(t, preview, book, reconcileIndeterminateReasonUnmatchedCrossProvider)
 	}
 }
 
@@ -257,6 +279,7 @@ func TestApplyCatalogueReconciliation_CannotDeleteUnmatchedCrossProviderRow(t *t
 	if len(preview.Candidates) != 0 || preview.Summary.Kept != 1 || preview.Summary.Indeterminate != 1 {
 		t.Fatalf("preview = %+v, want one indeterminate kept row", preview)
 	}
+	assertIndeterminateRow(t, preview, local, reconcileIndeterminateReasonUnmatchedCrossProvider)
 
 	body, err := json.Marshal(applyCatalogueReconciliationRequest{BookIDs: []int64{local.ID}})
 	if err != nil {
@@ -326,7 +349,7 @@ func TestPreviewCatalogueReconciliation_IncompleteLanguageEvidenceIsIndeterminat
 		},
 	}
 	f := newReconciliationFixture(t, provider)
-	f.createBook(t, "hc:ambiguous", "Ambiguous", "hardcover", models.BookStatusWanted)
+	local := f.createBook(t, "hc:ambiguous", "Ambiguous", "hardcover", models.BookStatusWanted)
 
 	preview, err := f.handler.buildCatalogueReconciliation(context.Background(), f.author)
 	if err != nil {
@@ -338,6 +361,7 @@ func TestPreviewCatalogueReconciliation_IncompleteLanguageEvidenceIsIndeterminat
 	if preview.Summary.Kept != 1 || preview.Summary.Indeterminate != 1 {
 		t.Errorf("summary = %+v, want one indeterminate kept row", preview.Summary)
 	}
+	assertIndeterminateRow(t, preview, local, reconcileIndeterminateReasonLanguageUnknown)
 }
 
 func TestPreviewCatalogueReconciliation_LanguageEvidenceFailureIsIndeterminate(t *testing.T) {
@@ -351,7 +375,7 @@ func TestPreviewCatalogueReconciliation_LanguageEvidenceFailureIsIndeterminate(t
 		err: errors.New("language evidence unavailable"),
 	}
 	f := newReconciliationFixture(t, provider)
-	f.createBook(t, "hc:translated-default", "Translated Default", "hardcover", models.BookStatusWanted)
+	local := f.createBook(t, "hc:translated-default", "Translated Default", "hardcover", models.BookStatusWanted)
 
 	preview, err := f.handler.buildCatalogueReconciliation(context.Background(), f.author)
 	if err != nil {
@@ -363,6 +387,7 @@ func TestPreviewCatalogueReconciliation_LanguageEvidenceFailureIsIndeterminate(t
 	if preview.Summary.Kept != 1 || preview.Summary.Indeterminate != 1 {
 		t.Errorf("summary = %+v, want one indeterminate kept row", preview.Summary)
 	}
+	assertIndeterminateRow(t, preview, local, reconcileIndeterminateReasonLanguageLookupFailed)
 	if provider.calls != 1 {
 		t.Errorf("language evidence calls = %d, want 1", provider.calls)
 	}
@@ -461,6 +486,7 @@ func TestPreviewCatalogueReconciliation_PartialProviderNeverUsesAbsence(t *testi
 	if got.Summary.Indeterminate != 1 {
 		t.Fatalf("indeterminate = %d, want the missing local row", got.Summary.Indeterminate)
 	}
+	assertIndeterminateRow(t, got, missing, reconcileIndeterminateReasonPartialCatalogue)
 	if book, _ := f.books.GetByID(context.Background(), missing.ID); book == nil {
 		t.Fatal("preview mutated the database")
 	}
@@ -804,9 +830,13 @@ func TestBuildCatalogueReconciliation_UsesConservativeEditionAndIdentityEvidence
 			t.Errorf("candidate %d reason = %q, want %q", candidate.BookID, candidate.Reason, want)
 		}
 	}
-	if got.Summary.Indeterminate < 4 {
+	if got.Summary.Indeterminate != 4 {
 		t.Errorf("indeterminate = %d, want no-ID, DNB, edition-error, and unmatched previous-provider rows kept", got.Summary.Indeterminate)
 	}
+	assertIndeterminateRow(t, got, noID, reconcileIndeterminateReasonEditionUnavailable)
+	assertIndeterminateRow(t, got, dnb, reconcileIndeterminateReasonEditionUnavailable)
+	assertIndeterminateRow(t, got, editionUnknown, reconcileIndeterminateReasonEditionUnavailable)
+	assertIndeterminateRow(t, got, fallbackProvider, reconcileIndeterminateReasonUnmatchedCrossProvider)
 	if got.Summary.ProtectedStatus < 2 {
 		t.Errorf("protected status = %d, want skipped and other-owner rows", got.Summary.ProtectedStatus)
 	}
@@ -817,18 +847,89 @@ func TestBuildCatalogueReconciliation_UsesConservativeEditionAndIdentityEvidence
 	}
 }
 
+// NB and BnF works arrive from the author catalogue with every edition
+// attached, so the per-work editions lookup (a full GetBook each) is skipped
+// and the work's own editions are the evidence. A work that somehow has none
+// stays indeterminate: no editions is not proof of no ISBN or too few pages.
+// On a partial catalogue (page cap, failed series recall, BnF's unlinked 2026
+// records) a work may be missing editions, so none of them is judged on that
+// evidence.
+func TestBuildCatalogueReconciliation_NBUsesTheWorksOwnEditions(t *testing.T) {
+	for _, tc := range []struct{ provider, authorID string }{
+		{"nb", "nb:author:10000001"},
+		{"bnf", "bnf:author:11885918"},
+	} {
+		for _, complete := range []bool{true, false} {
+			name := tc.provider
+			id := func(s string) string { return name + ":" + s }
+			pages100, pages300 := 100, 300
+			isbn := "9788200000011"
+			lookupErr := errors.New("per-work editions lookup must not run for " + name + " works")
+			provider := &editionResultsProvider{
+				partialSnapshotProvider: partialSnapshotProvider{
+					stubMetaProvider: stubMetaProvider{name: name, works: []models.Book{
+						{ForeignID: id("long"), Title: "Long Work", Language: "eng", MetadataProvider: name,
+							Editions: []models.Edition{{NumPages: &pages300, ISBN13: &isbn}}},
+						{ForeignID: id("short"), Title: "Short Work", Language: "eng", MetadataProvider: name,
+							Editions: []models.Edition{{NumPages: &pages100, ISBN13: &isbn}}},
+						{ForeignID: id("bare"), Title: "Bare Work", Language: "eng", MetadataProvider: name},
+					}},
+					complete: complete,
+				},
+				errors: map[string]error{id("long"): lookupErr, id("short"): lookupErr, id("bare"): lookupErr},
+			}
+			f := newReconciliationFixture(t, provider)
+			profile, err := f.profiles.GetByID(context.Background(), models.DefaultMetadataProfileID)
+			if err != nil || profile == nil {
+				t.Fatalf("load profile: profile=%+v err=%v", profile, err)
+			}
+			profile.MinPages = 200
+			if err := f.profiles.Update(context.Background(), profile); err != nil {
+				t.Fatal(err)
+			}
+			long := f.createBook(t, id("long"), "Long Work", name, models.BookStatusWanted)
+			short := f.createBook(t, id("short"), "Short Work", name, models.BookStatusWanted)
+			bare := f.createBook(t, id("bare"), "Bare Work", name, models.BookStatusWanted)
+			f.author.ForeignID = tc.authorID // the snapshot routes by prefix
+
+			ctx := auth.WithUserRole(auth.WithUserID(context.Background(), 7), "user")
+			got, err := f.handler.buildCatalogueReconciliation(ctx, f.author)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertIndeterminateRow(t, got, bare, reconcileIndeterminateReasonEditionUnavailable)
+			if !complete {
+				if len(got.Candidates) != 0 {
+					t.Errorf("%s partial catalogue: candidates = %+v, want none judged on its editions", name, got.Candidates)
+				}
+				assertIndeterminateRow(t, got, short, reconcileIndeterminateReasonEditionUnavailable)
+				assertIndeterminateRow(t, got, long, reconcileIndeterminateReasonEditionUnavailable)
+				continue
+			}
+			if len(got.Candidates) != 1 || got.Candidates[0].BookID != short.ID || got.Candidates[0].Reason != reconcileReasonPages {
+				t.Errorf("%s candidates = %+v, want only the short work, for pages", name, got.Candidates)
+			}
+			for _, row := range got.IndeterminateRows {
+				if row.BookID == long.ID || row.BookID == short.ID {
+					t.Errorf("%s %q is indeterminate (%s): its own editions were not used", name, row.Title, row.Reason)
+				}
+			}
+		}
+	}
+}
+
 func TestReconciliationRejectReason_ProfileReasonsAndIndeterminateEvidence(t *testing.T) {
 	pages100 := 100
 	pages250 := 250
 	tests := []struct {
-		name                   string
-		work                   models.Book
-		profile                reconciliationProfile
-		editionEvidence        editionEvidence
-		languageEvidence       map[string]metadata.AuthorWorkLanguageEvidence
-		languageEvidenceFailed bool
-		wantReason             string
-		indeterminate          bool
+		name                    string
+		work                    models.Book
+		profile                 reconciliationProfile
+		editionEvidence         editionEvidence
+		languageEvidence        map[string]metadata.AuthorWorkLanguageEvidence
+		languageEvidenceFailed  bool
+		wantReason              string
+		wantIndeterminateReason CatalogueReconciliationIndeterminateReason
 	}{
 		{name: "accepted", work: models.Book{Title: "Dune"}},
 		{name: "empty title", work: models.Book{}, wantReason: reconcileReasonCatalogueFilter},
@@ -841,7 +942,7 @@ func TestReconciliationRejectReason_ProfileReasonsAndIndeterminateEvidence(t *te
 		},
 		{
 			name: "unknown language kept", work: models.Book{Title: "Unknown"},
-			profile: reconciliationProfile{allowedLangs: []string{"eng"}, unknownFail: true}, indeterminate: true,
+			profile: reconciliationProfile{allowedLangs: []string{"eng"}, unknownFail: true}, wantIndeterminateReason: reconcileIndeterminateReasonLanguageUnknown,
 		},
 		{
 			name:    "allowed edition overrides translated default",
@@ -862,7 +963,7 @@ func TestReconciliationRejectReason_ProfileReasonsAndIndeterminateEvidence(t *te
 		{
 			name:    "indeterminate evidence protects blank scalar",
 			work:    models.Book{ForeignID: "hc:unknown", Title: "Unknown"},
-			profile: reconciliationProfile{allowedLangs: []string{"eng"}, unknownFail: true}, indeterminate: true,
+			profile: reconciliationProfile{allowedLangs: []string{"eng"}, unknownFail: true}, wantIndeterminateReason: reconcileIndeterminateReasonLanguageUnknown,
 			languageEvidence: map[string]metadata.AuthorWorkLanguageEvidence{
 				"hc:unknown": {State: metadata.AuthorWorkLanguageIndeterminate},
 			},
@@ -885,11 +986,11 @@ func TestReconciliationRejectReason_ProfileReasonsAndIndeterminateEvidence(t *te
 			wantReason: reconcileReasonLanguage,
 		},
 		{
-			name:                   "failed evidence lookup protects non-allowed scalar",
-			work:                   models.Book{ForeignID: "hc:failed", Title: "Failed", Language: "por"},
-			profile:                reconciliationProfile{allowedLangs: []string{"eng"}, unknownFail: true},
-			languageEvidenceFailed: true,
-			indeterminate:          true,
+			name:                    "failed evidence lookup protects non-allowed scalar",
+			work:                    models.Book{ForeignID: "hc:failed", Title: "Failed", Language: "por"},
+			profile:                 reconciliationProfile{allowedLangs: []string{"eng"}, unknownFail: true},
+			languageEvidenceFailed:  true,
+			wantIndeterminateReason: reconcileIndeterminateReasonLanguageLookupFailed,
 		},
 		{
 			name: "part book", work: models.Book{Title: "The New Turing Omnibus"},
@@ -901,7 +1002,7 @@ func TestReconciliationRejectReason_ProfileReasonsAndIndeterminateEvidence(t *te
 		},
 		{
 			name: "edition lookup unavailable", work: models.Book{Title: "Unresolved"},
-			profile: reconciliationProfile{minPages: 200}, indeterminate: true,
+			profile: reconciliationProfile{minPages: 200}, wantIndeterminateReason: reconcileIndeterminateReasonEditionUnavailable,
 		},
 		{
 			name: "missing isbn", work: models.Book{Title: "No ISBN"},
@@ -921,9 +1022,9 @@ func TestReconciliationRejectReason_ProfileReasonsAndIndeterminateEvidence(t *te
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			reason, indeterminate := reconciliationRejectReason(tt.work, "test author", tt.profile, tt.editionEvidence, tt.languageEvidence, tt.languageEvidenceFailed)
-			if reason != tt.wantReason || indeterminate != tt.indeterminate {
-				t.Fatalf("reason=%q indeterminate=%v, want %q/%v", reason, indeterminate, tt.wantReason, tt.indeterminate)
+			reason, indeterminateReason := reconciliationRejectReason(tt.work, "test author", tt.profile, tt.editionEvidence, tt.languageEvidence, tt.languageEvidenceFailed)
+			if reason != tt.wantReason || indeterminateReason != tt.wantIndeterminateReason {
+				t.Fatalf("reason=%q indeterminate=%q, want %q/%q", reason, indeterminateReason, tt.wantReason, tt.wantIndeterminateReason)
 			}
 		})
 	}

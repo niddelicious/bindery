@@ -1,9 +1,10 @@
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { ManagedUser, UserOwnedRows, UserDeletePlan } from '../api/client'
+import { useModal } from '../components/useModal'
 
 const btnCls = 'px-3 py-1.5 rounded text-sm font-medium transition-colors'
-const inputCls = 'w-full bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-slate-400 dark:focus:border-zinc-600'
+const inputCls = 'w-full bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-3 py-2 text-sm'
 
 // The order rows are listed in, and the i18n key for each. Blocklist is left
 // out on purpose: those entries are global and survive either choice, so
@@ -53,12 +54,14 @@ export default function DeleteUserDialog({ user, counts, users, busy, onCancel, 
     })
   }
 
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" role="dialog" aria-modal="true">
-      <div className="bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-800 rounded-lg p-5 w-full max-w-md space-y-4">
-        <h2 className="text-base font-semibold">{t('users.deleteTitle', { username: user.username })}</h2>
+  const { titleId, panelProps } = useModal({ onClose: onCancel, canClose: !busy })
 
-        <div className="text-sm text-slate-600 dark:text-zinc-400 space-y-2">
+  return (
+    <div className="modal-overlay fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+      <div {...panelProps} className="bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-800 rounded-lg p-5 w-full max-w-md space-y-4 modal-max-h overflow-y-auto">
+        <h2 id={titleId} className="text-base font-semibold">{t('users.deleteTitle', { username: user.username })}</h2>
+
+        <div className="text-sm text-fg-muted space-y-2">
           <p>{t('users.deleteOwns')}</p>
           <ul className="space-y-0.5">
             {nonEmpty.map(r => (
@@ -83,7 +86,7 @@ export default function DeleteUserDialog({ user, counts, users, busy, onCancel, 
             />
             <span>
               <span className="font-medium">{t('users.deleteKeep')}</span>
-              <span className="block text-xs text-slate-500 dark:text-zinc-500">{t('users.deleteKeepHint')}</span>
+              <span className="block text-xs text-fg-muted">{t('users.deleteKeepHint')}</span>
             </span>
           </label>
 
@@ -110,7 +113,7 @@ export default function DeleteUserDialog({ user, counts, users, busy, onCancel, 
             />
             <span>
               <span className="font-medium">{t('users.deletePurge')}</span>
-              <span className="block text-xs text-slate-500 dark:text-zinc-500">{t('users.deletePurgeHint')}</span>
+              <span className="block text-xs text-fg-muted">{t('users.deletePurgeHint')}</span>
             </span>
           </label>
         </div>

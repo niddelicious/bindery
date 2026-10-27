@@ -19,6 +19,8 @@ type stubABSImporter struct {
 	progress abs.ImportProgress
 	runs     []models.ABSImportRun
 	rollback *abs.RollbackResult
+	// rollbackErr, when set, is returned by RollbackPreview and Rollback.
+	rollbackErr error
 }
 
 func (s *stubABSImporter) Start(_ context.Context, cfg abs.ImportConfig) error {
@@ -31,12 +33,18 @@ func (s *stubABSImporter) RecentRuns(context.Context, int) ([]models.ABSImportRu
 	return s.runs, nil
 }
 func (s *stubABSImporter) RollbackPreview(context.Context, int64) (*abs.RollbackResult, error) {
+	if s.rollbackErr != nil {
+		return nil, s.rollbackErr
+	}
 	if s.rollback == nil {
 		return &abs.RollbackResult{}, nil
 	}
 	return s.rollback, nil
 }
 func (s *stubABSImporter) Rollback(context.Context, int64) (*abs.RollbackResult, error) {
+	if s.rollbackErr != nil {
+		return nil, s.rollbackErr
+	}
 	if s.rollback == nil {
 		return &abs.RollbackResult{}, nil
 	}
@@ -224,7 +232,7 @@ func TestABSImportHandler_Status(t *testing.T) {
 	}
 }
 
-func TestABSImportHandler_StartBubblesImporterValidation(t *testing.T) {
+func TestABSImportHandler_StartUnclassifiedImporterErrorIsGeneric500(t *testing.T) {
 	t.Parallel()
 
 	stub := &stubABSImporter{startErr: errors.New("boom")}
@@ -240,7 +248,10 @@ func TestABSImportHandler_StartBubblesImporterValidation(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	h.Start(rec, httptest.NewRequest(http.MethodPost, "/api/v1/abs/import", nil))
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+	// The handler validates the config itself before calling Start, and the
+	// real importer's Start returns only its two sentinels, so an error it did
+	// not classify is a fault underneath it, not a bad request.
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
 	}
 }

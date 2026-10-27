@@ -13,14 +13,17 @@ import (
 // hot ingestion path can fill the cache faster than the hourly sweep evicts.
 //
 // Eviction policy: when set() would push the entry count past maxEntries,
-// the cache evicts the entry with the earliest expiresAt. That's the entry
-// that would have been dropped soonest anyway, so it's the cheapest correct
-// policy. It's an O(n) scan on every overflow set, which is fine at the
-// default cap of 10000 entries and the access frequency this cache sees
-// (metadata fan-out, not a request-path cache). Switch to container/list
-// LRU if the cap ever needs to climb past ~100k. We deliberately avoid
-// pulling in a third-party LRU package; this cache is internal and the
-// no-deps policy keeps the package vendorable.
+// the cache looks at a bounded sample of entries (evictSampleSize) and evicts
+// the one with the earliest expiresAt among them. That is the sampled entry
+// that would have been dropped soonest anyway. The sample keeps the write lock
+// hold time constant: the previous exact policy scanned every entry on each
+// overflowing set, so at the 10000 entry cap every set under load held the
+// lock for the whole map while readers queued behind it. The cost of sampling
+// is that the victim is only approximately the global earliest, which is fine
+// for a cache whose entries all share one TTL and are dropped by expiry
+// anyway. A cache no larger than the sample is still evicted exactly. We
+// deliberately avoid pulling in a third-party LRU package; this cache is
+// internal and the no-deps policy keeps the package vendorable.
 //
 // The janitor's lifetime is tied to the cache value via runtime.AddCleanup:
 // when the cache becomes unreachable, the cleanup fires and the janitor
@@ -56,6 +59,13 @@ type cacheItem struct {
 // prolific-author fan-out) bounds the cache at roughly 500MB worst-case,
 // which is the rough ceiling we want for a single aggregator instance.
 const defaultMaxEntries = 10000
+
+// evictSampleSize is how many entries one overflow eviction inspects. Go
+// starts a map range at a random position, so successive evictions look at
+// different parts of the map. 32 entries make it overwhelmingly likely that
+// the victim is among the earlier-expiring half while bounding the work, and
+// the lock hold time, independent of the cache size.
+const evictSampleSize = 32
 
 func newTTLCache(ttl time.Duration) *ttlCache {
 	return newTTLCacheWithCap(ttl, defaultMaxEntries)
@@ -136,30 +146,37 @@ func (c *ttlCache) delete(key string) {
 	delete(c.state.items, key)
 }
 
-// evictEarliestLocked removes the entry with the smallest expiresAt and is
-// invoked with state.mu held in write mode. It refuses to evict the key
+// evictEarliestLocked removes the entry with the smallest expiresAt among at
+// most evictSampleSize entries and is invoked with state.mu held in write
+// mode. It returns how many entries it inspected. It refuses to evict the key
 // just inserted by the caller so a single set() can never delete its own
 // write (matters when every existing entry happens to share an expiresAt
 // that compares strictly less than the just-written one only by chance).
-func (s *ttlState) evictEarliestLocked(justInserted string) {
+func (s *ttlState) evictEarliestLocked(justInserted string) int {
 	var (
 		victim       string
 		victimExpiry time.Time
 		found        bool
+		seen         int
 	)
 	for k, v := range s.items {
 		if k == justInserted {
 			continue
 		}
+		seen++
 		if !found || v.expiresAt.Before(victimExpiry) {
 			victim = k
 			victimExpiry = v.expiresAt
 			found = true
 		}
+		if seen >= evictSampleSize {
+			break
+		}
 	}
 	if found {
 		delete(s.items, victim)
 	}
+	return seen
 }
 
 // cleanup delegates to the underlying state. Exposed on the cache type so

@@ -1,5 +1,5 @@
 import { BrowserRouter, Routes, Route, NavLink, Link, Navigate, useLocation, useParams } from 'react-router'
-import { Fragment, lazy, Suspense, useEffect, useState, type ReactNode } from 'react'
+import { Fragment, Suspense, useEffect, useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { api } from './api/client'
 import { AuthProvider, useAuth } from './auth/AuthContext'
@@ -10,13 +10,18 @@ import ErrorBoundary from './components/ErrorBoundary'
 import LibrarySearch from './components/LibrarySearch'
 import Logo from './components/Logo'
 import NavTabs from './components/NavTabs'
+import { ModalHistoryProvider } from './components/useModal'
 import { activeGroup, isEntryActive, matchesPath, navGroupsFor, type NavItem } from './components/navGroups'
 import SetupBanner from './components/SetupBanner'
 import VersionBadge from './components/VersionBadge'
 import WhatsNewToast from './components/WhatsNewToast'
 import { useUnmatchedCount } from './components/useUnmatchedCount'
+import { useFailedQueueCount } from './components/useFailedQueueCount'
 import { REQUESTS_CHANGED_EVENT } from './pages/requests/requestLabels'
 import { useTheme } from './theme'
+import ScrollRestoration from './components/ScrollRestoration'
+import { lazyWithReload } from './util/lazyWithReload'
+import { primaryFill } from './components/buttons'
 
 // Route-scoped error boundary: a render crash in one page shows an inline error
 // inside the content area (the nav/header stay usable) instead of bubbling to
@@ -31,26 +36,27 @@ function RoutedErrorBoundary({ children }: { children: ReactNode }) {
   )
 }
 
-const LoginPage = lazy(() => import('./pages/LoginPage'))
-const SetupPage = lazy(() => import('./pages/SetupPage'))
-const AuthorsPage = lazy(() => import('./pages/AuthorsPage'))
-const AuthorDetailPage = lazy(() => import('./pages/AuthorDetailPage'))
-const BooksPage = lazy(() => import('./pages/BooksPage'))
-const BookDetailPage = lazy(() => import('./pages/BookDetailPage'))
-const WantedPage = lazy(() => import('./pages/WantedPage'))
-const QueuePage = lazy(() => import('./pages/QueuePage'))
-const ImportPage = lazy(() => import('./pages/import/ImportPage'))
-const SettingsPage = lazy(() => import('./pages/SettingsPage'))
-const UsersPage = lazy(() => import('./pages/UsersPage'))
-const HistoryPage = lazy(() => import('./pages/HistoryPage'))
-const SeriesPage = lazy(() => import('./pages/SeriesPage'))
-const CalendarPage = lazy(() => import('./pages/CalendarPage'))
-const DiscoverPage = lazy(() => import('./pages/DiscoverPage'))
-const SearchPage = lazy(() => import('./pages/SearchPage'))
-const RequesterLibraryPage = lazy(() => import('./pages/requests/RequesterLibraryPage'))
-const RequestSearchPage = lazy(() => import('./pages/requests/RequestSearchPage'))
-const MyRequestsPage = lazy(() => import('./pages/requests/MyRequestsPage'))
-const RequestsPage = lazy(() => import('./pages/requests/RequestsPage'))
+const LoginPage = lazyWithReload(() => import('./pages/LoginPage'), './pages/LoginPage')
+const SetupPage = lazyWithReload(() => import('./pages/SetupPage'), './pages/SetupPage')
+const AuthorsPage = lazyWithReload(() => import('./pages/AuthorsPage'), './pages/AuthorsPage')
+const AuthorDetailPage = lazyWithReload(() => import('./pages/AuthorDetailPage'), './pages/AuthorDetailPage')
+const BooksPage = lazyWithReload(() => import('./pages/BooksPage'), './pages/BooksPage')
+const BookDetailPage = lazyWithReload(() => import('./pages/BookDetailPage'), './pages/BookDetailPage')
+const DuplicatesPage = lazyWithReload(() => import('./pages/DuplicatesPage'), './pages/DuplicatesPage')
+const WantedPage = lazyWithReload(() => import('./pages/WantedPage'), './pages/WantedPage')
+const QueuePage = lazyWithReload(() => import('./pages/QueuePage'), './pages/QueuePage')
+const ImportPage = lazyWithReload(() => import('./pages/import/ImportPage'), './pages/import/ImportPage')
+const SettingsPage = lazyWithReload(() => import('./pages/SettingsPage'), './pages/SettingsPage')
+const UsersPage = lazyWithReload(() => import('./pages/UsersPage'), './pages/UsersPage')
+const HistoryPage = lazyWithReload(() => import('./pages/HistoryPage'), './pages/HistoryPage')
+const SeriesPage = lazyWithReload(() => import('./pages/SeriesPage'), './pages/SeriesPage')
+const CalendarPage = lazyWithReload(() => import('./pages/CalendarPage'), './pages/CalendarPage')
+const DiscoverPage = lazyWithReload(() => import('./pages/DiscoverPage'), './pages/DiscoverPage')
+const SearchPage = lazyWithReload(() => import('./pages/SearchPage'), './pages/SearchPage')
+const RequesterLibraryPage = lazyWithReload(() => import('./pages/requests/RequesterLibraryPage'), './pages/requests/RequesterLibraryPage')
+const RequestSearchPage = lazyWithReload(() => import('./pages/requests/RequestSearchPage'), './pages/requests/RequestSearchPage')
+const MyRequestsPage = lazyWithReload(() => import('./pages/requests/MyRequestsPage'), './pages/requests/MyRequestsPage')
+const RequestsPage = lazyWithReload(() => import('./pages/requests/RequestsPage'), './pages/requests/RequestsPage')
 
 // The admin nav badge: pending requests, read once on load and again after
 // each approve or decline. No polling.
@@ -78,7 +84,7 @@ function PageLoadingFallback() {
   const { t } = useTranslation()
 
   return (
-    <div className="py-10 text-center text-sm text-slate-600 dark:text-zinc-500">
+    <div className="py-10 text-center text-sm text-fg-muted">
       {t('common.loading')}
     </div>
   )
@@ -111,7 +117,7 @@ function NotFoundPage() {
       </p>
       <Link
         to="/"
-        className="inline-block mt-6 px-4 py-2 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium"
+        className={`inline-block mt-6 px-4 py-2 rounded ${primaryFill} text-sm font-medium`}
       >
         {t('notFound.home', 'Go to Authors')}
       </Link>
@@ -132,6 +138,9 @@ function Shell() {
   const unmatched = useUnmatchedCount(isAdmin)
   const navEntries = navGroupsFor(isAdmin, isRequester)
   const pendingRequests = usePendingRequestCount(isAdmin)
+  // Every role but requester has the queue; under tenancy the server counts
+  // a user's own downloads only.
+  const failedDownloads = useFailedQueueCount(isAdmin || (signedIn && !isRequester))
   const { pathname } = useLocation()
   // The group whose tab strip belongs above the current page, if any.
   const tabGroup = activeGroup(pathname, navEntries)
@@ -154,14 +163,26 @@ function Shell() {
       {item.key === 'import' && unmatched > 0 && (
         <span
           className="ml-1.5 inline-flex min-w-[1.25rem] items-center justify-center rounded-full bg-amber-100 px-1.5 text-[11px] font-semibold text-amber-800 dark:bg-amber-950 dark:text-amber-300"
-          aria-label={t('nav.importUnmatched', { count: unmatched, defaultValue: '{{count}} books need a decision' })}
         >
-          {unmatched > 999 ? '999+' : unmatched}
+          <span aria-hidden="true">{unmatched > 999 ? '999+' : unmatched}</span>
+          <span className="sr-only">{t('nav.importUnmatched', { count: unmatched, defaultValue: '{{count}} books need a decision' })}</span>
+        </span>
+      )}
+      {/* Failed downloads ride Activity and the Queue tab, in the danger
+          vocabulary: they need a retry or a removal, and they are the most
+          urgent thing the nav can report. */}
+      {(item.key === 'queue' || item.key === 'activity') && failedDownloads > 0 && (
+        <span
+          className="ml-1.5 inline-flex min-w-[1.25rem] items-center justify-center rounded-full bg-red-100 px-1.5 text-[11px] font-semibold text-red-800 dark:bg-red-950 dark:text-red-300"
+        >
+          <span aria-hidden="true">{failedDownloads > 999 ? '999+' : failedDownloads}</span>
+          <span className="sr-only">{t('nav.queueFailed', { count: failedDownloads, defaultValue: '{{count}} failed downloads' })}</span>
         </span>
       )}
       {(item.key === 'requests' || item.key === 'activity') && pendingRequests > 0 && (
-        <span className="ml-1.5 px-1.5 py-0.5 rounded-full bg-amber-500 text-white text-[10px] font-semibold" aria-label={t('nav.requestsPending', { count: pendingRequests })}>
-          {pendingRequests}
+        <span className="ml-1.5 px-1.5 py-0.5 rounded-full bg-amber-500 text-white text-[10px] font-semibold">
+          <span aria-hidden="true">{pendingRequests}</span>
+          <span className="sr-only">{t('nav.requestsPending', { count: pendingRequests })}</span>
         </span>
       )}
     </>
@@ -169,21 +190,21 @@ function Shell() {
 
   const linkClass = ({ isActive }: { isActive: boolean }) =>
     `px-2.5 py-2 rounded-md text-sm font-medium whitespace-nowrap transition-colors ${
-      isActive ? 'bg-slate-200 dark:bg-zinc-800 text-slate-900 dark:text-white' : 'text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200/50 dark:hover:bg-zinc-800/50'
+      isActive ? 'bg-slate-200 dark:bg-zinc-800 text-slate-900 dark:text-white' : 'text-fg-muted hover:text-slate-900 dark:hover:text-white hover:bg-slate-200/50 dark:hover:bg-zinc-800/50'
     }`
 
   const mobileLinkClass = ({ isActive }: { isActive: boolean }) =>
-    `block px-4 py-3 text-sm font-medium transition-colors border-b border-slate-200/50 dark:border-zinc-800/50 ${
-      isActive ? 'bg-slate-200 dark:bg-zinc-800 text-slate-900 dark:text-white' : 'text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200/50 dark:hover:bg-zinc-800/50'
+    `block px-4 py-3 text-sm font-medium transition-colors focus-visible:-outline-offset-2 border-b border-slate-200/50 dark:border-zinc-800/50 ${
+      isActive ? 'bg-slate-200 dark:bg-zinc-800 text-slate-900 dark:text-white' : 'text-fg-muted hover:text-slate-900 dark:hover:text-white hover:bg-slate-200/50 dark:hover:bg-zinc-800/50'
     }`
 
   return (
     <div className="min-h-screen bg-slate-50 dark:bg-zinc-950 text-slate-900 dark:text-zinc-100">
-      <header className="border-b border-slate-200 dark:border-zinc-800 sticky top-0 z-40 bg-slate-50 dark:bg-zinc-950">
+      <header className="border-b border-slate-200 dark:border-zinc-800 sticky top-0 z-40 pt-safe bg-slate-50 dark:bg-zinc-950">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex items-center justify-between gap-4 h-16">
             <Link to="/" className="flex items-center gap-2 flex-shrink-0 group" onClick={() => setMenuOpen(false)}>
-              <Logo className="w-14 h-14 rounded-full transition-transform group-hover:scale-105" />
+              <Logo alt="" className="w-14 h-14 rounded-full transition-transform group-hover:scale-105" />
               <h1 className="text-lg font-bold tracking-tight">Bindery</h1>
             </Link>
 
@@ -201,25 +222,15 @@ function Shell() {
 
             <div className="flex items-center gap-2 flex-shrink-0">
               {!isRequester && <LibrarySearch className="hidden lg:block w-40" />}
-              {!isRequester && <NavLink
-                to="/search"
-                className={({ isActive }) =>
-                  `hidden lg:block p-2 rounded-md transition-colors ${
-                    isActive ? 'bg-slate-200 dark:bg-zinc-800 text-slate-900 dark:text-white' : 'text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200/50 dark:hover:bg-zinc-800/50'
-                  }`
-                }
-                title={t('nav.search')}
-              >
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 1 0 5.196 5.196a7.5 7.5 0 0 0 10.607 10.607Z" />
-                </svg>
-              </NavLink>}
+              {/* One search box. Indexer search is a row in its results
+                  ("Search indexers for …"); the magnifier icon that sat
+                  beside it had the same glyph and a different scope. */}
               {isAdmin && (
                 <NavLink
                   to="/users"
                   className={({ isActive }) =>
                     `hidden lg:block p-2 rounded-md transition-colors ${
-                      isActive ? 'bg-slate-200 dark:bg-zinc-800 text-slate-900 dark:text-white' : 'text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200/50 dark:hover:bg-zinc-800/50'
+                      isActive ? 'bg-slate-200 dark:bg-zinc-800 text-slate-900 dark:text-white' : 'text-fg-muted hover:text-slate-900 dark:hover:text-white hover:bg-slate-200/50 dark:hover:bg-zinc-800/50'
                     }`
                   }
                   title={t('nav.users')}
@@ -233,7 +244,7 @@ function Shell() {
                 to="/settings"
                 className={({ isActive }) =>
                   `hidden lg:block p-2 rounded-md transition-colors ${
-                    isActive ? 'bg-slate-200 dark:bg-zinc-800 text-slate-900 dark:text-white' : 'text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200/50 dark:hover:bg-zinc-800/50'
+                    isActive ? 'bg-slate-200 dark:bg-zinc-800 text-slate-900 dark:text-white' : 'text-fg-muted hover:text-slate-900 dark:hover:text-white hover:bg-slate-200/50 dark:hover:bg-zinc-800/50'
                   }`
                 }
                 title={t('nav.settings')}
@@ -254,8 +265,10 @@ function Shell() {
               )}
               <button
                 onClick={() => setMenuOpen(open => !open)}
-                className="xl:hidden p-2 rounded-md text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-zinc-800 transition-colors"
-                aria-label="Toggle menu"
+                className="xl:hidden p-2 rounded-md text-fg-muted hover:text-slate-900 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-zinc-800 transition-colors"
+                aria-label={t('nav.toggleMenu', 'Toggle menu')}
+                aria-expanded={menuOpen}
+                aria-controls={menuOpen ? 'mobile-menu' : undefined}
               >
                 {menuOpen ? (
                   <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -272,7 +285,15 @@ function Shell() {
         </div>
 
         {menuOpen && (
-          <div className="xl:hidden border-t border-slate-200 dark:border-zinc-800">
+          // The header is sticky, so a menu taller than the screen (the admin
+          // one runs to about 840px) could never scroll into view with the
+          // page. Cap it at the viewport below the 4rem header row, its 1px
+          // border and the header's top safe area inset, and scroll it on its
+          // own.
+          <div
+            id="mobile-menu"
+            className="xl:hidden border-t border-slate-200 dark:border-zinc-800 max-h-[calc(100dvh-4rem-1px-env(safe-area-inset-top))] overflow-y-auto overscroll-contain"
+          >
             {/* From lg up the search, the icons and the account menu stay in
                 the header row, so the menu only carries the nav links. */}
             {!isRequester && <div className="lg:hidden px-4 py-3 border-b border-slate-200/50 dark:border-zinc-800/50">
@@ -336,7 +357,7 @@ function Shell() {
               {signedIn && (
                 <button
                   onClick={logout}
-                  className="text-xs text-fg-muted hover:text-slate-900 dark:hover:text-white transition-colors"
+                  className="touch-target text-xs text-fg-muted hover:text-slate-900 dark:hover:text-white transition-colors"
                 >
                   {t('login.signOut')}
                 </button>
@@ -371,8 +392,12 @@ function Shell() {
                 to the canonical "/" the same way /blocklist aliases into
                 settings, so a guessed or bookmarked URL lands somewhere. */}
             <Route path="/authors" element={<Navigate to="/" replace />} />
+            {/* The Activity nav group's own address, so the group label and
+                the URL agree when someone types it. */}
+            <Route path="/activity" element={<Navigate to="/wanted" replace />} />
             <Route path="/author/:id" element={<AuthorDetailPage />} />
             <Route path="/books" element={<BooksPage />} />
+            <Route path="/books/duplicates" element={<DuplicatesPage />} />
             <Route path="/book/:id" element={<BookDetailPage />} />
             <Route path="/wanted" element={<WantedPage />} />
             <Route path="/queue" element={<QueuePage />} />
@@ -401,7 +426,7 @@ function Shell() {
               href="https://github.com/vavallee/bindery"
               target="_blank"
               rel="noopener noreferrer"
-              className="flex items-center gap-2 text-slate-500 dark:text-zinc-600 hover:text-slate-700 dark:hover:text-zinc-300 transition-colors text-xs"
+              className="flex items-center gap-2 text-fg-muted hover:text-slate-700 dark:hover:text-zinc-300 transition-colors text-xs"
             >
               <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
                 <path d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z" />
@@ -423,36 +448,40 @@ const binderyBase: string =
 function App() {
   return (
     <BrowserRouter basename={binderyBase}>
-      <AuthProvider>
-        <Suspense fallback={<PageLoadingFallback />}>
-          <Routes>
-            <Route
-              path="/login"
-              element={
-                <PublicOnlyRoute mode="login">
-                  <LoginPage />
-                </PublicOnlyRoute>
-              }
-            />
-            <Route
-              path="/setup"
-              element={
-                <PublicOnlyRoute mode="setup">
-                  <SetupPage />
-                </PublicOnlyRoute>
-              }
-            />
-            <Route
-              path="/*"
-              element={
-                <AuthGuard>
-                  <Shell />
-                </AuthGuard>
-              }
-            />
-          </Routes>
-        </Suspense>
-      </AuthProvider>
+      <ScrollRestoration />
+      {/* Modals get their back button behaviour from this (#3052). */}
+      <ModalHistoryProvider>
+        <AuthProvider>
+          <Suspense fallback={<PageLoadingFallback />}>
+            <Routes>
+              <Route
+                path="/login"
+                element={
+                  <PublicOnlyRoute mode="login">
+                    <LoginPage />
+                  </PublicOnlyRoute>
+                }
+              />
+              <Route
+                path="/setup"
+                element={
+                  <PublicOnlyRoute mode="setup">
+                    <SetupPage />
+                  </PublicOnlyRoute>
+                }
+              />
+              <Route
+                path="/*"
+                element={
+                  <AuthGuard>
+                    <Shell />
+                  </AuthGuard>
+                }
+              />
+            </Routes>
+          </Suspense>
+        </AuthProvider>
+      </ModalHistoryProvider>
     </BrowserRouter>
   )
 }

@@ -16,6 +16,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/vavallee/bindery/internal/db"
+	"github.com/vavallee/bindery/internal/dirperm"
+	"github.com/vavallee/bindery/internal/importer/formatsniff"
 	"github.com/vavallee/bindery/internal/models"
 	"github.com/vavallee/bindery/internal/textutil"
 )
@@ -34,20 +36,94 @@ var downloadArtifactExts = map[string]bool{
 // (case-insensitive). PAR2 volumes like "x.vol01+02.par2" resolve to ".par2"
 // via filepath.Ext, so they are covered without special-casing.
 func isDownloadArtifact(name string) bool {
+	return isReceiptOrRepairFile(name) || isArchivePart(name)
+}
+
+// archiveVolumeRe matches the volumes of a RAR set: "x.rar", which covers the
+// RAR 5 "x.part1.rar" naming, and the RAR 4 overflow volumes "x.r00" to
+// "x.r99", then "x.s00" onwards.
+var archiveVolumeRe = regexp.MustCompile(`(?i)\.(rar|[rs][0-9]{2})$`)
+
+// isArchivePart reports whether name is a volume of a RAR set. Bindery does
+// not unpack archives (#3203): a release packed as one waits for an unpacker
+// such as unpackerr to extract it into the download's folder, and once it has,
+// the volumes are kept out of the library by copy and hardlink placements, like
+// the other download artifacts, and stay with the client. A move of a whole
+// folder carries them along instead (a moved torrent cannot seed anyway), and a
+// per-file move leaves them in the download folder. The name is all it looks
+// at; no archive is opened.
+func isArchivePart(name string) bool {
+	return archiveVolumeRe.MatchString(name)
+}
+
+// archiveAwaitingExtraction reports the first volume of the RAR set under dir
+// when dir holds one and no book file yet: a release packed as an archive
+// that nothing has extracted. Empty when dir holds a book file, no archive,
+// or cannot be read. It stops at the first book file it finds.
+//
+// An ebook file under MinPlausibleEbookBytes does not count as a book file: a
+// notes or link .txt shipped beside the volumes would otherwise end the wait,
+// and the import would be blocked as tiny before an unpacker ran (#3232). The
+// size comes from the walk's own directory entry, so no path is statted again.
+//
+// The first volume is the one an unpacker opens: "x.rar" in the RAR 4 naming,
+// "x.part1.rar" in RAR 5. Both are the first ".rar" in walk order (".part1."
+// sorts before ".part10."); ".r00" sorts before ".rar", so a ".rar" volume
+// wins over an earlier ".rNN" one.
+func archiveAwaitingExtraction(dir string) string {
+	archive, firstRar := "", ""
+	errBookFound := errors.New("book file found")
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || !d.Type().IsRegular() {
+			return nil
+		}
+		if IsBookFile(path) {
+			// An entry whose size cannot be read counts as a book, as before.
+			if info, infoErr := d.Info(); infoErr != nil || !TooSmallToBeABook(path, info.Size()) {
+				return errBookFound
+			}
+			return nil
+		}
+		if isArchivePart(d.Name()) {
+			if archive == "" {
+				archive = path
+			}
+			if firstRar == "" && strings.EqualFold(filepath.Ext(d.Name()), ".rar") {
+				firstRar = path
+			}
+		}
+		return nil
+	})
+	if errors.Is(err, errBookFound) {
+		return ""
+	}
+	if firstRar != "" {
+		return firstRar
+	}
+	return archive
+}
+
+// isReceiptOrRepairFile reports whether name has one of the receipt or repair
+// extensions in downloadArtifactExts. Unlike isDownloadArtifact it does not
+// count archive volumes: copy and hardlink placements keep those out of the
+// library, but a move takes the folder whole, so a sweep of it must never
+// delete them.
+func isReceiptOrRepairFile(name string) bool {
 	return downloadArtifactExts[strings.ToLower(filepath.Ext(name))]
 }
 
-// removeDownloadArtifacts deletes download-artifact files anywhere under dir.
-// Used after MoveDir's same-filesystem rename fast path, which moves the job
-// folder wholesale (a rename cannot filter); the copy-based paths skip the
-// artifacts at placement time instead. Best-effort: a receipt that cannot be
-// removed is not worth failing an otherwise-successful import over.
+// removeDownloadArtifacts deletes receipt and repair files (not archive
+// volumes, see isReceiptOrRepairFile) anywhere under dir. Used after MoveDir's
+// same-filesystem rename fast path, which moves the job folder wholesale (a
+// rename cannot filter); the copy-based paths skip the receipt and repair files
+// at placement time instead. Archive volumes are never removed. Best-effort: a receipt that cannot be removed is not worth
+// failing an otherwise-successful import over.
 func removeDownloadArtifacts(dir string) {
 	_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
-		if d.Type().IsRegular() && isDownloadArtifact(d.Name()) {
+		if d.Type().IsRegular() && isReceiptOrRepairFile(d.Name()) {
 			if rmErr := os.Remove(path); rmErr != nil {
 				slog.Warn("could not remove download artifact from imported folder", "path", path, "error", rmErr)
 			}
@@ -105,6 +181,18 @@ const defaultAudiobookFileTemplate = "{Title} - Part {Part:3}.{ext}"
 type Renamer struct {
 	template          string
 	audiobookTemplate string
+	// windowsNames drops the trailing dots and spaces Windows would strip from
+	// a rendered file or folder name (#3468). Off elsewhere, so POSIX paths
+	// are rendered exactly as before.
+	windowsNames bool
+}
+
+// WithWindowsNames sets whether rendered path components are made safe for
+// Windows, which silently drops a trailing dot or space from a name. It
+// defaults to the host OS; tests use it to cover both flavours anywhere.
+func (r *Renamer) WithWindowsNames(on bool) *Renamer {
+	r.windowsNames = on
+	return r
 }
 
 // NewRenamer creates a renamer with the given naming template.
@@ -122,7 +210,7 @@ func NewRenamerWithAudiobook(ebookTemplate, audiobookTemplate string) *Renamer {
 	if audiobookTemplate == "" {
 		audiobookTemplate = defaultAudiobookTemplate
 	}
-	return &Renamer{template: ebookTemplate, audiobookTemplate: audiobookTemplate}
+	return &Renamer{template: ebookTemplate, audiobookTemplate: audiobookTemplate, windowsNames: onWindows}
 }
 
 // ResolveNamingTemplates reads the operator's ebook and audiobook destination
@@ -150,12 +238,81 @@ func ResolveNamingTemplates(ctx context.Context, settings *db.SettingsRepo) (ebo
 	return ebook, get("naming_template_audiobook")
 }
 
+// ErrEbookNoExtension is returned by DestPath when the destination it would
+// propose carries no file extension: the source has none that can be recovered,
+// or the template does not put a "." in front of {ext}. Writing that name would
+// strand the file where Audiobookshelf and e-readers, which dispatch on the
+// extension, stop treating it as a book (#3217).
+var ErrEbookNoExtension = errors.New("the destination would have no file extension: check that the ebook naming template has a dot before {ext}, as in {Title}.{ext}")
+
+// ebookExtensionFormats are the formatsniff tokens an ebook extension may be
+// recovered as from the file's content. Audio tokens are excluded so a stray
+// audio signature never renames an ebook to .mp3.
+var ebookExtensionFormats = map[string]bool{
+	"azw":                  true,
+	formatsniff.FormatEPUB: true, formatsniff.FormatMOBI: true, formatsniff.FormatPDF: true,
+	formatsniff.FormatDJVU: true, formatsniff.FormatCBZ: true, formatsniff.FormatCBR: true,
+	formatsniff.FormatAZW3: true, formatsniff.FormatFB2: true, formatsniff.FormatTXT: true,
+	formatsniff.FormatRTF: true,
+}
+
+// sniffTimeout bounds how long a content sniff may take. formatsniff opens the
+// path to read its first bytes, and opening a FIFO blocks until a writer shows
+// up, so a tracked path that is a FIFO would otherwise hang a Reorganize preview
+// (#3217). A file that does not answer in time is treated as unreadable, which
+// leaves it without a recovered extension. The abandoned open stays parked on
+// its own goroutine until the FIFO gets a writer, a cost paid only by a tracked
+// book file that is a FIFO.
+const sniffTimeout = time.Second
+
+// sniffContent is formatsniff.DetectContent with a deadline.
+func sniffContent(path string) string {
+	done := make(chan string, 1)
+	go func() { done <- formatsniff.DetectContent(path) }()
+	select {
+	case format := <-done:
+		return format
+	case <-time.After(sniffTimeout):
+		return ""
+	}
+}
+
+// ebookExt returns the extension (no dot) DestPath will use for srcPath: the
+// path's own extension, or, when it has none, the format read from the file's
+// content. Empty when neither answers.
+func ebookExt(srcPath string) string {
+	if ext := strings.TrimPrefix(filepath.Ext(srcPath), "."); ext != "" {
+		return ext
+	}
+	if format := sniffContent(srcPath); ebookExtensionFormats[format] {
+		return format
+	}
+	return ""
+}
+
 // DestPath computes the destination path for an ebook file.
 // series and seriesNumber are the book's primary series title and position
 // (empty strings for standalone books without a series).
+//
+// The extension comes from srcPath, or from the file's content when srcPath has
+// none. A destination that would end up without an extension is refused with
+// ErrEbookNoExtension rather than returned (#3217).
 func (r *Renamer) DestPath(rootFolder string, author *models.Author, book *models.Book, series, seriesNumber, srcPath string) (string, error) {
-	ext := strings.TrimPrefix(filepath.Ext(srcPath), ".")
+	ext := ebookExt(srcPath)
 	dest := filepath.Join(rootFolder, r.apply(r.template, author, book, series, seriesNumber, ext))
+	if ext == "" || len(filepath.Ext(dest)) < 2 {
+		return "", ErrEbookNoExtension
+	}
+	if templateHasToken(r.template, "ext") {
+		if !strings.HasSuffix(strings.ToLower(dest), "."+strings.ToLower(ext)) {
+			return "", ErrEbookNoExtension
+		}
+	} else if strings.ContainsAny(filepath.Ext(dest), " \t") {
+		// A template with no {ext} must still end in a real extension. A space in
+		// what filepath.Ext found means a dot inside the title ("Dr. Book"), not
+		// an extension.
+		return "", ErrEbookNoExtension
+	}
 	return ensureContained(dest, rootFolder)
 }
 
@@ -166,15 +323,106 @@ func (r *Renamer) DestPath(rootFolder string, author *models.Author, book *model
 // ext is the source extension WITHOUT a leading dot (the template supplies the
 // dot before {ext}, matching the ebook template convention).
 func (r *Renamer) AudiobookFileName(template string, author *models.Author, book *models.Book, series, seriesNumber, ext string, part int) string {
+	return r.audiobookFileName(template, author, book, series, seriesNumber, ext, strconv.Itoa(part))
+}
+
+// AudiobookSingleFileName renders the per-file audiobook naming template for
+// an audiobook that is one audio file (#2900): a lone .m4b, or a folder holding
+// a single track. It is the same render AudiobookFileName does for a track of a
+// multi-file book, so the two differ only in the part.
+//
+// {Part} renders empty when every {Part} in the template sits in a conditional
+// group with its own text, so the #1127 collapse drops the whole group:
+// "{Title}{ - Pt. Part:3}.{ext}" gives "Title.m4b" here and "Title - Pt. 001.m4b"
+// for each track of a multi-file book. A bare "{Part}" or "{Part:3}" has its
+// glue outside the braces, and an empty value there leaves it dangling
+// ("Title - Part .m4b" from the default template), so such a template numbers
+// the lone file as part 1, exactly as it would the first of several.
+func (r *Renamer) AudiobookSingleFileName(template string, author *models.Author, book *models.Book, series, seriesNumber, ext string) string {
+	if template == "" {
+		template = defaultAudiobookFileTemplate
+	}
+	part := ""
+	if !audiobookPartIsConditional(template) {
+		part = "1"
+	}
+	return r.audiobookFileName(template, author, book, series, seriesNumber, ext, part)
+}
+
+func (r *Renamer) audiobookFileName(template string, author *models.Author, book *models.Book, series, seriesNumber, ext, part string) string {
 	if template == "" {
 		template = defaultAudiobookFileTemplate
 	}
 	name := r.applyWithExtra(template, author, book, series, seriesNumber, ext, map[string]string{
-		"Part": strconv.Itoa(part),
+		"Part": part,
 	})
 	// Defensive: collapse any separator a hand-edited template might introduce
 	// so a track can never escape the destination directory.
 	return filepath.Base(name)
+}
+
+// audiobookPartIsConditional reports whether every {Part} in template is in a
+// conditional group, one renderGroup collapses to "" when the part is empty.
+// It is the negation of renderGroup's simple-form test: a group whose content
+// is "Part" with an optional default or width modifier renders the bare value,
+// so an empty part there cannot take its surrounding text with it. A template
+// with no {Part} at all is trivially conditional.
+func audiobookPartIsConditional(template string) bool {
+	for _, g := range templateGroupRe.FindAllStringSubmatch(template, -1) {
+		if m := simpleGroupRe.FindStringSubmatch(g[1]); m != nil && !widthThenLiteralRe.MatchString(m[2]) && m[1] == "Part" {
+			return false
+		}
+	}
+	return true
+}
+
+// AudiobookTemplateHasPart reports whether template carries a {Part} token the
+// renderer substitutes, either as a group of its own ("{Part:3}") or inside a
+// conditional group with literal text ("{ - Pt. Part:3}"). The settings
+// validator uses it so the conditional form a single-file audiobook collapses
+// (#2900) can be saved; a plain substring test for "{Part" rejected it.
+func AudiobookTemplateHasPart(template string) bool {
+	return templateHasToken(template, "Part")
+}
+
+// templateHasToken reports whether any {...} group of template references the
+// named token, as a group of its own or inside a conditional group.
+func templateHasToken(template, name string) bool {
+	for _, g := range templateGroupRe.FindAllStringSubmatch(template, -1) {
+		if m := simpleGroupRe.FindStringSubmatch(g[1]); m != nil && !widthThenLiteralRe.MatchString(m[2]) {
+			if m[1] == name {
+				return true
+			}
+			continue
+		}
+		for _, w := range groupWordRe.FindAllStringSubmatch(g[1], -1) {
+			if w[1] == name {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// AudiobookTemplateUsesExt reports whether an audiobook folder template carries
+// an {ext} token. Audiobook folders render {ext} empty, so "{Title}.{ext}"
+// makes a folder named "Title." (#3217).
+func AudiobookTemplateUsesExt(template string) bool {
+	return templateHasToken(template, "ext")
+}
+
+// EbookTemplateExtNeedsDot reports whether an ebook template has a bare {ext}
+// group with no "." directly before it, as in "{Title}{ext}". That renders
+// "Titleepub", a file with no extension (#3217).
+func EbookTemplateExtNeedsDot(template string) bool {
+	for _, seg := range strings.Split(template, "/") {
+		for _, loc := range templateGroupRe.FindAllStringSubmatchIndex(seg, -1) {
+			if seg[loc[2]:loc[3]] == "ext" && !strings.HasSuffix(seg[:loc[0]], ".") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // AudiobookDestDir computes the destination directory into which an audiobook
@@ -192,7 +440,7 @@ func (r *Renamer) AudiobookDestDir(rootFolder string, author *models.Author, boo
 // safe to filepath.Join under the drop folder. filepath.Base is defensive
 // insurance against a sanitizer change ever letting a separator through.
 func (r *Renamer) DropEbookName(author *models.Author, book *models.Book, srcPath string) string {
-	ext := strings.TrimPrefix(filepath.Ext(srcPath), ".")
+	ext := ebookExt(srcPath)
 	return filepath.Base(r.apply("{Title} - {Author}.{ext}", author, book, "", "", ext))
 }
 
@@ -254,6 +502,16 @@ func (r *Renamer) applyWithExtra(template string, author *models.Author, book *m
 	kept := segments[:0]
 	for _, seg := range segments {
 		rendered := renderSegment(seg, values)
+		if r.windowsNames {
+			if trimmed := trimWindowsName(rendered); trimmed != "" || rendered == "" {
+				rendered = trimmed
+			} else {
+				// Only dots or spaces ("..."): Windows would drop the whole
+				// name, folding the folder level away. Keep a stand in so the
+				// path stays valid and distinct from its parent.
+				rendered = "_"
+			}
+		}
 		if rendered != "" {
 			kept = append(kept, rendered)
 		}
@@ -500,7 +758,7 @@ func firstGenre(genres []string) string {
 // This handles cross-filesystem moves (e.g., NFS download dir → NFS library).
 func MoveFile(src, dst string) error {
 	// Ensure destination directory exists
-	if err := os.MkdirAll(filepath.Dir(dst), 0o750); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dst), dirperm.Library()); err != nil {
 		return fmt.Errorf("create dir: %w", err)
 	}
 
@@ -644,6 +902,12 @@ func MoveDir(src, dst string) error {
 // the partial destination is removed but the source is left intact — never
 // remove the still-seeding source after a cancelled or failed copy.
 func moveDirCtx(ctx context.Context, src, dst string) error {
+	return moveDir(ctx, src, dst, true)
+}
+
+// moveDir is moveDirCtx with the rename fast path optional. allowRename=false
+// always takes the copy-then-remove route, which places regular files only.
+func moveDir(ctx context.Context, src, dst string, allowRename bool) error {
 	info, err := os.Stat(src)
 	if err != nil {
 		return fmt.Errorf("stat source dir: %w", err)
@@ -658,21 +922,24 @@ func moveDirCtx(ctx context.Context, src, dst string) error {
 		return fmt.Errorf("destination already exists: %s", dst)
 	}
 
-	if err := os.MkdirAll(filepath.Dir(dst), 0o750); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dst), dirperm.Library()); err != nil {
 		return fmt.Errorf("create parent dir: %w", err)
 	}
 
 	// Fast path: same filesystem. Rename moves the folder wholesale, so any
-	// download artifacts (.nzb receipts, .par2 volumes) ride along — sweep
+	// download artifacts (.nzb receipts, .par2 volumes) ride along, so sweep
 	// them out of the destination afterwards to match the filtering the
-	// copy-based paths do at placement time.
-	if err := os.Rename(src, dst); err == nil {
-		removeDownloadArtifacts(dst)
-		return nil
+	// copy-based paths do at placement time. Archive volumes are not swept:
+	// the folder has left the client, so they are all that is left of them.
+	if allowRename {
+		if err := os.Rename(src, dst); err == nil {
+			removeDownloadArtifacts(dst)
+			return nil
+		}
 	}
 
 	// Slow path: recursive copy, then verify, then remove.
-	if err := copyDirContext(ctx, src, dst); err != nil {
+	if err := copyDirFiltered(ctx, src, dst, isReceiptOrRepairFile); err != nil {
 		_ = os.RemoveAll(dst)
 		return fmt.Errorf("copy dir: %w", err)
 	}
@@ -704,7 +971,7 @@ func MoveDirMergeCtx(ctx context.Context, src, dst string) (skipped []string, er
 	if err := checkDestNotInsideSource("move", src, dst); err != nil {
 		return nil, err
 	}
-	skipped, err = mergeCopyDirContext(ctx, src, dst)
+	skipped, err = mergeCopyDirFiltered(ctx, src, dst, isReceiptOrRepairFile)
 	if err != nil {
 		return skipped, fmt.Errorf("copy dir: %w", err)
 	}
@@ -718,7 +985,7 @@ func MoveDirMergeCtx(ctx context.Context, src, dst string) (skipped []string, er
 // import mode counterpart to MoveFile. The source is left intact so that
 // torrent clients continue seeding from the original download location.
 func CopyFile(src, dst string) error {
-	if err := os.MkdirAll(filepath.Dir(dst), 0o750); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dst), dirperm.Library()); err != nil {
 		return fmt.Errorf("create dir: %w", err)
 	}
 	return copyFile(src, dst)
@@ -732,7 +999,7 @@ func CopyFile(src, dst string) error {
 // which would break seeding. The cost is extra disk for the imported copy.
 // Non-EXDEV errors (permissions, missing source) are returned as-is.
 func HardlinkFile(src, dst string) error {
-	if err := os.MkdirAll(filepath.Dir(dst), 0o750); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dst), dirperm.Library()); err != nil {
 		return fmt.Errorf("create dir: %w", err)
 	}
 	if err := osLink(src, dst); err != nil {
@@ -795,7 +1062,7 @@ func copyDirPublicCtx(ctx context.Context, src, dst string) error {
 	if _, err := os.Stat(dst); err == nil {
 		return fmt.Errorf("destination already exists: %s", dst)
 	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o750); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dst), dirperm.Library()); err != nil {
 		return fmt.Errorf("create parent dir: %w", err)
 	}
 	if err := copyDirContext(ctx, src, dst); err != nil {
@@ -843,10 +1110,16 @@ func CopyDirMergeCtx(ctx context.Context, src, dst string) (skipped []string, er
 // mergeCopyDirContext is copyDirContext's merge-aware sibling — see
 // CopyDirMergeCtx. dst is created if absent and reused as-is if present.
 func mergeCopyDirContext(ctx context.Context, srcDir, dstDir string) (skipped []string, err error) {
+	return mergeCopyDirFiltered(ctx, srcDir, dstDir, isDownloadArtifact)
+}
+
+// mergeCopyDirFiltered is mergeCopyDirContext with the left-behind set chosen
+// by the caller, as copyDirFiltered is for copyDirContext.
+func mergeCopyDirFiltered(ctx context.Context, srcDir, dstDir string, skip func(string) bool) (skipped []string, err error) {
 	if dirContains(srcDir, dstDir) {
 		return nil, fmt.Errorf("%w: %s is inside %s", ErrDestInsideSource, dstDir, srcDir)
 	}
-	if err := os.MkdirAll(dstDir, 0o750); err != nil {
+	if err := os.MkdirAll(dstDir, dirperm.Library()); err != nil {
 		return nil, err
 	}
 	srcRoot, err := os.OpenRoot(srcDir)
@@ -862,7 +1135,7 @@ func mergeCopyDirContext(ctx context.Context, srcDir, dstDir string) (skipped []
 	defer func() { _ = dstRoot.Close() }()
 
 	acc := &mergeSkipTracker{}
-	if err := mergeCopyDirRooted(ctx, srcRoot, dstRoot, ".", acc); err != nil {
+	if err := mergeCopyDirRooted(ctx, srcRoot, dstRoot, ".", acc, skip); err != nil {
 		return acc.skipped, err
 	}
 	return acc.skipped, nil
@@ -876,7 +1149,7 @@ type mergeSkipTracker struct {
 	skipped []string
 }
 
-func mergeCopyDirRooted(ctx context.Context, srcRoot, dstRoot *os.Root, rel string, acc *mergeSkipTracker) error {
+func mergeCopyDirRooted(ctx context.Context, srcRoot, dstRoot *os.Root, rel string, acc *mergeSkipTracker, skip func(string) bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -897,14 +1170,14 @@ func mergeCopyDirRooted(ctx context.Context, srcRoot, dstRoot *os.Root, rel stri
 		if !e.Type().IsRegular() && !e.IsDir() {
 			continue // skip symlinks and other non-regular entries
 		}
-		if e.Type().IsRegular() && isDownloadArtifact(e.Name()) {
+		if e.Type().IsRegular() && skip(e.Name()) {
 			continue // receipts/repair files never enter the library (#1542)
 		}
 		if e.IsDir() {
-			if err := dstRoot.Mkdir(child, 0o750); err != nil && !os.IsExist(err) {
+			if err := dstRoot.Mkdir(child, dirperm.Library()); err != nil && !os.IsExist(err) {
 				return err
 			}
-			if err := mergeCopyDirRooted(ctx, srcRoot, dstRoot, child, acc); err != nil {
+			if err := mergeCopyDirRooted(ctx, srcRoot, dstRoot, child, acc, skip); err != nil {
 				return err
 			}
 			continue
@@ -939,7 +1212,7 @@ func HardlinkDir(src, dst string) error {
 	if _, err := os.Stat(dst); err == nil {
 		return fmt.Errorf("destination already exists: %s", dst)
 	}
-	if err := os.MkdirAll(dst, 0o750); err != nil {
+	if err := os.MkdirAll(dst, dirperm.Library()); err != nil {
 		return fmt.Errorf("create dest dir: %w", err)
 	}
 
@@ -979,7 +1252,7 @@ func HardlinkDirMerge(src, dst string) (skipped []string, err error) {
 	if err := checkDestNotInsideSource("hardlink", src, dst); err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(dst, 0o750); err != nil {
+	if err := os.MkdirAll(dst, dirperm.Library()); err != nil {
 		return nil, fmt.Errorf("create dest dir: %w", err)
 	}
 
@@ -1021,7 +1294,7 @@ func mergeHardlinkDirRooted(srcRoot, dstRoot *os.Root, rel string, acc *mergeSki
 			continue // receipts/repair files never enter the library (#1542)
 		}
 		if e.IsDir() {
-			if err := dstRoot.Mkdir(child, 0o750); err != nil && !os.IsExist(err) {
+			if err := dstRoot.Mkdir(child, dirperm.Library()); err != nil && !os.IsExist(err) {
 				return err
 			}
 			if err := mergeHardlinkDirRooted(srcRoot, dstRoot, child, acc); err != nil {
@@ -1067,7 +1340,7 @@ func hardlinkDirRooted(srcRoot, dstRoot *os.Root, rel string) error {
 			continue // receipts/repair files never enter the library (#1542)
 		}
 		if e.IsDir() {
-			if err := dstRoot.Mkdir(child, 0o750); err != nil && !os.IsExist(err) {
+			if err := dstRoot.Mkdir(child, dirperm.Library()); err != nil && !os.IsExist(err) {
 				return err
 			}
 			if err := hardlinkDirRooted(srcRoot, dstRoot, child); err != nil {
@@ -1107,13 +1380,21 @@ func hardlinkDirRooted(srcRoot, dstRoot *os.Root, rel string) error {
 // what lets callers safely skip os.RemoveAll(src) on cancellation — the copy
 // never finishes, so the seeding source is never deleted.
 func copyDirContext(ctx context.Context, srcDir, dstDir string) error {
+	return copyDirFiltered(ctx, srcDir, dstDir, isDownloadArtifact)
+}
+
+// copyDirFiltered is copyDirContext with the set of files left behind chosen
+// by the caller. Copy mode passes isDownloadArtifact, which keeps archive
+// volumes out of the library. A move passes isReceiptOrRepairFile: the move
+// deletes the source afterwards, so leaving a volume behind would destroy it.
+func copyDirFiltered(ctx context.Context, srcDir, dstDir string, skip func(string) bool) error {
 	// A destination nested inside the source is unwalkable: the recursion below
 	// would descend into the directory tree it is creating and copy forever
 	// (#1809). Refuse before anything is created.
 	if dirContains(srcDir, dstDir) {
 		return fmt.Errorf("%w: %s is inside %s", ErrDestInsideSource, dstDir, srcDir)
 	}
-	if err := os.MkdirAll(dstDir, 0o750); err != nil {
+	if err := os.MkdirAll(dstDir, dirperm.Library()); err != nil {
 		return err
 	}
 	srcRoot, err := os.OpenRoot(srcDir)
@@ -1128,10 +1409,10 @@ func copyDirContext(ctx context.Context, srcDir, dstDir string) error {
 	}
 	defer func() { _ = dstRoot.Close() }()
 
-	return copyDirRooted(ctx, srcRoot, dstRoot, ".")
+	return copyDirRooted(ctx, srcRoot, dstRoot, ".", skip)
 }
 
-func copyDirRooted(ctx context.Context, srcRoot, dstRoot *os.Root, rel string) error {
+func copyDirRooted(ctx context.Context, srcRoot, dstRoot *os.Root, rel string, skip func(string) bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -1152,14 +1433,14 @@ func copyDirRooted(ctx context.Context, srcRoot, dstRoot *os.Root, rel string) e
 		if !e.Type().IsRegular() && !e.IsDir() {
 			continue // skip symlinks and other non-regular entries
 		}
-		if e.Type().IsRegular() && isDownloadArtifact(e.Name()) {
+		if e.Type().IsRegular() && skip(e.Name()) {
 			continue // receipts/repair files never enter the library (#1542)
 		}
 		if e.IsDir() {
-			if err := dstRoot.Mkdir(child, 0o750); err != nil && !os.IsExist(err) {
+			if err := dstRoot.Mkdir(child, dirperm.Library()); err != nil && !os.IsExist(err) {
 				return err
 			}
-			if err := copyDirRooted(ctx, srcRoot, dstRoot, child); err != nil {
+			if err := copyDirRooted(ctx, srcRoot, dstRoot, child, skip); err != nil {
 				return err
 			}
 			continue
@@ -1297,7 +1578,7 @@ var osLink = os.Link
 // MoveFileCtx is like MoveFile but returns ctx.Err() if the context is
 // cancelled during the cross-filesystem copy phase.
 func MoveFileCtx(ctx context.Context, src, dst string) error {
-	if err := os.MkdirAll(filepath.Dir(dst), 0o750); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dst), dirperm.Library()); err != nil {
 		return fmt.Errorf("create dir: %w", err)
 	}
 
@@ -1328,7 +1609,7 @@ func MoveFileCtx(ctx context.Context, src, dst string) error {
 // CopyFileCtx is like CopyFile but returns ctx.Err() if the context is
 // cancelled during the copy.
 func CopyFileCtx(ctx context.Context, src, dst string) error {
-	if err := os.MkdirAll(filepath.Dir(dst), 0o750); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dst), dirperm.Library()); err != nil {
 		return fmt.Errorf("create dir: %w", err)
 	}
 	return copyFileCtx(ctx, src, dst)
@@ -1373,7 +1654,7 @@ func CopyFileCtx(ctx context.Context, src, dst string) error {
 // The mode strings match those used by scanner.go: "hardlink", "copy",
 // and the default (anything else) is move.
 func StagedImport(ctx context.Context, mode, src, dst string) (stagedPath string, commit func() error, rollback func(), err error) {
-	if err := os.MkdirAll(filepath.Dir(dst), 0o750); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dst), dirperm.Library()); err != nil {
 		return "", nil, nil, fmt.Errorf("create dir: %w", err)
 	}
 	staged := stagingPath(dst)
@@ -1519,6 +1800,118 @@ func stageMove(ctx context.Context, src, staged string) (movedViaRename bool, er
 // import therefore can never delete the still-seeding source after the fact.
 func MoveDirCtx(ctx context.Context, src, dst string) error {
 	return moveDirCtx(ctx, src, dst)
+}
+
+// ErrDownloadDirIsSymlink is returned by MoveDownloadDirCtx when the download
+// folder itself is a symlink. Moving it would put the link, not a folder, into
+// the library, and copying through it would import whatever it points at.
+var ErrDownloadDirIsSymlink = errors.New("download folder is a symlink")
+
+// ErrLinkLeftInLibrary is returned by MoveDownloadDirCtx when, after a move,
+// the placed folder still holds a symlink or special file that could not be
+// removed. The import fails loudly rather than succeeding with the link in
+// place, where a media server reading the library would follow it.
+var ErrLinkLeftInLibrary = errors.New("imported folder still holds a symlink or special file")
+
+// refuseSymlinkedDownloadDir returns ErrDownloadDirIsSymlink when src is
+// itself a symlink (Lstat). Every download placement mode calls it, not only
+// move: copying or hardlinking through the link would import whatever it
+// names. An Lstat error returns nil and is left to the caller's own stat,
+// which already reports a missing source. Library internal moves
+// (reorganize) never call it.
+func refuseSymlinkedDownloadDir(src string) error {
+	if li, err := os.Lstat(src); err == nil && li.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%w: %s", ErrDownloadDirIsSymlink, src)
+	}
+	return nil
+}
+
+// maxReportedEntries caps how many non-regular entries a log line names.
+const maxReportedEntries = 10
+
+// MoveDownloadDirCtx is MoveDirCtx for a folder that came from a download
+// client. A download is untrusted input: whoever built the release decides
+// what is in it, symlinks included ("cover.jpg -> /config/bindery.db"). The
+// rename fast path moves a folder wholesale and cannot filter, so:
+//
+//   - a source that is itself a symlink is refused (ErrDownloadDirIsSymlink);
+//   - a source tree holding any symlink, device, fifo or socket skips the
+//     rename and takes the copy-then-remove path, which places regular files
+//     only, so the link never lands in the library at all;
+//   - a clean tree keeps the cheap rename, and the placed folder is checked
+//     again afterwards. Anything non-regular found then is removed, and if
+//     that fails the import fails with ErrLinkLeftInLibrary.
+//
+// Library-internal moves (reorganize) use MoveDirCtx, which keeps an
+// operator's own links exactly as they were.
+func MoveDownloadDirCtx(ctx context.Context, src, dst string) error {
+	li, err := os.Lstat(src)
+	if err != nil {
+		return fmt.Errorf("stat source dir: %w", err)
+	}
+	if li.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%w: %s", ErrDownloadDirIsSymlink, src)
+	}
+	found, scanErr := nonRegularEntries(src)
+	if scanErr != nil || len(found) > 0 {
+		// A tree that cannot be fully read cannot be shown clean, so it takes
+		// the filtering copy as well.
+		slog.Warn("download folder holds symlinks or special files, copying its regular files instead of moving the folder",
+			"src", src, "entries", capEntries(found), "count", len(found), "scanError", scanErr)
+		return moveDir(ctx, src, dst, false)
+	}
+	if err := moveDir(ctx, src, dst, true); err != nil {
+		return err
+	}
+	return ensureNoNonRegularEntries(dst)
+}
+
+// nonRegularEntries lists every entry under root that is neither a regular
+// file nor a directory. WalkDir reads entries without following links, so a
+// link to a directory is listed, not entered.
+func nonRegularEntries(root string) ([]string, error) {
+	var out []string
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() && !d.Type().IsRegular() {
+			out = append(out, path)
+		}
+		return nil
+	})
+	return out, err
+}
+
+// ensureNoNonRegularEntries removes any non-regular entry under dir and
+// returns ErrLinkLeftInLibrary if one could not be removed or the tree could
+// not be checked. Only reached after a rename of a tree that was clean a
+// moment earlier, so finding anything here means it changed in between.
+func ensureNoNonRegularEntries(dir string) error {
+	found, err := nonRegularEntries(dir)
+	if err != nil {
+		return fmt.Errorf("%w: could not check %s: %w", ErrLinkLeftInLibrary, dir, err)
+	}
+	var left []string
+	for _, p := range found {
+		if rmErr := os.Remove(p); rmErr != nil {
+			slog.Error("could not remove a symlink or special file from an imported folder", "path", p, "error", rmErr)
+			left = append(left, p)
+			continue
+		}
+		slog.Warn("removed a symlink or special file from an imported folder", "path", p)
+	}
+	if len(left) > 0 {
+		return fmt.Errorf("%w: %v", ErrLinkLeftInLibrary, capEntries(left))
+	}
+	return nil
+}
+
+func capEntries(entries []string) []string {
+	if len(entries) > maxReportedEntries {
+		return entries[:maxReportedEntries]
+	}
+	return entries
 }
 
 // CopyDirCtx is like CopyDir but returns ctx.Err() if the context is

@@ -14,8 +14,9 @@ Open a book's detail page and click **Edit**. You can change:
 | Genres | Comma-separated; the first genre drives the `{Genre}` naming token |
 | Language | Language code, e.g. `en`, `it` — drives the `{Lang}` naming token |
 | Release date | `YYYY-MM-DD`, or clear it entirely |
+| Series | The author's series, with a position; admin only. See [Fixing one book's series](Hardcover-Series-Wiki.md#fixing-one-books-series) |
 
-Every field you edit is **locked**: the nightly metadata refresh, the
+Every field you edit is **locked**: the scheduled metadata refresh, the
 author-works sync, and Audiobookshelf/Calibre re-imports keep your value
 instead of overwriting it. Locked fields show a 🔒 badge in the edit dialog.
 
@@ -28,6 +29,27 @@ them.
 Two actions clear locks on their own, deliberately: **Re-bind** and metadata
 **re-map**. Both mean "this is the wrong record, take the new one", so
 Bindery applies the new provider record wholesale.
+
+A re-bind also empties the fields the new record does not have, so a book
+moved to a record without a release date does not keep the old one. That covers
+the release date, language, description and genres. Bindery tracks the values
+you edited only through locks, so a value it cannot tell you typed (one an
+Audiobookshelf or Calibre import wrote, or one you edited without locking it)
+is emptied the same way. A field you locked is not emptied, although the
+re-bind still drops the lock itself, as it always did. When the provider could
+not answer for a field (for example OpenLibrary's search lookup failed, or
+Hardcover's single book fetch, which does not carry genres or language), the
+field is left alone. The rating, original title, cover, narrator, duration,
+ASIN, format and files are never emptied. When the new record does have a
+value, it replaces yours as before. The re-bind result lists what was emptied
+in `cleared`, and the book's history entry records the same list.
+
+A re-bind to a different record also drops the editions the metadata provider
+listed for the old record, so their ISBNs no longer steer searches for the
+book. Editions created by the Calibre or Audiobookshelf import for your files
+are kept, and so is the edition you selected for the book and any edition a
+download or a Calibre delivery recorded. Re-binding to the record the book is
+already bound to changes no editions.
 
 ## What you cannot edit: an author's sort name
 

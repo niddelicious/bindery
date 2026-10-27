@@ -173,7 +173,7 @@ func TestApplyEnrichmentSnapshotHonoursLocks(t *testing.T) {
 // the next library that enriches the same work. A locked book must not seed
 // the cache at all.
 func TestEnrichBookDoesNotCacheFromALockedBook(t *testing.T) {
-	newAgg := func() *Aggregator {
+	newAgg := func() *aggregatorCore {
 		enricher := &mockProvider{name: "hardcover", searchBooks: []models.Book{
 			{Title: "Locked Book", Description: "A considerably longer description supplied by the enricher.", Genres: []string{"Fantasy"}},
 		}}

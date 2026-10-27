@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next'
 import { api, BINDERY_BASE, OidcProvider } from '../api/client'
 import { useAuth } from '../auth/AuthContext'
 import Logo from '../components/Logo'
+import { literalInputAttrs } from '../util/inputAttrs'
 
 export default function LoginPage() {
   const { t } = useTranslation()
@@ -14,12 +15,16 @@ export default function LoginPage() {
   const navigate = useNavigate()
 
   useEffect(() => {
+    // Skip the state update once the page has unmounted, so a request that
+    // settles late does not call setState on a torn down component.
+    let cancelled = false
     api.oidcProviders()
       // Hide providers that failed startup discovery so users don't click
       // into a flow that's guaranteed to error. Older backends omit `status`
       // entirely — fall through and show those buttons unfiltered.
-      .then(ps => setOidcProviders(ps.filter(p => !p.status || p.status.state === 'ok')))
-      .catch(() => setOidcProviders([]))
+      .then(ps => { if (!cancelled) setOidcProviders(ps.filter(p => !p.status || p.status.state === 'ok')) })
+      .catch(() => { if (!cancelled) setOidcProviders([]) })
+    return () => { cancelled = true }
   }, [])
 
   // Read values from the form at submit time instead of React state.
@@ -61,7 +66,7 @@ export default function LoginPage() {
   if (status?.mode === 'proxy') {
     return (
       <CardShell title={t('login.title')} subtitle="">
-        <p className="text-sm text-slate-600 dark:text-zinc-400 text-center py-2">
+        <p className="text-sm text-fg-muted text-center py-2">
           {t('login.proxyHint')}
         </p>
       </CardShell>
@@ -70,6 +75,7 @@ export default function LoginPage() {
 
   return (
     <CardShell title={t('login.title')} subtitle="">
+      {status?.hostNotAllowed && <HostNotAllowedNotice mode={status.mode} host={status.refusedHost || window.location.host} />}
       {oidcProviders.length > 0 && (
         <div className="space-y-2 mb-4">
           {oidcProviders.map(p => (
@@ -84,7 +90,7 @@ export default function LoginPage() {
           {localAuthEnabled && (
             <div className="relative flex items-center gap-3 py-1">
               <div className="flex-1 border-t border-slate-200 dark:border-zinc-800" />
-              <span className="text-xs text-slate-500 dark:text-zinc-500">{t('login.orLocal')}</span>
+              <span className="text-xs text-fg-muted">{t('login.orLocal')}</span>
               <div className="flex-1 border-t border-slate-200 dark:border-zinc-800" />
             </div>
           )}
@@ -94,13 +100,14 @@ export default function LoginPage() {
       <form onSubmit={submit} method="post" className="space-y-4">
         <Field label={t('login.username')}>
           <input
+            {...literalInputAttrs}
             type="text"
             name="username"
             id="username"
             autoComplete="username"
             autoFocus
             required
-            className="w-full bg-white dark:bg-zinc-900 border border-slate-300 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+            className="w-full bg-white dark:bg-zinc-900 border border-slate-300 dark:border-zinc-700 rounded-md px-3 py-2 text-sm"
           />
         </Field>
         <Field label={t('login.password')}>
@@ -110,10 +117,10 @@ export default function LoginPage() {
             id="password"
             autoComplete="current-password"
             required
-            className="w-full bg-white dark:bg-zinc-900 border border-slate-300 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+            className="w-full bg-white dark:bg-zinc-900 border border-slate-300 dark:border-zinc-700 rounded-md px-3 py-2 text-sm"
           />
         </Field>
-        <label className="flex items-center gap-2 text-sm text-slate-600 dark:text-zinc-400">
+        <label className="flex items-center gap-2 text-sm text-fg-muted">
           <input
             type="checkbox"
             name="rememberMe"
@@ -123,7 +130,7 @@ export default function LoginPage() {
           {t('login.rememberMe')}
         </label>
         {error && (
-          <div className="text-sm text-red-600 dark:text-red-400 py-1">{error}</div>
+          <div className="text-sm text-red-700 dark:text-red-400 py-1">{error}</div>
         )}
         <button
           type="submit"
@@ -134,7 +141,7 @@ export default function LoginPage() {
         </button>
       </form>
       ) : oidcProviders.length === 0 ? (
-        <p className="text-sm text-slate-600 dark:text-zinc-400 text-center py-2">
+        <p className="text-sm text-fg-muted text-center py-2">
           {t('login.contactAdmin')}
         </p>
       ) : null}
@@ -145,19 +152,40 @@ export default function LoginPage() {
 export function CardShell({ title, subtitle, children }: { title: string; subtitle: string; children: React.ReactNode }) {
   return (
     <div className="min-h-screen flex items-center justify-center px-4 bg-slate-50 dark:bg-zinc-950 text-slate-900 dark:text-zinc-100">
-      <div className="w-full max-w-sm">
+      <main className="w-full max-w-sm">
         <div className="mb-6 text-center">
           <div className="flex items-center justify-center gap-2">
-            <Logo className="w-12 h-12 rounded-full" />
+            <Logo alt="" className="w-12 h-12 rounded-full" />
             <h1 className="text-2xl font-bold tracking-tight">Bindery</h1>
           </div>
-          {subtitle && <div className="text-xs text-slate-500 dark:text-zinc-500 mt-2">{subtitle}</div>}
+          {subtitle && <div className="text-xs text-fg-muted mt-2">{subtitle}</div>}
         </div>
         <div className="border border-slate-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 rounded-lg p-6 shadow-sm">
           <h2 className="text-lg font-semibold mb-4">{title}</h2>
           {children}
         </div>
-      </div>
+      </main>
+    </div>
+  )
+}
+
+// Shown when local-only or disabled mode refused to skip sign in because of
+// the host name the browser used. Without it the operator just sees a login
+// page and no reason why the mode stopped applying.
+function HostNotAllowedNotice({ mode, host }: { mode: string; host: string }) {
+  const { t } = useTranslation()
+  return (
+    <div role="alert" className="mb-4 rounded-md border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-950/40 px-3 py-2 text-sm text-amber-900 dark:text-amber-200">
+      <p className="font-medium">{t('login.hostNotAllowedTitle')}</p>
+      <p className="mt-1">{t('login.hostNotAllowed', { mode, host })}</p>
+      <a
+        href="https://github.com/vavallee/bindery/blob/main/docs/DEPLOYMENT.md#host-names-in-local-only-and-disabled-mode"
+        target="_blank"
+        rel="noopener noreferrer"
+        className="mt-1 inline-block underline"
+      >
+        {t('login.hostNotAllowedDocs')}
+      </a>
     </div>
   )
 }
@@ -165,7 +193,7 @@ export function CardShell({ title, subtitle, children }: { title: string; subtit
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <label className="block">
-      <span className="block text-xs font-medium text-slate-600 dark:text-zinc-400 mb-1">{label}</span>
+      <span className="block text-xs font-medium text-fg-muted mb-1">{label}</span>
       {children}
     </label>
   )

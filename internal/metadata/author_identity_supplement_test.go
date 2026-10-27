@@ -42,7 +42,7 @@ func hcBookFor(title string) models.Book {
 // than the author's name, which cannot separate two people who share one.
 func TestAuthorWorksSupplement_PrefersIdentity(t *testing.T) {
 	p := &identitySupplementProvider{byIdentity: []models.Book{hcBookFor("Right Book")}}
-	a := &Aggregator{}
+	a := &aggregatorCore{requests: &requestCache{}}
 
 	author := models.Author{
 		ID: 1, Name: "J.A. Andrews", ForeignID: "OL123A",
@@ -67,7 +67,7 @@ func TestAuthorWorksSupplement_PrefersIdentity(t *testing.T) {
 // linked directly to Hardcover needs no identifiers row.
 func TestAuthorWorksSupplement_UsesPrimaryForeignIDWhenItIsTheProvider(t *testing.T) {
 	p := &identitySupplementProvider{byIdentity: []models.Book{hcBookFor("Right Book")}}
-	a := &Aggregator{}
+	a := &aggregatorCore{requests: &requestCache{}}
 
 	author := models.Author{ID: 1, Name: "J.A. Andrews", ForeignID: "hc:primary-andrews"}
 	if _, err := a.authorWorksSupplement(context.Background(), p, author, author.Name); err != nil {
@@ -83,7 +83,7 @@ func TestAuthorWorksSupplement_UsesPrimaryForeignIDWhenItIsTheProvider(t *testin
 // how the first link gets made.
 func TestAuthorWorksSupplement_FallsBackToNameWhenUnlinked(t *testing.T) {
 	p := &identitySupplementProvider{byName: []models.Book{hcBookFor("Some Book")}}
-	a := &Aggregator{}
+	a := &aggregatorCore{requests: &requestCache{}}
 
 	author := models.Author{ID: 1, Name: "Unlinked Author", ForeignID: "OL999A"}
 	books, err := a.authorWorksSupplement(context.Background(), p, author, author.Name)
@@ -107,7 +107,7 @@ func TestAuthorWorksSupplement_FallsBackToNameWhenUnlinked(t *testing.T) {
 // requested.
 func TestAuthorWorksSupplement_IdentityWithNoWorksDoesNotWiden(t *testing.T) {
 	p := &identitySupplementProvider{byName: []models.Book{hcBookFor("Wrong Andrews Book")}}
-	a := &Aggregator{}
+	a := &aggregatorCore{requests: &requestCache{}}
 
 	author := models.Author{
 		ID: 1, Name: "J.A. Andrews", ForeignID: "OL123A",

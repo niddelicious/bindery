@@ -63,7 +63,7 @@ func NewWithTimeout(baseURL, apiKey string, timeout time.Duration) *Client {
 		// to the same Prowlarr/Jackett hosts. Without the proxy transport, a
 		// Prowlarr reachable only through the configured egress proxy fails on
 		// the sync/test path while indexer searches succeed (#proxy-bypass).
-		http: &http.Client{Timeout: timeout, Transport: sharedGuardedTransport()},
+		http: &http.Client{Timeout: timeout, Transport: sharedGuardedTransport(), CheckRedirect: httpsec.RedirectGuard(httpsec.PolicyService)},
 	}
 }
 
@@ -86,31 +86,17 @@ func sharedGuardedTransport() http.RoundTripper {
 	return guardedTransportShared
 }
 
-// guardedTransport mirrors the image proxy and notifier transports. On the
-// direct path it installs a per-dial SSRF re-validation, closing the DNS-rebind
-// TOCTOU between the up-front ValidateOutboundURL in the Prowlarr handlers
-// (internal/api/prowlarr.go) and the connect that actually happens (#2353).
+// guardedTransport is the Prowlarr dial guard (#2353): a per-dial SSRF
+// re-validation closing the DNS-rebind TOCTOU between the up-front
+// ValidateOutboundURL in the Prowlarr handlers (internal/api/prowlarr.go) and
+// the connect that actually happens. Under an outbound proxy the dial to the
+// proxy itself is exempt and a bypass-listed (direct) destination is checked.
 //
-// When an outbound proxy is configured the dial targets the operator-trusted
-// proxy rather than the Prowlarr host, so a per-dial check would re-validate
-// the proxy's own address and reject a LAN or loopback proxy. In that shape we
-// return the shared proxy transport unchanged and the up-front validation
-// carries the guard, which is all a rebind check could see past a proxy anyway.
-//
-// PolicyLANLoopback matches what the create and update handlers validate
+// PolicyService matches what the create and update handlers validate
 // against: a Prowlarr on the LAN, or on the Bindery host itself, is the normal
 // deployment.
 func guardedTransport() http.RoundTripper {
-	base := httpsec.DefaultProxyTransport()
-	if httpsec.ProxyFunc() != nil {
-		return base
-	}
-	if t, ok := base.(*http.Transport); ok {
-		c := t.Clone()
-		c.DialContext = httpsec.NewDialContext(httpsec.PolicyLANLoopback)
-		return c
-	}
-	return &http.Transport{DialContext: httpsec.NewDialContext(httpsec.PolicyLANLoopback)}
+	return httpsec.GuardedTransport(httpsec.PolicyService)
 }
 
 // remoteIndexer is the shape of each element in GET /api/v1/indexer.
@@ -151,6 +137,39 @@ func (ri remoteIndexer) seedRatio() *float64 {
 			return nil
 		}
 		var v float64
+		if err := json.Unmarshal(f.Value, &v); err != nil {
+			return nil
+		}
+		if v <= 0 {
+			return nil
+		}
+		return &v
+	}
+	return nil
+}
+
+// prowlarrSeedTimeField is the field name Prowlarr serialises for the
+// per-indexer seed time on a torrent indexer, the flattening of
+// IndexerTorrentBaseSettings.SeedTime. Prowlarr labels it in minutes. The
+// neighbouring packSeedTime is for season packs, which Bindery never grabs,
+// and Prowlarr has no inactive seed time setting at all.
+const prowlarrSeedTimeField = "torrentBaseSettings.seedTime"
+
+// seedTimeMinutes returns the per-indexer seed time Prowlarr has configured
+// for this indexer, in minutes, or nil when none is set (#2206). Prowlarr
+// models it as a nullable int and warns on anything <= 0, so as with the ratio
+// only a present, positive whole number counts; anything else, including a
+// fractional value that is not a valid int to Prowlarr either, is "no seed
+// time".
+func (ri remoteIndexer) seedTimeMinutes() *int {
+	for _, f := range ri.Fields {
+		if f.Name != prowlarrSeedTimeField {
+			continue
+		}
+		if len(f.Value) == 0 || string(f.Value) == "null" {
+			return nil
+		}
+		var v int
 		if err := json.Unmarshal(f.Value, &v); err != nil {
 			return nil
 		}
@@ -205,6 +224,10 @@ type IndexerInfo struct {
 	// when Prowlarr has none. Used to auto-populate Bindery's local seed-ratio
 	// override (#1065) for torrent indexers that lack an explicit override.
 	SeedRatio *float64
+	// SeedTimeMinutes is the per-indexer seed time Prowlarr has configured, or
+	// nil when it has none. Auto-populates Bindery's seed time override (#2206)
+	// under the same provenance rules as SeedRatio.
+	SeedTimeMinutes *int
 }
 
 // FetchIndexers returns all indexers configured in Prowlarr.
@@ -248,15 +271,16 @@ func (c *Client) FetchIndexers(ctx context.Context) ([]IndexerInfo, error) {
 		}
 
 		infos = append(infos, IndexerInfo{
-			ProwlarrID:     ri.ID,
-			Name:           ri.Name,
-			Enable:         ri.Enable,
-			Protocol:       ri.Protocol,
-			TorznabURL:     torznabURL,
-			APIKey:         c.apiKey,
-			SupportsSearch: ri.SupportsSearch,
-			Categories:     cats,
-			SeedRatio:      ri.seedRatio(),
+			ProwlarrID:      ri.ID,
+			Name:            ri.Name,
+			Enable:          ri.Enable,
+			Protocol:        ri.Protocol,
+			TorznabURL:      torznabURL,
+			APIKey:          c.apiKey,
+			SupportsSearch:  ri.SupportsSearch,
+			Categories:      cats,
+			SeedRatio:       ri.seedRatio(),
+			SeedTimeMinutes: ri.seedTimeMinutes(),
 		})
 	}
 	return infos, nil
@@ -353,17 +377,54 @@ func hasBookOrAudiobookCategory(categories []int) bool {
 	return false
 }
 
+// nonBookCategories are the standard Newznab subcategories inside the book
+// and audio ranges that never hold books: music (3010 MP3, 3020 Video, 3040
+// Lossless, 3050 Other, 3060 Foreign), 7010 Books/Mags and 7030 Books/Comics.
+// The search sends every stored category in the range, so keeping these asks
+// an indexer for its music, magazines and comics on every book search (#3214).
+// Localised and non-standard book IDs (31xx, 71xx, MaM-style) are not listed
+// and still pass, as #851 needs.
+var nonBookCategories = map[int]bool{
+	3010: true, 3020: true, 3040: true, 3050: true, 3060: true,
+	7010: true, 7030: true,
+}
+
 // bookCapabilityCategories returns an indexer's advertised capability
 // categories restricted to the book and audiobook ranges. It is the
 // standalone-Prowlarr fallback for FetchIndexers (issue #763): with no
 // application scope to consult, the indexer's own capabilities are the only
 // signal for whether it can serve books.
+//
+// A parent (3000, 7000) is kept only when a book child in its range survives,
+// or when the indexer lists no children there at all. An indexer whose only
+// 7xxx child is Comics must not keep a bare 7000, which the syncer widens to
+// 7020 and would send ebook searches to a comics tracker.
 func bookCapabilityCategories(indexer remoteIndexer) []int {
-	var out []int
+	var kept []int
+	hasChild := map[int]bool{}  // range (3 or 7) -> any child advertised
+	bookChild := map[int]bool{} // range -> a book child survived
 	for _, id := range categoryIDs(indexer.Capabilities.Categories) {
-		if isBookOrAudiobookCategory(id) {
-			out = append(out, id)
+		if !isBookOrAudiobookCategory(id) {
+			continue
 		}
+		parent := id%1000 == 0
+		if !parent {
+			hasChild[id/1000] = true
+		}
+		if nonBookCategories[id] {
+			continue
+		}
+		if !parent {
+			bookChild[id/1000] = true
+		}
+		kept = append(kept, id)
+	}
+	var out []int
+	for _, id := range kept {
+		if id%1000 == 0 && hasChild[id/1000] && !bookChild[id/1000] {
+			continue
+		}
+		out = append(out, id)
 	}
 	return out
 }

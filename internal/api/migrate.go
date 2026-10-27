@@ -2,10 +2,11 @@ package api
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/csv"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
@@ -104,14 +105,14 @@ func NewMigrateHandler(
 func (h *MigrateHandler) ImportCSV(w http.ResponseWriter, r *http.Request) {
 	file, err := acceptUpload(w, r, 5<<20) // 5 MB cap — CSV of names is tiny
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		writeUploadError(w, r, err)
 		return
 	}
 	defer file.Close()
 
 	result, err := migrate.ImportCSVAuthors(r.Context(), file, h.authors, h.settings, h.meta, h.onNewAuthor)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		writeMigrateError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
@@ -130,7 +131,7 @@ func (h *MigrateHandler) ImportReadarr(w http.ResponseWriter, r *http.Request) {
 	file, err := acceptUpload(w, r, 1<<30) // 1 GB cap — readarr.db is usually < 100 MB
 	if err != nil {
 		slog.Error("readarr import: upload rejected", "error", err)
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		writeUploadError(w, r, err)
 		return
 	}
 	defer file.Close()
@@ -184,9 +185,10 @@ func (h *MigrateHandler) ImportReadarrStatus(w http.ResponseWriter, _ *http.Requ
 }
 
 // acceptUpload reads a multipart "file" field with a size cap, returning
-// the file reader. Caller must Close. Passing w to MaxBytesReader makes the
-// server respond 413 Request Entity Too Large automatically when the body
-// exceeds maxBytes, instead of the handler seeing a generic parse error.
+// the file reader. Caller must Close. The body is wrapped in MaxBytesReader, so
+// a body past maxBytes surfaces as a *http.MaxBytesError from the parse below
+// (MaxBytesReader does not write a response itself; w only lets it close the
+// connection). writeUploadError maps that error to 413.
 func acceptUpload(w http.ResponseWriter, r *http.Request, maxBytes int64) (io.ReadCloser, error) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
@@ -205,7 +207,7 @@ func acceptUpload(w http.ResponseWriter, r *http.Request, maxBytes int64) (io.Re
 	}
 	if !allowedUploadCT[ct] {
 		_ = f.Close()
-		return nil, fmt.Errorf("unsupported content-type %q; expected text/csv or sqlite binary", ct)
+		return nil, fmt.Errorf("%w %q; expected text/csv or sqlite binary", errUploadType, ct)
 	}
 	return f, nil
 }
@@ -224,7 +226,7 @@ func acceptUpload(w http.ResponseWriter, r *http.Request, maxBytes int64) (io.Re
 func (h *MigrateHandler) ImportGoodreadsPreview(w http.ResponseWriter, r *http.Request) {
 	file, err := acceptUpload(w, r, 20<<20) // 20 MB cap — a big Goodreads export
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		writeUploadError(w, r, err)
 		return
 	}
 	defer file.Close()
@@ -266,8 +268,7 @@ func (h *MigrateHandler) ImportGoodreadsCommit(w http.ResponseWriter, r *http.Re
 	var body struct {
 		Token string `json:"token"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	if !decodeJSON(w, r, &body) {
 		return
 	}
 	body.Token = strings.TrimSpace(body.Token)
@@ -306,4 +307,44 @@ func parseShelfFilter(raw string) []string {
 		}
 	}
 	return out
+}
+
+// errUploadType marks an upload whose part Content-Type is not one of
+// allowedUploadCT. The message names only what the caller sent.
+var errUploadType = errors.New("unsupported content-type")
+
+// writeUploadError answers an error from acceptUpload. Multipart parsing
+// reports its own failures in words that name temp files and syscalls, so
+// only the cases a caller can act on keep their text: a body past the cap is
+// 413, a refused content type says which type was refused, a storage fault
+// (the temp file could not be written) is a generic 500, and everything else
+// is the same fixed 400 about the shape of the upload.
+func writeUploadError(w http.ResponseWriter, r *http.Request, err error) {
+	var tooLarge *http.MaxBytesError
+	var pathErr *fs.PathError
+	switch {
+	case errors.As(err, &tooLarge):
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "upload too large"})
+	case errors.Is(err, errUploadType):
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+	case errors.As(err, &pathErr):
+		writeServerError(w, r, err)
+	default:
+		slog.Debug("migrate: upload rejected", "error", err)
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid upload: send a multipart form with a file field"})
+	}
+}
+
+// writeMigrateError answers an error from a migration import. Two kinds of
+// text are safe and useful to the caller: a provider hold (a daily quota or a
+// rejected token, written by Bindery with the reset time) and a CSV syntax
+// error, which names a line and column of the caller's own file. Anything else
+// is a storage or I/O fault and gets the generic 500.
+func writeMigrateError(w http.ResponseWriter, r *http.Request, err error) {
+	var parseErr *csv.ParseError
+	if metadata.ProviderHold(err) != nil || errors.As(err, &parseErr) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeServerError(w, r, err)
 }

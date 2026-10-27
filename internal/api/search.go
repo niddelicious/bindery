@@ -3,10 +3,12 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/vavallee/bindery/internal/auth"
 	"github.com/vavallee/bindery/internal/db"
@@ -152,8 +154,30 @@ func NewSearchHandler(meta *metadata.Aggregator, books *db.BookRepo, authors *db
 func writeUpstreamError(w http.ResponseWriter, err error) {
 	slog.Warn("metadata provider request failed", "error", err)
 	writeJSON(w, http.StatusBadGateway, map[string]string{
-		"error": "metadata provider unavailable",
+		"error": upstreamErrorMessage(err),
 	})
+}
+
+// upstreamErrorMessage is the client-facing text for a metadata failure. It is
+// generic, except for a provider hold (a daily quota or a rejected token): that
+// is Bindery's own state, not the provider's words, and the user needs it to
+// know the call will keep failing until the reset time or a new token. The
+// token case is rebuilt here rather than relayed, since its Error() carries the
+// provider's answer.
+func upstreamErrorMessage(err error) string {
+	var daily *metadata.DailyQuotaError
+	if errors.As(err, &daily) {
+		return daily.Error()
+	}
+	var rejected *metadata.TokenRejectedError
+	if errors.As(err, &rejected) {
+		provider := rejected.Provider
+		if provider == "" {
+			provider = "the metadata provider"
+		}
+		return provider + " rejected the API token; requests are paused until the token is changed in Settings"
+	}
+	return "metadata provider unavailable"
 }
 
 func (h *SearchHandler) SearchAuthors(w http.ResponseWriter, r *http.Request) {
@@ -224,8 +248,18 @@ func (h *SearchHandler) Lookup(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// interactiveLookupTimeout bounds a whole ISBN or ASIN lookup from the Add
+// Book dialog. The lookup walks the providers one after another, and each now
+// retries a refusal or an outage, so two dead providers used to run past the
+// server's 120s write timeout and the dialog got a dropped connection instead
+// of an error. The provider clients fail fast once a retry or hold would
+// outlast this deadline. A var so tests can shorten it.
+var interactiveLookupTimeout = 20 * time.Second
+
 func (h *SearchHandler) lookupByISBN(w http.ResponseWriter, r *http.Request, isbn string) {
-	book, outcome, err := h.meta.GetBookByISBNWithOutcome(r.Context(), isbn)
+	ctx, cancel := context.WithTimeout(r.Context(), interactiveLookupTimeout)
+	defer cancel()
+	book, outcome, err := h.meta.GetBookByISBNWithOutcome(ctx, isbn)
 	if err != nil {
 		writeUpstreamError(w, err)
 		return
@@ -250,9 +284,18 @@ func (h *SearchHandler) lookupByISBN(w http.ResponseWriter, r *http.Request, isb
 }
 
 func (h *SearchHandler) lookupByASIN(w http.ResponseWriter, r *http.Request, asin string) {
-	book, err := h.meta.GetCanonicalBookByASIN(r.Context(), asin)
+	ctx, cancel := context.WithTimeout(r.Context(), interactiveLookupTimeout)
+	defer cancel()
+	book, err := h.meta.GetCanonicalBookByASIN(ctx, asin)
 	if err != nil {
 		writeUpstreamError(w, err)
+		return
+	}
+	if book == nil && h.meta.AudnexDisabled() {
+		// The lookup was skipped, not empty: say so rather than claim no book.
+		writeJSON(w, http.StatusNotFound, map[string]string{
+			"error": fmt.Sprintf("ASIN %s could not be looked up because the audnex source is turned off in Settings, Metadata. Turn it on, or try searching by title instead.", asin),
+		})
 		return
 	}
 	if book == nil {

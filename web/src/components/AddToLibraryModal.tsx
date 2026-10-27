@@ -1,16 +1,21 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { api, Author, Book } from '../api/client'
+import BookRating from './BookRating'
 import type { LibraryRequest } from '../api/client'
 import { useIsRequester } from '../auth/AuthContext'
 import { isbnFromQuery, resolveBookQuery } from '../api/booklookup'
 import { splitAuthorSearchResults } from './addAuthorTitleGuard'
 import { groupAddResults } from './addToLibraryGrouping'
+import type { AddResultFilter } from './addToLibraryGrouping'
 import AddAuthorConfirm from './AddAuthorConfirm'
 import { AuthorAddDefaults, loadAuthorAddDefaults } from './authorAddDefaults'
 import AddBookConfirm from './AddBookConfirm'
 import { authorProviderKey } from '../util/authorMetadata'
 import { providerDisplayName } from '../util/metadataSource'
+import { useModal } from './useModal'
+import CoverImage from './CoverImage'
+import { primaryFill } from './buttons'
 
 // What the modal reports back once something is in the library. Callers that
 // only refresh a list ignore the payload; the header search navigates to it.
@@ -25,13 +30,16 @@ interface Props {
   // search hands its query over this way (#2551) so a miss in the library
   // becomes an add without retyping.
   initialQuery?: string
-  // Which button opened the dialog. Only the placeholder changes: the search
-  // itself always fans out to authors and books, because the user's intent is
-  // resolved by what they pick, not by what they said up front (#1227).
+  // Which button opened the dialog. It sets the placeholder and which results
+  // show first (books, authors, or both); the search itself always fans out to
+  // authors and books, so the other kind is one click away (#1227).
   mode?: 'author' | 'book'
   // For a requester, called once a request is sent (the confirm steps send a
   // request instead of adding).
   onRequested?: (request: LibraryRequest) => void
+  // The dialog is the whole page (the requester's search route) rather than
+  // a layer over one, so it adds no history entry of its own.
+  standalone?: boolean
 }
 
 type Selected =
@@ -51,7 +59,7 @@ function isIdentifierQuery(q: string): boolean {
   return isbnFromQuery(q) !== null || ASIN_RE.test(q)
 }
 
-export default function AddToLibraryModal({ onClose, onAdded, initialQuery, mode, onRequested }: Props) {
+export default function AddToLibraryModal({ onClose, onAdded, initialQuery, mode, onRequested, standalone = false }: Props) {
   const { t } = useTranslation()
   // A requester cannot read profiles, root folders or settings, and never
   // needs them: the admin picks those at approval.
@@ -60,6 +68,7 @@ export default function AddToLibraryModal({ onClose, onAdded, initialQuery, mode
   const [authors, setAuthors] = useState<Author[]>([])
   const [hiddenAuthors, setHiddenAuthors] = useState<Author[]>([])
   const [showHidden, setShowHidden] = useState(false)
+  const [filter, setFilter] = useState<AddResultFilter>(mode === 'book' ? 'books' : mode === 'author' ? 'authors' : 'all')
   const [books, setBooks] = useState<Book[]>([])
   const [searched, setSearched] = useState(false)
   const [searching, setSearching] = useState(false)
@@ -74,7 +83,6 @@ export default function AddToLibraryModal({ onClose, onAdded, initialQuery, mode
   // every row selection. Null until it arrives; the step disables Add
   // meanwhile.
   const [authorDefaults, setAuthorDefaults] = useState<AuthorAddDefaults | null>(null)
-  const dialogRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     if (isRequester) return
@@ -90,7 +98,7 @@ export default function AddToLibraryModal({ onClose, onAdded, initialQuery, mode
         const value = (s.value || '').trim().toLowerCase()
         // Mirror MetadataPrimaryProviders on the backend; anything else means
         // no explicit choice, so no notice.
-        if (value === 'openlibrary' || value === 'dnb' || value === 'hardcover') setPrimaryProvider(value)
+        if (value === 'openlibrary' || value === 'dnb' || value === 'nb' || value === 'bnf' || value === 'hardcover') setPrimaryProvider(value)
       })
       .catch(() => { /* unset; no provider notice needed */ })
   }, [isRequester])
@@ -115,6 +123,9 @@ export default function AddToLibraryModal({ onClose, onAdded, initialQuery, mode
         setHiddenAuthors([])
         setBooks(found)
         setSearchedISBN(isbnFromQuery(q))
+        // An identifier never returns an author, so the Authors view would
+        // hide the one result there is.
+        setFilter(f => (f === 'authors' ? 'books' : f))
       } else {
         let authorError: unknown = null
         let bookError: unknown = null
@@ -164,56 +175,10 @@ export default function AddToLibraryModal({ onClose, onAdded, initialQuery, mode
     return provider
   }
 
-  const handleDialogKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
-    if (event.key === 'Escape') {
-      event.preventDefault()
-      onClose()
-      return
-    }
-    if (event.key !== 'Tab') return
-
-    const focusable = dialogRef.current?.querySelectorAll<HTMLElement>(
-      'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), summary, textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
-    )
-    if (!focusable?.length) return
-    const first = focusable[0]
-    const last = focusable[focusable.length - 1]
-    const activeElement = document.activeElement as HTMLElement | null
-    const activeIsFocusable = activeElement ? Array.from(focusable).includes(activeElement) : false
-    if (event.shiftKey && (activeElement === first || !activeIsFocusable)) {
-      event.preventDefault()
-      last.focus()
-    } else if (!event.shiftKey && (activeElement === last || !activeIsFocusable)) {
-      event.preventDefault()
-      first.focus()
-    }
-  }
-
-  // Focus leaves the dialog after an overlay click or when a row that had
-  // focus is replaced, and from the body the dialog's own handler never sees
-  // the key. Escape must still close and Tab must still land inside, so a
-  // document listener covers keys whose target is outside the dialog; keys
-  // inside it stay with handleDialogKeyDown so inner menus can stop them.
-  useEffect(() => {
-    const onDocumentKeyDown = (event: KeyboardEvent) => {
-      const dialog = dialogRef.current
-      if (!dialog || (event.target instanceof Node && dialog.contains(event.target))) return
-      if (event.key === 'Escape') {
-        event.preventDefault()
-        onClose()
-        return
-      }
-      if (event.key !== 'Tab') return
-      const focusable = dialog.querySelectorAll<HTMLElement>(
-        'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), summary, textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
-      )
-      if (!focusable.length) return
-      event.preventDefault()
-      ;(event.shiftKey ? focusable[focusable.length - 1] : focusable[0]).focus()
-    }
-    document.addEventListener('keydown', onDocumentKeyDown)
-    return () => document.removeEventListener('keydown', onDocumentKeyDown)
-  }, [onClose])
+  // Escape, the focus trap and the back button come from useModal (#3052).
+  // As a page of its own (the requester's search) back already leaves the
+  // page, which is what the user wants there.
+  const { panelProps } = useModal({ onClose, labelledBy: 'add-to-library-title', history: !standalone })
 
   const placeholder = mode === 'author'
     ? t('addToLibrary.searchPlaceholderAuthor')
@@ -221,15 +186,23 @@ export default function AddToLibraryModal({ onClose, onAdded, initialQuery, mode
       ? t('addToLibrary.searchPlaceholderBook')
       : t('addToLibrary.searchPlaceholder')
 
-  const rows = useMemo(
-    () => groupAddResults(showHidden ? [...authors, ...hiddenAuthors] : authors, books),
-    [showHidden, authors, hiddenAuthors, books],
+  const shownAuthors = useMemo(
+    () => (showHidden ? [...authors, ...hiddenAuthors] : authors),
+    [showHidden, authors, hiddenAuthors],
   )
+  const rows = useMemo(() => groupAddResults(shownAuthors, books, filter), [shownAuthors, books, filter])
   const hasRows = rows.length > 0
+  // The Books view has no author rows, so it has none to reveal either.
+  const hiddenCount = filter === 'books' ? 0 : hiddenAuthors.length
+  const filterOptions: { value: AddResultFilter; label: string; count: number | null }[] = [
+    { value: 'all', label: t('addToLibrary.filter.all'), count: null },
+    { value: 'books', label: t('addToLibrary.filter.books'), count: searched ? books.length : null },
+    { value: 'authors', label: t('addToLibrary.filter.authors'), count: searched ? shownAuthors.length : null },
+  ]
 
   const badgeClass = 'px-2 py-0.5 rounded-full bg-slate-300/70 dark:bg-zinc-700 text-[11px] font-medium text-slate-700 dark:text-zinc-300'
   const openClass = 'px-3 py-1 rounded text-xs font-medium border border-slate-400 dark:border-zinc-600 hover:bg-slate-200 dark:hover:bg-zinc-800'
-  const selectClass = 'px-3 py-1 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed rounded text-xs font-medium text-white flex-shrink-0'
+  const selectClass = `px-3 py-1 ${primaryFill} disabled:opacity-50 disabled:cursor-not-allowed rounded text-xs font-medium flex-shrink-0`
 
   // Keys carry the list index as well as the id: providers occasionally return
   // the same record twice, and a duplicate key makes React drop a row.
@@ -243,7 +216,7 @@ export default function AddToLibraryModal({ onClose, onAdded, initialQuery, mode
       >
         <div className="min-w-0">
           <div className="font-medium text-sm">{author.authorName}</div>
-          <div className="text-xs text-slate-600 dark:text-zinc-500 flex flex-wrap gap-x-3">
+          <div className="text-xs text-fg-muted flex flex-wrap gap-x-3">
             {author.disambiguation && <span>{t('addToLibrary.topWork')} {author.disambiguation}</span>}
             {author.statistics?.bookCount ? <span title={t('addToLibrary.booksTooltip')}>{t('addToLibrary.books', { count: author.statistics.bookCount })}</span> : null}
             {author.ratingsCount ? <span>{t('addToLibrary.ratings', { count: author.ratingsCount })}</span> : null}
@@ -283,19 +256,20 @@ export default function AddToLibraryModal({ onClose, onAdded, initialQuery, mode
         data-testid="add-result-book"
         className="flex items-center gap-3 p-3 rounded-md bg-slate-200/50 dark:bg-zinc-800/50 hover:bg-slate-200 dark:hover:bg-zinc-800"
       >
-        {book.imageUrl ? (
-          <img src={book.imageUrl} alt="" className="w-14 h-20 object-cover rounded flex-shrink-0" />
-        ) : (
-          <div aria-hidden="true" className="w-14 h-20 rounded bg-slate-300 dark:bg-zinc-800 flex-shrink-0" />
-        )}
+        <CoverImage src={book.imageUrl} alt="" className="w-14 h-20 object-cover rounded flex-shrink-0"
+          fallback={
+            <div aria-hidden="true" className="w-14 h-20 rounded bg-slate-300 dark:bg-zinc-800 flex-shrink-0" />
+          }
+        />
         <div className="flex-1 min-w-0">
           <div className="font-medium text-sm truncate">{book.title}</div>
           {book.author?.authorName && (
-            <div className="text-xs text-slate-600 dark:text-zinc-500">{book.author.authorName}</div>
+            <div className="text-xs text-fg-muted">{book.author.authorName}</div>
           )}
           {book.releaseDate && (
-            <div className="text-xs text-slate-500 dark:text-zinc-600">{new Date(book.releaseDate).getFullYear()}</div>
+            <div className="text-xs text-fg-muted">{new Date(book.releaseDate).getFullYear()}</div>
           )}
+          <BookRating book={book} withCount className="block text-xs text-fg-muted" />
         </div>
         {book.libraryBookId ? (
           <div className="flex items-center gap-2 flex-shrink-0">
@@ -325,8 +299,8 @@ export default function AddToLibraryModal({ onClose, onAdded, initialQuery, mode
   }
 
   return (
-    <div className="fixed inset-0 bg-black/60 flex items-center justify-center p-4 z-50" onClick={onClose}>
-      <div ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="add-to-library-title" className="bg-slate-100 dark:bg-zinc-900 border border-slate-300 dark:border-zinc-700 rounded-lg w-full max-w-lg shadow-2xl max-h-[90vh] flex flex-col" onClick={e => e.stopPropagation()} onKeyDown={handleDialogKeyDown}>
+    <div className="modal-overlay fixed inset-0 bg-black/60 flex items-center justify-center p-4 z-50" onClick={onClose}>
+      <div {...panelProps} className="bg-slate-100 dark:bg-zinc-900 border border-slate-300 dark:border-zinc-700 rounded-lg w-full max-w-lg shadow-2xl modal-max-h flex flex-col" onClick={e => e.stopPropagation()}>
         <div className="p-4 border-b border-slate-200 dark:border-zinc-800">
           <h3 id="add-to-library-title" className="text-lg font-semibold">{t('addToLibrary.title')}</h3>
           <p className="text-xs text-fg-muted mt-0.5">{t('addToLibrary.description')}</p>
@@ -355,25 +329,42 @@ export default function AddToLibraryModal({ onClose, onAdded, initialQuery, mode
           <div className="p-4 flex-1 overflow-y-auto">
             <div className="flex gap-2">
               <input
+                enterKeyHint="search"
                 type="text"
                 value={query}
                 onChange={e => setQuery(e.target.value)}
                 onKeyDown={e => e.key === 'Enter' && void search()}
                 placeholder={placeholder}
-                className="flex-1 min-w-0 bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-emerald-500"
+                className="flex-1 min-w-0 bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded-md px-3 py-2 text-sm"
                 autoFocus
               />
               <button
                 type="button"
                 onClick={() => void search()}
                 disabled={searching || !query.trim()}
-                className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed rounded-md text-sm font-medium text-white"
+                className={`px-4 py-2 ${primaryFill} disabled:opacity-50 disabled:cursor-not-allowed rounded-md text-sm font-medium`}
               >
                 {searching ? t('addToLibrary.searching') : t('common.search')}
               </button>
             </div>
 
-            <div className="mt-4 space-y-2 max-h-[50vh] overflow-y-auto">
+            <div className="mt-3 flex flex-wrap gap-1" role="group" aria-label={t('addToLibrary.filter.label')}>
+              {filterOptions.map(({ value, label, count }) => (
+                <button
+                  key={value}
+                  type="button"
+                  aria-pressed={filter === value}
+                  onClick={() => setFilter(value)}
+                  className={`touch-target px-3 py-1 rounded-full text-xs font-medium border ${filter === value
+                    ? 'bg-emerald-600 border-emerald-600 text-white'
+                    : 'border-slate-300 dark:border-zinc-700 text-fg-muted hover:text-slate-900 dark:hover:text-white hover:bg-slate-200/60 dark:hover:bg-zinc-800/60'}`}
+                >
+                  {label}{count !== null && ` (${count})`}
+                </button>
+              ))}
+            </div>
+
+            <div className="mt-4 space-y-2 max-h-[50dvh] overflow-y-auto">
               {rows.map((row, i) => {
                 if (row.kind === 'author') return renderAuthorRow(row.author, i)
                 if (row.kind === 'book') return renderBookRow(row.book, i)
@@ -384,13 +375,13 @@ export default function AddToLibraryModal({ onClose, onAdded, initialQuery, mode
                   </div>
                 )
               })}
-              {hiddenAuthors.length > 0 && !showHidden && (
+              {hiddenCount > 0 && !showHidden && (
                 <button
                   type="button"
                   onClick={() => setShowHidden(true)}
-                  className="w-full px-3 py-2 rounded-md border border-slate-300 dark:border-zinc-700 text-xs font-medium text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200/60 dark:hover:bg-zinc-800/60 transition-colors"
+                  className="w-full px-3 py-2 rounded-md border border-slate-300 dark:border-zinc-700 text-xs font-medium text-fg-muted hover:text-slate-900 dark:hover:text-white hover:bg-slate-200/60 dark:hover:bg-zinc-800/60 transition-colors"
                 >
-                  {t('addToLibrary.showHiddenResults', { count: hiddenAuthors.length })}
+                  {t('addToLibrary.showHiddenResults', { count: hiddenCount })}
                 </button>
               )}
               {partialError && (
@@ -399,14 +390,14 @@ export default function AddToLibraryModal({ onClose, onAdded, initialQuery, mode
               {searchError && (
                 <p role="alert" className="text-sm text-red-700 dark:text-red-300 text-center py-4">{t('addToLibrary.searchError', { error: searchError })}</p>
               )}
-              {searched && !hasRows && hiddenAuthors.length === 0 && !searching && !searchError && (
+              {searched && !hasRows && hiddenCount === 0 && !searching && !searchError && (
                 <p className="text-sm text-fg-muted text-center py-4">{t('addToLibrary.noResults')}</p>
               )}
             </div>
           </div>
 
           <div className="p-4 border-t border-slate-200 dark:border-zinc-800 flex justify-end gap-2">
-            <button type="button" onClick={onClose} className="px-4 py-2 text-sm text-slate-600 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white">{t('common.cancel')}</button>
+            <button type="button" onClick={onClose} className="px-4 py-2 text-sm text-fg-muted hover:text-slate-900 dark:hover:text-white">{t('common.cancel')}</button>
           </div>
         </>}
       </div>

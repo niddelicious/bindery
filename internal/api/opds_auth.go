@@ -15,9 +15,10 @@ import (
 // mirrors the global auth middleware but adds HTTP Basic on top, because
 // that's what KOReader / Moon+ Reader / Aldiko all speak natively:
 //
-//  1. Mode == disabled                 — always allowed
+//  1. Mode == disabled                 — allowed under an accepted Host
 //  2. Valid X-Api-Key header or ?apikey= query — allowed
-//  3. Mode == local-only + RFC1918 IP  — always allowed
+//  3. Mode == local-only + RFC1918 IP  — allowed under an accepted Host
+//     (auth.HostAllowedForModeGrant; a refused Host falls through to 4-6)
 //  4. Valid signed session cookie      — allowed
 //  5. Valid Basic credentials          — allowed
 //  6. Otherwise                        — 401 with WWW-Authenticate: Basic
@@ -32,6 +33,13 @@ import (
 // The realm ("Bindery OPDS") is what shows in the client's credential
 // prompt; keep it descriptive so users know which server is asking.
 func OPDSAuth(p auth.Provider, users *db.UserRepo, limiter *auth.LoginLimiter) func(http.Handler) http.Handler {
+	return opdsAuthWith(p, users, limiter, newOPDSBasicVerifier())
+}
+
+// opdsAuthWith is OPDSAuth with the Basic verifier supplied, so tests can
+// observe how many KDF runs a burst cost. One verifier serves every route the
+// middleware wraps, so the cache and single flight span the whole subtree.
+func opdsAuthWith(p auth.Provider, users *db.UserRepo, limiter *auth.LoginLimiter, basic *opdsBasicVerifier) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			mode := p.Mode()
@@ -43,7 +51,15 @@ func OPDSAuth(p auth.Provider, users *db.UserRepo, limiter *auth.LoginLimiter) f
 				return
 			}
 
-			if mode == auth.ModeDisabled {
+			// The two mode grants below admit a caller with no credential,
+			// so they also need a Host name a public site cannot have, as in
+			// auth.Middleware (DNS rebinding). A refused name is not answered
+			// here: it falls through to the API key, session and Basic checks,
+			// so a reader with real credentials still gets in and one without
+			// gets the usual Basic challenge.
+			// Disabled mode admits every peer, so the proxy set is not needed
+			// (and not read: the #1894 tests pin the provider call order).
+			if mode == auth.ModeDisabled && auth.ModeGrantsAdmin(mode, r, nil) {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -58,7 +74,7 @@ func OPDSAuth(p auth.Provider, users *db.UserRepo, limiter *auth.LoginLimiter) f
 				next.ServeHTTP(w, r)
 				return
 			}
-			if mode == auth.ModeLocalOnly && auth.IsLocalRequestTrusted(r, p.TrustedProxyCIDRs()) {
+			if mode == auth.ModeLocalOnly && auth.ModeGrantsAdmin(mode, r, p.TrustedProxyCIDRs()) {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -81,7 +97,7 @@ func OPDSAuth(p auth.Provider, users *db.UserRepo, limiter *auth.LoginLimiter) f
 						next.ServeHTTP(w, r)
 						return
 					}
-					if liveEpoch, err := users.GetSessionEpoch(r.Context(), uid); err == nil && liveEpoch == epoch {
+					if liveEpoch, err := users.GetSessionEpoch(r.Context(), uid); err == nil && liveEpoch == epoch && !opdsSessionRevoked(r, p, c.Value) {
 						if !opdsRoleAllowed(w, p.UserRole(r.Context(), uid)) {
 							return
 						}
@@ -93,26 +109,33 @@ func OPDSAuth(p auth.Provider, users *db.UserRepo, limiter *auth.LoginLimiter) f
 			}
 			if username, password, ok := r.BasicAuth(); ok && users != nil {
 				ip := opdsClientIP(r)
-				if limiter != nil && !limiter.Allow(ip) {
-					w.Header().Set("WWW-Authenticate", `Basic realm="Bindery OPDS"`)
-					http.Error(w, "too many attempts", http.StatusTooManyRequests)
-					return
-				}
-				u, err := users.GetByUsername(r.Context(), strings.TrimSpace(username))
+				name := strings.TrimSpace(username)
+				u, err := users.GetByUsername(r.Context(), name)
 				// Verify against a dummy hash when the user is missing so the
 				// basic-auth response time does not reveal which usernames exist
 				// (mirrors the main login handler). See auth.DummyPasswordHash.
 				hash := auth.DummyPasswordHash()
-				if err == nil && u != nil {
+				known := err == nil && u != nil
+				if known {
 					hash = u.PasswordHash
 				}
-				if ok := auth.VerifyPassword(password, hash); err == nil && u != nil && ok {
-					if limiter != nil {
-						limiter.Reset(ip)
-					}
-					// The password is correct, so the limiter is reset, but a
-					// requester may not read the feed or download its files:
-					// they browse through /requests/library only.
+				// basic reserves the attempt before the KDF (Allow alone let a
+				// concurrent burst run one verification per request), refunds
+				// it when nothing was verified, serves recent successes from
+				// its cache and coalesces identical concurrent credentials.
+				switch basic.check(r.Context(), limiter, ip, name, password, hash, known) {
+				case opdsBasicLimited:
+					w.Header().Set("WWW-Authenticate", `Basic realm="Bindery OPDS"`)
+					writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many attempts"})
+					return
+				case opdsBasicAbandoned:
+					// Client went away while queued for a KDF slot.
+					writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "server busy, try again"})
+					return
+				case opdsBasicOK:
+					// The password is correct, but a requester may not read
+					// the feed or download its files: they browse through
+					// /requests/library only.
 					if !opdsRoleAllowed(w, u.Role) {
 						return
 					}
@@ -124,17 +147,27 @@ func OPDSAuth(p auth.Provider, users *db.UserRepo, limiter *auth.LoginLimiter) f
 					r = r.WithContext(auth.WithUserID(r.Context(), u.ID))
 					next.ServeHTTP(w, r)
 					return
-				}
-				if limiter != nil {
-					limiter.Record(ip)
+				case opdsBasicFail:
+					// Falls through to the challenge. No Record: the attempt
+					// was already counted when the verification reserved it.
 				}
 			}
 
 			// Challenge — OPDS clients retry with credentials on 401.
+			body := []byte(`{"error":"unauthorized"}`)
+			if host, refused := auth.RefusedModeGrantHost(mode, r, p.TrustedProxyCIDRs()); refused {
+				// Still a 401 with the Basic challenge, so readers can prompt
+				// for credentials, but say why the mode did not let it in.
+				// The name goes to the log only: reader apps rarely show
+				// the body, and a fixed body echoes nothing caller supplied.
+				auth.LogRefusedModeGrantHost(host)
+				body = []byte(`{"error":"this host name is not allowed to use this auth mode without a login; ` +
+					`sign in, or add it to ` + auth.AllowedHostsEnv + `"}`)
+			}
 			w.Header().Set("WWW-Authenticate", `Basic realm="Bindery OPDS"`)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
-			if _, err := w.Write([]byte(`{"error":"unauthorized"}`)); err != nil {
+			if _, err := w.Write(body); err != nil {
 				slog.Warn("failed to write OPDS unauthorized response", "error", err)
 			}
 		})
@@ -157,7 +190,24 @@ func opdsSessionIsRequester(r *http.Request, p auth.Provider, users *db.UserRepo
 			return false
 		}
 	}
+	// A signed out requester cookie no longer speaks for anyone, so it is
+	// treated like no cookie rather than refused as a requester.
+	if opdsSessionRevoked(r, p, c.Value) {
+		return false
+	}
 	return p.UserRole(r.Context(), uid) == auth.RoleRequester
+}
+
+// opdsSessionRevoked reports whether cookie was signed out via /auth/logout.
+// A failed lookup counts as revoked: the cookie then fails here and the
+// client falls through to Basic auth or the 401 challenge, never to access.
+func opdsSessionRevoked(r *http.Request, p auth.Provider, cookie string) bool {
+	revoked, err := p.SessionRevoked(r.Context(), auth.SessionTokenHash(cookie))
+	if err != nil {
+		slog.Warn("opds: session revocation lookup failed", "error", err)
+		return true
+	}
+	return revoked
 }
 
 // opdsRoleAllowed answers 403 and returns false when role may not read the
